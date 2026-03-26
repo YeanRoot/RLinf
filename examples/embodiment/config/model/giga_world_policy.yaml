@@ -1,0 +1,24 @@
+model_type: "giga_world_policy"
+model_path: "/shared_disk/users/chaojun.ni/experiments/wa_single_year/pretrain_robotwin/models/checkpoint_epoch_140_step_60340/transformer"
+wan_model_id: "/shared_disk/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers"
+precision: "bf16"
+
+# eval-only wrapper; no value head / no LoRA for now
+add_value_head: False
+is_lora: False
+
+# RoboTwin piper dual-arm setup
+value_type: action_level
+action_dim: 14
+use_proprio: True
+proprio_dim: 14
+state_dim: 14
+
+# WA model generation setup
+num_action_chunks: 48
+num_frames: 5
+num_inference_steps: 10
+guidance_scale: 0.0
+max_text_length: 60
+dst_size: [768, 192]
+center_crop: True
