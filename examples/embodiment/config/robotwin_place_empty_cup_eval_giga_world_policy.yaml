@@ -138,6 +138,8 @@ actor:
   model:
     model_path: "/shared_disk/users/chaojun.ni/experiments/wa_single_year/pretrain_robotwin/models/checkpoint_epoch_140_step_60340/transformer"
     wan_model_id: "/shared_disk/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers"
+    norm_json: "/shared_disk/users/chaojun.ni/peking-human/paper/RoboTwin2.0/pi0_1/norm_stats_delta.json"
+    robotype: "aloha"
     model_type: "giga_world_policy"
     precision: "bf16"
 

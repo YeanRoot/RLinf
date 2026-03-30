@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy
 
-from .inference_utils import build_wa_pipeline, run_single_observation
+from .inference_utils import build_wa_pipeline, run_single_observation, _build_delta_mask, _load_norm_stats
 
 
 class GigaWorldPolicy(nn.Module, BasePolicy):
@@ -33,6 +33,8 @@ class GigaWorldPolicy(nn.Module, BasePolicy):
         self.guidance_scale = float(getattr(cfg, "guidance_scale", 0.0))
         self.num_inference_steps = int(getattr(cfg, "num_inference_steps", 10))
         self.state_dim = int(getattr(cfg, "state_dim", 14))
+        self.robotype = str(getattr(cfg, "robotype", "aloha"))
+        self.norm_json = getattr(cfg, "norm_json", None)
 
         self.device_str = "cuda" if torch.cuda.is_available() else "cpu"
         self.pipe = build_wa_pipeline(
@@ -40,6 +42,10 @@ class GigaWorldPolicy(nn.Module, BasePolicy):
             device=self.device_str,
             torch_dtype=torch_dtype,
         )
+
+        self.model_action_dim = int(self.pipe.transformer.action_encoder[0].in_features)
+        self.norm_stats = _load_norm_stats(cfg, self.model_action_dim, self.device_str)
+        self.delta_mask = _build_delta_mask(self.robotype, self.model_action_dim, self.device_str)
 
         # Register the actual submodules to make eval()/state_dict()/to() more predictable.
         self.transformer = self.pipe.transformer
@@ -117,6 +123,9 @@ class GigaWorldPolicy(nn.Module, BasePolicy):
                 guidance_scale=self.guidance_scale,
                 num_inference_steps=self.num_inference_steps,
                 device=self.device_str,
+                norm_stats=self.norm_stats,
+                delta_mask=self.delta_mask,
+                env_action_dim=self.action_dim,
             )
             batch_actions.append(action_chunk)
 

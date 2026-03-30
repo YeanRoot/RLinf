@@ -375,6 +375,7 @@ def build_wa_pipeline(cfg, device: str = "cuda", torch_dtype: torch.dtype = torc
     transformer = CasualWorldActionTransformer.from_pretrained(
         transformer_model_path,
         torch_dtype=torch_dtype,
+        use_safetensors=False,
     )
     pipe = WAPipeline.from_pretrained(
         model_id,
@@ -423,7 +424,14 @@ def build_ref_image(
     wrist_images: Optional[torch.Tensor | np.ndarray],
     dst_size: Tuple[int, int],
 ) -> Image.Image:
+    dst_w, dst_h = dst_size
+    single_w = dst_w // 3
+
     main = _as_chw_float01(main_image)
+    main = _resize_center_crop(
+        Image.fromarray((main.permute(1, 2, 0).cpu().numpy().clip(0.0, 1.0) * 255).astype(np.uint8)),
+        (single_w, dst_h),
+    )
 
     if wrist_images is None:
         left = main
@@ -431,20 +439,75 @@ def build_ref_image(
     else:
         if isinstance(wrist_images, np.ndarray):
             wrist_images = torch.from_numpy(wrist_images)
-        if wrist_images.ndim == 4:
-            left = _as_chw_float01(wrist_images[0])
-            right = _as_chw_float01(wrist_images[1]) if wrist_images.shape[0] > 1 else _as_chw_float01(wrist_images[0])
-        else:
+        if wrist_images.ndim != 4:
             raise ValueError(
                 f"Expected wrist_images with 4 dims [N,H,W,C] or [N,C,H,W], got {tuple(wrist_images.shape)}"
             )
+        left_tensor = _as_chw_float01(wrist_images[0])
+        right_tensor = _as_chw_float01(wrist_images[1]) if wrist_images.shape[0] > 1 else _as_chw_float01(wrist_images[0])
+        left = _resize_center_crop(
+            Image.fromarray((left_tensor.permute(1, 2, 0).cpu().numpy().clip(0.0, 1.0) * 255).astype(np.uint8)),
+            (single_w, dst_h),
+        )
+        right = _resize_center_crop(
+            Image.fromarray((right_tensor.permute(1, 2, 0).cpu().numpy().clip(0.0, 1.0) * 255).astype(np.uint8)),
+            (single_w, dst_h),
+        )
 
-    # Follow original inference_openloop_robotwin.py order:
-    # left_wrist | head | right_wrist
-    ref = torch.cat([left, main, right], dim=2)
-    ref = ref.permute(1, 2, 0).cpu().numpy()
-    ref = Image.fromarray((np.clip(ref, 0.0, 1.0) * 255).astype(np.uint8))
-    return _resize_center_crop(ref, dst_size)
+    # Match the standalone working script exactly: head | left_wrist | right_wrist
+    ref = np.concatenate([np.asarray(main), np.asarray(left), np.asarray(right)], axis=1)
+    return Image.fromarray(ref)
+
+
+def _load_norm_stats(cfg, model_action_dim: int, device: str):
+    norm_json = getattr(cfg, "norm_json", None)
+    if norm_json is None:
+        raise ValueError("cfg.norm_json must be provided for giga_world_policy inference")
+
+    import json
+
+    with open(norm_json, "r", encoding="utf-8") as f:
+        stats = json.load(f)
+    stats = stats["norm_stats"] if "norm_stats" in stats else stats
+
+    def _load_stat(key1: str, key2: str, pad_value: float):
+        x = torch.as_tensor(stats[key1][key2], dtype=torch.float32)
+        if x.numel() >= model_action_dim:
+            x = x[:model_action_dim]
+        else:
+            pad = torch.full((model_action_dim - x.numel(),), float(pad_value), dtype=torch.float32)
+            x = torch.cat([x, pad], dim=0)
+        return x.to(device)
+
+    return {
+        "state_mean": _load_stat("observation.state", "mean", 0.0),
+        "state_std": _load_stat("observation.state", "std", 1.0),
+        "delta_mean": _load_stat("action", "mean", 0.0),
+        "delta_std": _load_stat("action", "std", 1.0),
+    }
+
+
+def _build_delta_mask(robotype: str, dim: int, device: str):
+    name = robotype.lower()
+    embed_id = 1 if "agibot" in name else 0
+    templates = {
+        0: np.array(
+            [True, True, True, True, True, True, False,
+             True, True, True, True, True, True, False],
+            dtype=bool,
+        ),
+        1: np.array(
+            [True, True, True, True, True, True, True, False,
+             True, True, True, True, True, True, True, False],
+            dtype=bool,
+        ),
+    }
+    base = templates[embed_id]
+    if dim > len(base):
+        base = np.pad(base, (0, dim - len(base)), constant_values=False)
+    else:
+        base = base[:dim]
+    return torch.as_tensor(base, dtype=torch.bool, device=device)
 
 
 @torch.no_grad()
@@ -462,19 +525,28 @@ def run_single_observation(
     guidance_scale: float,
     num_inference_steps: int,
     device: str = "cuda",
+    norm_stats: Optional[Dict[str, torch.Tensor]] = None,
+    delta_mask: Optional[torch.Tensor] = None,
+    env_action_dim: int = 14,
 ) -> torch.Tensor:
     ref_image = build_ref_image(main_image, wrist_images, dst_size)
 
     if isinstance(state, np.ndarray):
         state = torch.from_numpy(state)
-    state = state.to(device=device, dtype=torch.float32)
-    state = state[..., :state_dim]
+    state_raw = state.to(device=device, dtype=torch.float32).flatten()
 
-    # 统一成 [B, 1, state_dim]
-    if state.ndim == 1:
-        state = state.unsqueeze(0).unsqueeze(1)
-    elif state.ndim == 2:
-        state = state.unsqueeze(1)
+    model_action_dim = int(pipe.transformer.action_encoder[0].in_features)
+    if state_raw.numel() >= model_action_dim:
+        state_pad = state_raw[:model_action_dim]
+    else:
+        pad = torch.zeros(model_action_dim - state_raw.numel(), dtype=torch.float32, device=state_raw.device)
+        state_pad = torch.cat([state_raw, pad], dim=0)
+
+    if norm_stats is None:
+        state_in = state_pad.unsqueeze(0)
+    else:
+        eps = 1e-8
+        state_in = ((state_pad - norm_stats["state_mean"]) / norm_stats["state_std"].clamp_min(eps)).unsqueeze(0)
 
     prompt_embeds = pipe._get_t5_prompt_embeds(
         prompt=[instruction],
@@ -486,7 +558,7 @@ def run_single_observation(
     _pred_imgs, pred_action = pipe(
         image=ref_image,
         action_chunk=action_chunk,
-        state=state,
+        state=state_in,
         height=dst_size[1],
         width=dst_size[0],
         num_frames=num_frames,
@@ -496,4 +568,13 @@ def run_single_observation(
         return_dict=False,
         max_sequence_length=max_text_length,
     )
-    return pred_action[0].float().cpu()
+
+    pred_action = pred_action[0].float()
+    if norm_stats is not None:
+        eps = 1e-8
+        pred_delta = pred_action * norm_stats["delta_std"].clamp_min(eps) + norm_stats["delta_mean"]
+        pred_action = pred_delta.clone()
+        if delta_mask is not None:
+            pred_action[:, delta_mask] += state_pad[delta_mask]
+
+    return pred_action[:, :env_action_dim].cpu()
