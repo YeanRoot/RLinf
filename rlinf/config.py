@@ -59,6 +59,7 @@ class SupportedModel(Enum):
     FLOW_POLICY = ("flow_policy", "embodied")
     CMA_POLICY = ("cma", "embodied")
     LINGBOTVLA = ("lingbotvla", "embodied")
+    GIGA_WORLD_POLICY = ("giga_world_policy", "embodied")
 
     # Sft models
     QWEN2_5_VL_SFT = ("qwen2.5_vl", "sft")

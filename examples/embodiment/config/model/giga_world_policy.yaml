@@ -1,0 +1,30 @@
+model_type: "giga_world_policy"
+
+# In RLinf rollout, model_path is treated as the WA transformer checkpoint path.
+model_path: "/path/to/wa_transformer_ckpt"
+
+precision: bf16
+
+num_action_chunks: 48
+action_dim: 14
+
+is_lora: False
+lora_rank: 32
+
+use_proprio: True
+num_steps: 1
+add_value_head: False
+
+giga_world_policy:
+  wa_root: "/path/to/wan-casual-cj"
+  base_model_dir: "/path/to/Wan2.2-TI2V-5B-Diffusers"
+  norm_json: "/path/to/norm_stats_delta.json"
+  diffusers_src: null
+  robotype: "aloha"
+  num_inference_steps: 10
+  guidance_scale: 0.0
+  num_frames: 5
+  single_view_width: 256
+  single_view_height: 192
+  prompt: null
+  use_safetensors: False
