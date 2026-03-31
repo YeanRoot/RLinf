@@ -136,14 +136,14 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/shared_disk/users/xinyu.zhou/experiments/wa_single/robotwin/models/checkpoint_epoch_2_step_100000/transformer"
+    model_path: "/shared_disk/users/angen.ye/code/world_module_rollout/checkpoints/checkpoint_epoch_2_step_100000/transformer"
     num_action_chunks: 48
     action_dim: 14
     precision: bf16
     giga_world_policy:
-      wa_root: "/mnt/pfs/users/xinyu.zhou/wan-casual-cj"
+      wa_root: "/shared_disk/users/angen.ye/code/world_module_rollout/wan-casual-cj"
       base_model_dir: "/shared_disk/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers"
-      norm_json: "/shared_disk/users/chaojun.ni/peking-human/paper/RoboTwin2.0/pi0_1/norm_stats_delta.json"
+      norm_json: "/shared_disk/users/angen.ye/code/world_module_rollout/norm_stats_delta.json"
       diffusers_src: null
       robotype: "aloha"
       num_inference_steps: 10
