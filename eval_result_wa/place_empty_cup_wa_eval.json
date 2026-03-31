@@ -1,0 +1,189 @@
+{
+  "task_name": "place_empty_cup",
+  "task_config": "demo_clean",
+  "num_episodes": 20,
+  "success_rate": 0.85,
+  "results": [
+    {
+      "episode": 0,
+      "seed": 100000,
+      "success": false,
+      "reward": 0.0,
+      "executed_steps": 528,
+      "num_chunks": 11,
+      "instruction": "Use an arm to drop the cup with light blue color on the grainy texture coaster"
+    },
+    {
+      "episode": 1,
+      "seed": 100001,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Use an arm to place the cup with smooth plastic surface on the wooden coaster"
+    },
+    {
+      "episode": 2,
+      "seed": 100002,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Grab the cylindrical light blue cup and lower it onto the flat surface gray wooden coaster"
+    },
+    {
+      "episode": 3,
+      "seed": 100003,
+      "success": false,
+      "reward": 0.0,
+      "executed_steps": 528,
+      "num_chunks": 11,
+      "instruction": "Move the smooth blue cup for liquids onto the light gray streaked wooden coaster with the arm"
+    },
+    {
+      "episode": 4,
+      "seed": 100004,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Use an arm to place the cup with light blue color on the wooden coaster"
+    },
+    {
+      "episode": 5,
+      "seed": 100005,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Stick the rounded base blue cup onto the coaster made of smooth wood using the arm."
+    },
+    {
+      "episode": 6,
+      "seed": 100006,
+      "success": false,
+      "reward": 0.0,
+      "executed_steps": 528,
+      "num_chunks": 11,
+      "instruction": "Position the cup with light blue color on the light gray streaked wooden coaster with the arm."
+    },
+    {
+      "episode": 7,
+      "seed": 100007,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Stick the medium-sized plastic blue cup onto the wooden coaster carefully."
+    },
+    {
+      "episode": 8,
+      "seed": 100008,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Direct the rounded base blue cup to the coaster with circular shape and let it rest."
+    },
+    {
+      "episode": 9,
+      "seed": 100009,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Grab the medium blue cylindrical cup, then place it onto the light gray round grainy coaster."
+    },
+    {
+      "episode": 10,
+      "seed": 100010,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Set the smooth blue cup for liquids down on the wooden coaster"
+    },
+    {
+      "episode": 11,
+      "seed": 100011,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Move the cup for holding liquids to the smooth round palm-sized coaster using the arm."
+    },
+    {
+      "episode": 12,
+      "seed": 100012,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Carefully place the blue rounded-bottom cup onto the grainy texture coaster without arm"
+    },
+    {
+      "episode": 13,
+      "seed": 100013,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Place the smooth blue cup for liquids on top of the flat surface gray wooden coaster"
+    },
+    {
+      "episode": 14,
+      "seed": 100014,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Move the cup with smooth plastic surface to the coaster with circular shape and set it down."
+    },
+    {
+      "episode": 15,
+      "seed": 100015,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Move the medium blue cylindrical cup onto the wooden coaster with the arm"
+    },
+    {
+      "episode": 16,
+      "seed": 100016,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Use the arm to set the medium-sized plastic blue cup on the round coaster"
+    },
+    {
+      "episode": 17,
+      "seed": 100017,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Grab the plastic cup for drinks and place it over the flat round wooden coaster."
+    },
+    {
+      "episode": 18,
+      "seed": 100018,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Set the light blue plastic cup carefully onto the smooth round palm-sized coaster"
+    },
+    {
+      "episode": 19,
+      "seed": 100019,
+      "success": true,
+      "reward": 1.0,
+      "executed_steps": 192,
+      "num_chunks": 4,
+      "instruction": "Set the light blue plastic cup on the light gray streaked wooden coaster using the arm."
+    }
+  ],
+  "video_dir": "/shared_disk/users/angen.ye/code/world_module_rollout/results/place_empty_cup"
+}
