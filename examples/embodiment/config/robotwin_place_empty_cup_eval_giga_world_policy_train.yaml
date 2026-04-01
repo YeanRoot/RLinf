@@ -23,12 +23,12 @@ runner:
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 200
+  max_epochs: 20
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 1
-  save_interval: 1
+  val_check_interval: 100000
+  save_interval: 100000
 
   resume_dir: null
   ckpt_path: null
@@ -38,7 +38,7 @@ algorithm:
     enable_cache: True
     cache_size: 2000
     sample_window_size: 2000
-    min_buffer_size: 10
+    min_buffer_size: 2
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
@@ -61,7 +61,7 @@ algorithm:
   group_size: 1
 
   rollout_epoch: 1
-  eval_rollout_epoch: 5
+  eval_rollout_epoch: 1
 
   reward_type: action_level
   logprob_type: token_level
@@ -78,7 +78,7 @@ algorithm:
   value_clip: 0.2
   huber_delta: 10.0
 
-  gamma: 1.0
+  gamma: 0.99
   gae_lambda: 0.95
 
   reward_coef: 5.0
@@ -94,7 +94,7 @@ algorithm:
   target_noise_clip: 0.5
   bc_coef: 1.0
   ref_action_dropout_p: 0.5
-  train_actor_steps: 10
+  train_actor_steps: 0
 
   sampling_params:
     do_sample: False
