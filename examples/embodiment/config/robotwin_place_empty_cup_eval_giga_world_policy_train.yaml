@@ -35,6 +35,8 @@ runner:
   ckpt_path: null
 
 algorithm:
+  replay_buffer:
+    auto_save_path: null
   normalize_advantages: False
   kl_penalty: kl
   group_size: 1
@@ -135,6 +137,19 @@ actor:
   global_batch_size: 1
   seed: 1234
   enable_offload: False
+
+  critic_optim:
+    lr: 0.000155
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 1
+    lr_warmup_steps: 0
+    lr_scheduler: constant
+    num_cycles: 0.5
+    min_lr: 2.5e-06
 
   model:
     model_path: "/shared_disk/users/angen.ye/code/world_module_rollout/checkpoints/checkpoint_epoch_2_step_100000/transformer"
