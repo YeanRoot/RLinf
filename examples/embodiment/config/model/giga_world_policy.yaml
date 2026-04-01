@@ -28,3 +28,12 @@ giga_world_policy:
   single_view_height: 192
   prompt: null
   use_safetensors: False
+
+  # route A: keep frozen WA backbone + latent compressor + small RL heads
+  use_rl_head_for_rollout: False
+  visual_feature_dim: 2048
+  bc_coef: 1.0
+  ref_action_dropout_p: 0.5
+  target_tau: 0.005
+  enable_latent_debug: False
+  latent_debug_dir: "./results/latent_debug"

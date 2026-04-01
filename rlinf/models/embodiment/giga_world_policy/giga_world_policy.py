@@ -267,7 +267,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         base_model_dir = policy_cfg.base_model_dir
         norm_json = policy_cfg.norm_json
 
-        self.enable_latent_debug = bool(policy_cfg.get("enable_latent_debug", True))
+        self.enable_latent_debug = bool(policy_cfg.get("enable_latent_debug", False))
         self.latent_debug_dir = str(
             policy_cfg.get(
                 "latent_debug_dir",
@@ -277,8 +277,14 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self._latent_debug_dumped = False
         self._latent_debug_warned = False
 
-        # rollout switch: keep base WA by default until RL worker is ready
-        self.use_rl_head_for_rollout = bool(policy_cfg.get("use_rl_head_for_rollout", False))
+        # rollout switch: keep base WA by default until RL worker is ready.
+        # This flag must live in the state_dict so actor->rollout weight sync can carry it.
+        initial_rollout_flag = 1 if bool(policy_cfg.get("use_rl_head_for_rollout", False)) else 0
+        self.register_buffer(
+            "use_rl_head_for_rollout_flag",
+            torch.tensor(initial_rollout_flag, dtype=torch.uint8),
+            persistent=True,
+        )
 
         # RLT-style knobs to expose to the future worker
         self.visual_feature_dim = int(policy_cfg.get("visual_feature_dim", 2048))
@@ -906,6 +912,12 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             return diff
         raise ValueError(f"Unknown reduction: {reduction}")
 
+    def set_use_rl_head_for_rollout(self, flag: bool):
+        self.use_rl_head_for_rollout_flag.fill_(1 if flag else 0)
+
+    def get_use_rl_head_for_rollout(self) -> bool:
+        return bool(int(self.use_rl_head_for_rollout_flag.item()))
+
     def soft_update_targets(self, tau: Optional[float] = None):
         if tau is None:
             tau = self.target_tau
@@ -1039,7 +1051,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         del mode, compute_values, kwargs
         batch_size = int(env_obs["states"].shape[0])
 
-        if not self.use_rl_head_for_rollout:
+        if not self.get_use_rl_head_for_rollout():
             action_chunks = [self._plan_single(env_obs, idx) for idx in range(batch_size)]
             actions = torch.stack(action_chunks, dim=0).to(self.device_ref)
         else:

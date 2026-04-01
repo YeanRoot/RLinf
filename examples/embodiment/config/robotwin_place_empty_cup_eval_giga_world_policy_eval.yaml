@@ -34,6 +34,28 @@ runner:
   ckpt_path: null
 
 algorithm:
+  replay_buffer:
+    enable_cache: True
+    cache_size: 10
+    sample_window_size: 10
+    min_buffer_size: 1
+    auto_save: False
+    auto_save_path: null
+    trajectory_format: pt
+    enable_preload: False
+    prefetch_size: 1
+
+  demo_buffer:
+    enable: False
+    enable_cache: True
+    cache_size: 10
+    sample_window_size: 10
+    min_buffer_size: 1
+    auto_save: False
+    auto_save_path: null
+    trajectory_format: pt
+    load_path: null
+
   normalize_advantages: False
   kl_penalty: kl
   group_size: 1
@@ -46,7 +68,7 @@ algorithm:
   entropy_type: token_level
 
   adv_type: gae
-  loss_type: actor
+  loss_type: embodied_gigawa
   loss_agg_func: "token-mean"
   kl_beta: 0.0
   entropy_bonus: 0.0
@@ -63,6 +85,16 @@ algorithm:
   filter_rewards: False
   rewards_lower_bound: 0.0
   rewards_upper_bound: 5.0
+
+  update_epoch: 1
+  critic_actor_ratio: 2
+  tau: 0.005
+  target_update_freq: 1
+  target_policy_noise: 0.2
+  target_noise_clip: 0.5
+  bc_coef: 1.0
+  ref_action_dropout_p: 0.5
+  train_actor_steps: 10
 
   sampling_params:
     do_sample: False
@@ -123,6 +155,8 @@ rollout:
   generation_backend: "huggingface"
   enable_offload: False
   pipeline_stage_num: 1
+  collect_transitions: False
+  collect_prev_infos: False
   model:
     model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
@@ -134,6 +168,19 @@ actor:
   global_batch_size: 1
   seed: 1234
   enable_offload: False
+
+  critic_optim:
+    lr: 0.000155
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 1
+    lr_warmup_steps: 0
+    lr_scheduler: constant
+    num_cycles: 0.5
+    min_lr: 2.5e-06
 
   model:
     model_path: "/shared_disk/users/angen.ye/code/world_module_rollout/checkpoints/checkpoint_epoch_2_step_100000/transformer"
@@ -153,6 +200,13 @@ actor:
       single_view_height: 192
       prompt: null
       use_safetensors: False
+      use_rl_head_for_rollout: False
+      visual_feature_dim: 2048
+      bc_coef: 1.0
+      ref_action_dropout_p: 0.5
+      target_tau: 0.005
+      enable_latent_debug: False
+      latent_debug_dir: "${runner.logger.log_path}/latent_debug"
 
   optim:
     lr: 2.5e-5

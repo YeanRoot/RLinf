@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -38,65 +38,39 @@ from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
 class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
-    """
-    TD3-style off-policy worker for GigaWA.
-
-    Key design choices for the first version:
-      - reuse RLinf's trajectory replay buffer and replay dataset
-      - store custom tensors under curr_obs / next_obs
-      - frozen WA backbone feature extraction happens once when trajectories arrive
-      - critic target uses target_model copy (worker-level target network)
-      - actor loss = -Q + bc_coef * ||a - a_ref||^2
-      - no entropy / alpha tuning
-
-    IMPORTANT:
-      This worker is enough to start off-policy training over replay collected
-      from RobotWin + base WA policy. To make rollout workers *switch online* to
-      the learned actor, one extra syncable rollout-switch flag is still needed
-      in the model state path, because the current `use_rl_head_for_rollout`
-      attribute is not part of the state_dict.
-    """
+    """TD3-style off-policy worker for frozen Giga World Policy + small RL heads."""
 
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self.replay_buffer = None
         self.demo_buffer = None
-        self.target_model = None
         self.update_step = 0
+        self.rollout_rl_head_enabled = False
 
     # ---------------------------------------------------------------------
     # Init / setup
     # ---------------------------------------------------------------------
     def init_worker(self):
-        self.setup_model_and_optimizer(initialize_target=True)
+        self.setup_model_and_optimizer()
         self.setup_gigawa_components()
-        self.soft_update_target_model(tau=1.0)
+
+        policy = self._unwrap_policy(self.model)
+        policy.soft_update_targets(tau=1.0)
+        policy.set_use_rl_head_for_rollout(False)
+
         if self.cfg.actor.get("enable_offload", False):
             self.offload_param_and_grad()
             self.offload_optimizer()
         self._setup_rollout_weight_dst_ranks()
         if self.cfg.actor.get("compile_model", False):
             self.model = torch.compile(self.model, mode="default")
-            self.target_model = torch.compile(self.target_model, mode="default")
 
-    def setup_model_and_optimizer(self, initialize_target=False) -> None:
+    def setup_model_and_optimizer(self) -> None:
         module = self.model_provider_func()
-        if initialize_target:
-            target_module = self.model_provider_func()
-
         self.model = self._strategy.wrap_model(model=module, device_mesh=self._device_mesh)
         if self.torch_dtype is None:
             self.torch_dtype = next(self.model.parameters()).dtype
 
-        if initialize_target:
-            self.target_model = self._strategy.wrap_model(
-                model=target_module, device_mesh=self._device_mesh
-            )
-            self.target_model.requires_grad_(False)
-            self.target_model_initialized = True
-
-        # critic optimizer only sees parameters whose names contain "critic"
-        # actor optimizer gets all other trainable params (visual compressor + actor head)
         param_filters = {"critic": ["critic"]}
         filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
         optimizers = self.build_optimizers(
@@ -136,8 +110,9 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         self.demo_buffer = None
         min_demo_buffer_size = 0
-        if self.cfg.algorithm.get("demo_buffer", None) is not None:
-            auto_save_path = self.cfg.algorithm.demo_buffer.get("auto_save_path", None)
+        demo_cfg = self.cfg.algorithm.get("demo_buffer", None)
+        if demo_cfg is not None and demo_cfg.get("enable", False):
+            auto_save_path = demo_cfg.get("auto_save_path", None)
             if auto_save_path is None:
                 auto_save_path = os.path.join(
                     self.cfg.runner.logger.log_path, f"gigawa_demo_buffer/rank_{self._rank}"
@@ -146,17 +121,17 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 auto_save_path = os.path.join(auto_save_path, f"rank_{self._rank}")
             self.demo_buffer = TrajectoryReplayBuffer(
                 seed=seed,
-                enable_cache=self.cfg.algorithm.demo_buffer.enable_cache,
-                cache_size=self.cfg.algorithm.demo_buffer.cache_size,
-                sample_window_size=self.cfg.algorithm.demo_buffer.sample_window_size,
-                auto_save=self.cfg.algorithm.demo_buffer.get("auto_save", False),
+                enable_cache=demo_cfg.enable_cache,
+                cache_size=demo_cfg.cache_size,
+                sample_window_size=demo_cfg.sample_window_size,
+                auto_save=demo_cfg.get("auto_save", False),
                 auto_save_path=auto_save_path,
-                trajectory_format="pt",
+                trajectory_format=demo_cfg.get("trajectory_format", "pt"),
             )
-            min_demo_buffer_size = self.cfg.algorithm.demo_buffer.min_buffer_size
-            if self.cfg.algorithm.demo_buffer.get("load_path", None) is not None:
+            min_demo_buffer_size = demo_cfg.min_buffer_size
+            if demo_cfg.get("load_path", None) is not None:
                 self.demo_buffer.load_checkpoint(
-                    self.cfg.algorithm.demo_buffer.load_path,
+                    demo_cfg.load_path,
                     is_distributed=True,
                     local_rank=self._rank,
                     world_size=self._world_size,
@@ -192,6 +167,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.target_update_freq = int(self.cfg.algorithm.get("target_update_freq", 1))
         self.target_tau = float(self.cfg.algorithm.get("tau", 0.005))
         self.ref_action_dropout_p = float(self.cfg.algorithm.get("ref_action_dropout_p", 0.5))
+        self.target_policy_noise = float(self.cfg.algorithm.get("target_policy_noise", 0.2))
+        self.target_noise_clip = float(self.cfg.algorithm.get("target_noise_clip", 0.5))
 
     # ---------------------------------------------------------------------
     # Helpers
@@ -200,13 +177,19 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     def _unwrap_policy(model):
         return model.module if hasattr(model, "module") else model
 
+    def _maybe_enable_rollout_rl_head(self):
+        if self.rollout_rl_head_enabled:
+            return
+        policy = self._unwrap_policy(self.model)
+        policy.set_use_rl_head_for_rollout(True)
+        self.rollout_rl_head_enabled = True
+
     def _slice_obs_at_step(self, obs: dict[str, Any], t: int) -> dict[str, Any]:
         step_obs = {}
         for key, value in obs.items():
             if isinstance(value, torch.Tensor):
                 step_obs[key] = value[t]
             elif isinstance(value, list):
-                # Heuristic handling for task_descriptions and similar batch lists.
                 if len(value) == 0:
                     step_obs[key] = value
                 elif len(value) > t and isinstance(value[t], list):
@@ -253,7 +236,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             next_robot_states.append(next_feat["robot_state"])
             next_ref_actions.append(next_feat["ref_action"])
 
-        new_traj = Trajectory(
+        return Trajectory(
             max_episode_length=traj.max_episode_length,
             model_weights_id=traj.model_weights_id,
             actions=traj.actions.cpu().contiguous() if traj.actions is not None else None,
@@ -277,7 +260,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 "ref_action": torch.stack(next_ref_actions, dim=0),
             },
         )
-        return new_traj
 
     # ---------------------------------------------------------------------
     # Replay ingestion
@@ -307,35 +289,21 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 self.demo_buffer.add_trajectories(intervene_traj_list)
 
     # ---------------------------------------------------------------------
-    # Target update
-    # ---------------------------------------------------------------------
-    def soft_update_target_model(self, tau: Optional[float] = None):
-        if tau is None:
-            tau = self.target_tau
-        assert self.target_model_initialized
-        with torch.no_grad():
-            for online_param, target_param in zip(
-                self.model.parameters(), self.target_model.parameters()
-            ):
-                target_param.data.mul_(1.0 - tau)
-                target_param.data.add_(online_param.data * tau)
-
-    # ---------------------------------------------------------------------
     # Losses
     # ---------------------------------------------------------------------
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
+        policy = self._unwrap_policy(self.model)
+
         curr_obs = batch["curr_obs"]
         next_obs = batch["next_obs"]
-        actions = batch["actions"].to(self.torch_dtype)
+        actions = batch["actions"].to(self.device, dtype=self.torch_dtype)
         rewards = batch["rewards"]
         terminations = batch["terminations"]
 
-        # chunk rewards -> scalar target reward per transition
         rewards_for_bootstrap = rewards.sum(dim=-1, keepdim=True).to(self.torch_dtype)
         done_mask = terminations.any(dim=-1, keepdim=True).to(self.torch_dtype)
 
-        # current q
         with torch.no_grad():
             curr_visual_feat = self.model(
                 forward_type=ForwardType.DEFAULT,
@@ -353,27 +321,24 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             )
             curr_rl_state = curr_actor_aux["rl_state"].detach()
 
-            next_visual_feat = self.target_model(
+            next_visual_feat = self.model(
                 forward_type=ForwardType.DEFAULT,
                 mode="encode_visual",
                 visual_latent=next_obs["visual_latent"].to(self.device),
             )
-            next_actions, next_actor_aux = self.target_model(
-                forward_type=ForwardType.DEFAULT,
-                mode="actor",
-                visual_feat=next_visual_feat,
+            next_actions, next_actor_aux = policy.target_actor_forward(
+                visual_feat=next_visual_feat.detach(),
                 robot_state=next_obs["robot_state"].to(self.device),
                 ref_action=next_obs["ref_action"].to(self.device),
-                ref_action_dropout_p=0.0,
-                use_target=False,
             )
+            if self.target_policy_noise > 0.0:
+                noise = torch.randn_like(next_actions) * self.target_policy_noise
+                noise = noise.clamp(-self.target_noise_clip, self.target_noise_clip)
+                next_actions = next_actions + noise
             next_rl_state = next_actor_aux["rl_state"]
-            target_q1, target_q2 = self.target_model(
-                forward_type=ForwardType.DEFAULT,
-                mode="critic",
+            target_q1, target_q2 = policy.target_critic_forward(
                 rl_state=next_rl_state,
                 action=next_actions,
-                use_target=False,
             )
             target_q = torch.minimum(target_q1, target_q2)
             target_q_values = rewards_for_bootstrap + (1.0 - done_mask) * self.discount * target_q
@@ -382,7 +347,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             forward_type=ForwardType.DEFAULT,
             mode="critic",
             rl_state=curr_rl_state,
-            action=actions.to(self.device),
+            action=actions,
             use_target=False,
         )
         target_q_values = target_q_values.to(dtype=q1.dtype)
@@ -395,6 +360,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
+        policy = self._unwrap_policy(self.model)
         curr_obs = batch["curr_obs"]
         ref_action = curr_obs["ref_action"].to(self.device)
 
@@ -422,7 +388,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
         q_pi = torch.minimum(q1_pi, q2_pi)
 
-        policy = self._unwrap_policy(self.model)
         bc_loss = policy.compute_bc_loss(pi, ref_action)
         actor_loss = (-q_pi).mean() + self.bc_coef * bc_loss
         return actor_loss, {
@@ -445,9 +410,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             global_batch,
             global_batch_size_per_rank // self.cfg.actor.micro_batch_size,
         )
-        train_micro_batch_list = [put_tensor_device(batch, device=self.device) for batch in train_micro_batch_list]
+        train_micro_batch_list = [
+            put_tensor_device(batch, device=self.device) for batch in train_micro_batch_list
+        ]
 
-        # critic step
         self.qf_optimizer.zero_grad()
         gbs_critic_loss = []
         all_critic_metrics = {}
@@ -457,8 +423,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             critic_loss.backward()
             gbs_critic_loss.append(critic_loss.item() * self.gradient_accumulation)
             append_to_dict(all_critic_metrics, critic_metrics)
-        all_critic_metrics = {f"critic/{k}": np.mean(v) for k, v in all_critic_metrics.items()}
-        qf_grad_norm = self.model.clip_grad_norm_(max_norm=self.cfg.actor.critic_optim.clip_grad)
+        all_critic_metrics = {
+            f"critic/{k}": np.mean(v) for k, v in all_critic_metrics.items()
+        }
+        qf_grad_norm = self.model.clip_grad_norm_(
+            max_norm=self.cfg.actor.critic_optim.clip_grad
+        )
         self.qf_optimizer.step()
         self.qf_lr_scheduler.step()
 
@@ -469,7 +439,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             **all_critic_metrics,
         }
 
-        # actor step
+        actor_updated = False
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
             self.optimizer.zero_grad()
             gbs_actor_loss = []
@@ -481,9 +451,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
                 append_to_dict(all_actor_metrics, actor_metrics)
             all_actor_metrics = {f"actor/{k}": np.mean(v) for k, v in all_actor_metrics.items()}
-            actor_grad_norm = self.model.clip_grad_norm_(max_norm=self.cfg.actor.optim.clip_grad)
+            actor_grad_norm = self.model.clip_grad_norm_(
+                max_norm=self.cfg.actor.optim.clip_grad
+            )
             self.optimizer.step()
             self.lr_scheduler.step()
+            actor_updated = True
             metrics_data.update(
                 {
                     "gigawa/actor_loss": np.mean(gbs_actor_loss),
@@ -493,17 +466,88 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 }
             )
 
-        if self.target_model_initialized and self.update_step % self.target_update_freq == 0:
-            self.soft_update_target_model()
+        if actor_updated and self.update_step % self.target_update_freq == 0:
+            policy = self._unwrap_policy(self.model)
+            policy.soft_update_targets(tau=self.target_tau)
+            self._maybe_enable_rollout_rl_head()
 
-        self.update_step += 1
         return metrics_data
 
     def process_train_metrics(self, metrics):
         replay_buffer_stats = self.replay_buffer.get_stats()
-        replay_buffer_stats = {f"replay_buffer/{k}": v for k, v in replay_buffer_stats.items()}
+        replay_buffer_stats = {
+            f"replay_buffer/{key}": value for key, value in replay_buffer_stats.items()
+        }
         append_to_dict(metrics, replay_buffer_stats)
-        return metrics
+
+        if self.demo_buffer is not None:
+            demo_buffer_stats = self.demo_buffer.get_stats()
+            demo_buffer_stats = {
+                f"demo_buffer/{key}": value for key, value in demo_buffer_stats.items()
+            }
+            append_to_dict(metrics, demo_buffer_stats)
+
+        mean_metric_dict = {}
+        for key, value in metrics.items():
+            if isinstance(value, list) and len(value) > 0:
+                cpu_values = []
+                for v in value:
+                    if isinstance(v, torch.Tensor):
+                        cpu_values.append(v.detach().cpu().item())
+                    else:
+                        cpu_values.append(v)
+                mean_metric_dict[key] = np.mean(cpu_values)
+            else:
+                if isinstance(value, torch.Tensor):
+                    mean_metric_dict[key] = value.detach().cpu().item()
+                else:
+                    mean_metric_dict[key] = value
+
+        return all_reduce_dict(mean_metric_dict, op=torch.distributed.ReduceOp.AVG)
+
+    @Worker.timer("run_training")
+    def run_training(self):
+        if self.cfg.actor.get("enable_offload", False):
+            self.load_param_and_grad(self.device)
+            self.load_optimizer(self.device)
+
+        min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
+        if not self.replay_buffer.is_ready(min_buffer_size):
+            self.log_on_first_rank(
+                f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
+            )
+            return {}
+
+        train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
+        train_actor_steps = max(min_buffer_size, train_actor_steps)
+        train_actor = self.replay_buffer.is_ready(train_actor_steps)
+
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        )
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
+        )
+
+        self.model.train()
+        metrics = {}
+
+        update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+        for _ in range(update_epoch):
+            metrics_data = self.update_one_epoch(train_actor=train_actor)
+            append_to_dict(metrics, metrics_data)
+            self.update_step += 1
+
+        mean_metric_dict = self.process_train_metrics(metrics)
+
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        torch.cuda.empty_cache()
+        return mean_metric_dict
 
     def compute_advantages_and_returns(self):
         return {}
@@ -524,20 +568,16 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             checkpoint_format="local_shard" if self.cfg.actor.fsdp_config.use_orig_params else "dcp",
         )
 
-        target_model_save_path = os.path.join(save_base_path, "gigawa_components/target_model")
-        os.makedirs(target_model_save_path, exist_ok=True)
-        target_model_state_dict = self._strategy.get_model_state_dict(
-            self.target_model, cpu_offload=False, full_state_dict=True
-        )
-        torch.save(
-            target_model_state_dict,
-            os.path.join(target_model_save_path, f"checkpoint_rank_{self._rank}.pt"),
-        )
-
         buffer_save_path = os.path.join(
             save_base_path, f"gigawa_components/replay_buffer/rank_{self._rank}"
         )
         self.replay_buffer.save_checkpoint(buffer_save_path)
+
+        if self.demo_buffer is not None:
+            demo_buffer_save_path = os.path.join(
+                save_base_path, f"gigawa_components/demo_buffer/rank_{self._rank}"
+            )
+            self.demo_buffer.save_checkpoint(demo_buffer_save_path)
 
     def load_checkpoint(self, load_base_path):
         self._strategy.load_checkpoint(
@@ -548,31 +588,18 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             checkpoint_format="local_shard" if self.cfg.actor.fsdp_config.use_orig_params else "dcp",
         )
 
-        target_model_load_path = os.path.join(load_base_path, "gigawa_components/target_model")
-        target_model_state_dict = torch.load(
-            os.path.join(target_model_load_path, f"checkpoint_rank_{self._rank}.pt")
-        )
-        self._strategy.load_model_with_state_dict(
-            self.target_model,
-            target_model_state_dict,
-            cpu_offload=False,
-            full_state_dict=True,
-        )
-
         buffer_load_path = os.path.join(
             load_base_path, f"gigawa_components/replay_buffer/rank_{self._rank}"
         )
-        self.replay_buffer.load_checkpoint(buffer_load_path)
+        if os.path.isdir(buffer_load_path):
+            self.replay_buffer.load_checkpoint(buffer_load_path)
 
-    @Worker.timer("fit")
-    def fit(self):
-        metrics = {}
-        epochs = self.cfg.algorithm.get("update_epochs_per_step", 1)
-        for _ in range(epochs):
-            metric = self.update_one_epoch(train_actor=True)
-            append_to_dict(metrics, metric)
+        if self.demo_buffer is not None:
+            demo_buffer_load_path = os.path.join(
+                load_base_path, f"gigawa_components/demo_buffer/rank_{self._rank}"
+            )
+            if os.path.isdir(demo_buffer_load_path):
+                self.demo_buffer.load_checkpoint(demo_buffer_load_path)
 
-        # reduce metrics across ranks
-        metrics = {k: float(np.mean(v)) for k, v in metrics.items()}
-        metrics = all_reduce_dict(metrics, op="mean")
-        return metrics
+        policy = self._unwrap_policy(self.model)
+        self.rollout_rl_head_enabled = policy.get_use_rl_head_for_rollout()

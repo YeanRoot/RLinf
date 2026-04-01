@@ -42,13 +42,16 @@ def main(cfg) -> None:
 
     actor_placement = component_placement.get_strategy("actor")
 
-    if cfg.algorithm.loss_type == "embodied_sac":
+    loss_type = cfg.algorithm.loss_type
+    model_type = cfg.actor.model.get("model_type", None)
+
+    if loss_type == "embodied_sac":
         from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
         actor_worker_cls = EmbodiedSACFSDPPolicy
-    elif cfg.algorithm.loss_type == "embodied_gigawa":
+    elif loss_type == "embodied_gigawa" or model_type == "giga_world_policy":
         from rlinf.workers.actor.fsdp_gigawa_policy_worker import EmbodiedGigaWAFSDPPolicy
         actor_worker_cls = EmbodiedGigaWAFSDPPolicy
-    elif cfg.algorithm.loss_type == "embodied_dagger":
+    elif loss_type == "embodied_dagger":
         from rlinf.workers.actor.fsdp_dagger_policy_worker import (
             EmbodiedDAGGERFSDPPolicy,
         )
