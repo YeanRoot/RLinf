@@ -308,14 +308,14 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             curr_visual_feat = self.model(
                 forward_type=ForwardType.DEFAULT,
                 mode="encode_visual",
-                visual_latent=curr_obs["visual_latent"].to(self.device),
+                visual_latent=curr_obs["visual_latent"].to(self.device, dtype=self.torch_dtype),
             )
             _, curr_actor_aux = self.model(
                 forward_type=ForwardType.DEFAULT,
                 mode="actor",
                 visual_feat=curr_visual_feat.detach(),
-                robot_state=curr_obs["robot_state"].to(self.device),
-                ref_action=curr_obs["ref_action"].to(self.device),
+                robot_state=curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
+                ref_action=curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
                 ref_action_dropout_p=0.0,
                 use_target=False,
             )
@@ -324,12 +324,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             next_visual_feat = self.model(
                 forward_type=ForwardType.DEFAULT,
                 mode="encode_visual",
-                visual_latent=next_obs["visual_latent"].to(self.device),
+                visual_latent=next_obs["visual_latent"].to(self.device, dtype=self.torch_dtype),
             )
             next_actions, next_actor_aux = policy.target_actor_forward(
                 visual_feat=next_visual_feat.detach(),
-                robot_state=next_obs["robot_state"].to(self.device),
-                ref_action=next_obs["ref_action"].to(self.device),
+                robot_state=next_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
+                ref_action=next_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
             )
             if self.target_policy_noise > 0.0:
                 noise = torch.randn_like(next_actions) * self.target_policy_noise
@@ -362,18 +362,18 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     def forward_actor(self, batch):
         policy = self._unwrap_policy(self.model)
         curr_obs = batch["curr_obs"]
-        ref_action = curr_obs["ref_action"].to(self.device)
+        ref_action = curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype)
 
         visual_feat = self.model(
             forward_type=ForwardType.DEFAULT,
             mode="encode_visual",
-            visual_latent=curr_obs["visual_latent"].to(self.device),
+            visual_latent=curr_obs["visual_latent"].to(self.device, dtype=self.torch_dtype),
         )
         pi, actor_aux = self.model(
             forward_type=ForwardType.DEFAULT,
             mode="actor",
             visual_feat=visual_feat,
-            robot_state=curr_obs["robot_state"].to(self.device),
+            robot_state=curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
             ref_action=ref_action,
             ref_action_dropout_p=self.ref_action_dropout_p,
             use_target=False,

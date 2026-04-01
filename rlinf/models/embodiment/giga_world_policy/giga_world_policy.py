@@ -771,11 +771,16 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         """
         if visual_latent.ndim != 5:
             raise ValueError(f"Expected visual_latent [B,Z,T,H,W], got {tuple(visual_latent.shape)}")
-        x = visual_latent.float()
+
+        comp_param = next(self.visual_compressor.parameters())
+        comp_device = comp_param.device
+        comp_dtype = comp_param.dtype
+
+        x = visual_latent.to(device=comp_device, dtype=comp_dtype)
         if x.shape[2] == 1:
             x = x[:, :, 0]        # [B, Z, H, W]
         else:
-            x = x.mean(dim=2)     # first version: temporal average if T>1
+            x = x.mean(dim=2)     # [B, Z, H, W]
         return self.visual_compressor(x)
 
     def build_rl_state(
@@ -787,9 +792,15 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         """
         RL state x = [visual_feat, robot_state, ref_action_flat]
         """
-        ref_action_flat = ref_action.reshape(ref_action.shape[0], -1).float()
-        robot_state = robot_state.float()
-        visual_feat = visual_feat.float()
+        actor_param = next(self.actor_head.parameters())
+        actor_device = actor_param.device
+        actor_dtype = actor_param.dtype
+
+        visual_feat = visual_feat.to(device=actor_device, dtype=actor_dtype)
+        robot_state = robot_state.to(device=actor_device, dtype=actor_dtype)
+        ref_action_flat = ref_action.reshape(ref_action.shape[0], -1).to(
+            device=actor_device, dtype=actor_dtype
+        )
         return torch.cat([visual_feat, robot_state, ref_action_flat], dim=-1)
 
     def _apply_ref_action_dropout(
@@ -804,7 +815,9 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         if (not self.training) or p <= 0.0:
             return ref_action, None
         batch_size = ref_action.shape[0]
-        keep = (torch.rand(batch_size, 1, 1, device=ref_action.device) > p).float()
+        keep = (
+            torch.rand(batch_size, 1, 1, device=ref_action.device) > p
+        ).to(dtype=ref_action.dtype)
         dropped = ref_action * keep
         return dropped, keep
 
@@ -857,9 +870,16 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         action: torch.Tensor,
         use_target: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        action_flat = action.reshape(action.shape[0], -1).float()
         critic = self.critic_target if use_target else self.critic
-        return critic(rl_state.float(), action_flat)
+        critic_param = next(critic.parameters())
+        critic_device = critic_param.device
+        critic_dtype = critic_param.dtype
+
+        rl_state = rl_state.to(device=critic_device, dtype=critic_dtype)
+        action_flat = action.reshape(action.shape[0], -1).to(
+            device=critic_device, dtype=critic_dtype
+        )
+        return critic(rl_state, action_flat)
 
     def target_actor_forward(
         self,
