@@ -351,11 +351,13 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             in_channels=self.vae_z_dim,
             out_dim=self.visual_feature_dim,
         )
-        self.ref_action_flat_dim = self.action_chunk * self.env_action_dim
+        self.ref_action_flat_dim = self.action_chunk * self.model_action_dim
         self.robot_state_dim = self.model_action_dim
         self.rl_state_dim = self.visual_feature_dim + self.robot_state_dim + self.ref_action_flat_dim
 
-        # actor outputs FINAL action chunk directly
+        # actor outputs MODEL-SPACE action chunk directly. During rollout, the
+        # model-space action is post-processed with the same WA logic used by the
+        # base policy before being sent to the environment.
         self.actor_head = MLP(
             input_dim=self.rl_state_dim,
             hidden_dims=[2048, 1024],
@@ -731,16 +733,21 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         if debug_dict is not None:
             self._dump_latent_debug(debug_dict, prompt=prompt)
 
-        ref_action = self._postprocess_pred_delta(pred_delta_norm, state_pad)[0]  # [C, A]
+        # `ref_action_model` stays in the WA model space (normalized delta space).
+        # The executed action is obtained by applying the same WA post-process used
+        # by the base policy.
+        ref_action_model = pred_delta_norm[0].float()  # [C, A_model]
+        ref_action_exec = self._postprocess_pred_delta(pred_delta_norm, state_pad)[0]  # [C, A_env]
         visual_latent = self._extract_visual_latent_from_ref(
             ref_image=ref_image,
             norm_state=norm_state,
         )[0]  # [Z, T, H, W]
 
         return {
-            "visual_latent": visual_latent,         # [Z, T, H, W]
-            "robot_state": state_pad.float(),       # [state_dim]
-            "ref_action": ref_action,               # [C, A]
+            "visual_latent": visual_latent,             # [Z, T, H, W]
+            "robot_state": state_pad.float(),           # [state_dim]
+            "ref_action": ref_action_model,             # [C, A_model]
+            "ref_action_exec": ref_action_exec,         # [C, A_env]
         }
 
     @torch.no_grad()
@@ -749,19 +756,22 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         Frozen backbone extraction for a batch of RobotWin observations.
 
         Returns:
-            visual_latent: [B, Z, T, H, W]
-            robot_state:   [B, state_dim]
-            ref_action:    [B, C, A]
+            visual_latent:   [B, Z, T, H, W]
+            robot_state:     [B, state_dim]
+            ref_action:      [B, C, A_model]  (model-space action)
+            ref_action_exec: [B, C, A_env]    (post-processed executable action)
         """
         batch_size = int(env_obs["states"].shape[0])
         outs = [self._extract_frozen_backbone_single(env_obs, i) for i in range(batch_size)]
         visual_latent = torch.stack([o["visual_latent"] for o in outs], dim=0).to(self.device_ref)
         robot_state = torch.stack([o["robot_state"] for o in outs], dim=0).to(self.device_ref)
         ref_action = torch.stack([o["ref_action"] for o in outs], dim=0).to(self.device_ref)
+        ref_action_exec = torch.stack([o["ref_action_exec"] for o in outs], dim=0).to(self.device_ref)
         return {
             "visual_latent": visual_latent,
             "robot_state": robot_state,
             "ref_action": ref_action,
+            "ref_action_exec": ref_action_exec,
         }
 
     def encode_visual(self, visual_latent: torch.Tensor) -> torch.Tensor:
@@ -854,7 +864,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
         head = self.actor_target if use_target else self.actor_head
         action_flat = head(rl_state)
-        action = action_flat.view(-1, self.action_chunk, self.env_action_dim)
+        action = action_flat.view(-1, self.action_chunk, self.model_action_dim)
 
         aux = {
             "rl_state": rl_state,
@@ -905,6 +915,28 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             action=action,
             use_target=True,
         )
+
+    @torch.no_grad()
+    def postprocess_action_model_batch(
+        self,
+        action_model: torch.Tensor,
+        robot_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Convert model-space action chunks into executable env-space actions using
+        the same WA post-processing as the base policy.
+
+        Args:
+            action_model: [B, C, A_model]
+            robot_state:  [B, state_dim], where state_dim matches the padded state
+                          used by WA post-processing.
+        Returns:
+            action_exec:  [B, C, A_env]
+        """
+        outs = []
+        for i in range(action_model.shape[0]):
+            outs.append(self._postprocess_pred_delta(action_model[i : i + 1], robot_state[i])[0])
+        return torch.stack(outs, dim=0)
 
     def compute_bc_loss(
         self,
@@ -1040,9 +1072,13 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         raise ValueError(f"Unsupported mode for default_forward: {mode}")
 
     @torch.no_grad()
-    def _plan_single(self, env_obs: dict[str, Any], index: int) -> torch.Tensor:
+    def _plan_single(self, env_obs: dict[str, Any], index: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Base WA reference action for rollout / warmup.
+
+        Returns:
+            action_exec:  executable action chunk in env space
+            action_model: action chunk in WA model space
         """
         ref_image = self._build_ref_image(env_obs, index)
         norm_state, state_pad = self._normalize_state(env_obs["states"][index])
@@ -1057,8 +1093,9 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         if debug_dict is not None:
             self._dump_latent_debug(debug_dict, prompt=prompt)
 
-        pred_action = self._postprocess_pred_delta(pred_delta_norm, state_pad)
-        return pred_action[0]
+        pred_action_exec = self._postprocess_pred_delta(pred_delta_norm, state_pad)
+        pred_action_model = pred_delta_norm.float()
+        return pred_action_exec[0], pred_action_model[0]
 
     @torch.no_grad()
     def predict_action_batch(
@@ -1072,38 +1109,49 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         batch_size = int(env_obs["states"].shape[0])
 
         if not self.get_use_rl_head_for_rollout():
-            action_chunks = [self._plan_single(env_obs, idx) for idx in range(batch_size)]
-            actions = torch.stack(action_chunks, dim=0).to(self.device_ref)
+            exec_chunks = []
+            model_chunks = []
+            for idx in range(batch_size):
+                action_exec, action_model = self._plan_single(env_obs, idx)
+                exec_chunks.append(action_exec)
+                model_chunks.append(action_model)
+            actions_exec = torch.stack(exec_chunks, dim=0).to(self.device_ref)
+            actions_model = torch.stack(model_chunks, dim=0).to(self.device_ref)
         else:
             backbone = self.extract_frozen_backbone_batch(env_obs)
             visual_feat = self.encode_visual(backbone["visual_latent"])
-            actions, _ = self.actor_forward(
+            actions_model, _ = self.actor_forward(
                 visual_feat=visual_feat,
                 robot_state=backbone["robot_state"],
                 ref_action=backbone["ref_action"],
                 ref_action_dropout_p=0.0,
                 use_target=False,
             )
-            actions = actions.to(self.device_ref)
+            actions_model = actions_model.to(self.device_ref)
+            actions_exec = self.postprocess_action_model_batch(
+                action_model=actions_model,
+                robot_state=backbone["robot_state"],
+            ).to(self.device_ref)
 
         result = {
             "prev_logprobs": torch.zeros(
                 batch_size,
                 self.action_chunk,
-                device=actions.device,
+                device=actions_exec.device,
                 dtype=torch.float32,
             ),
             "prev_values": torch.zeros(
                 batch_size,
                 1,
-                device=actions.device,
+                device=actions_exec.device,
                 dtype=torch.float32,
             ),
             "forward_inputs": {
-                "action": actions.reshape(batch_size, -1).contiguous(),
+                "action": actions_exec.reshape(batch_size, -1).contiguous(),
+                "model_action": actions_model.reshape(batch_size, -1).contiguous(),
             },
         }
-        return actions, result
+        return actions_exec, result
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)

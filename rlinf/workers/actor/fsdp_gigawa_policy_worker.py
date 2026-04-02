@@ -45,6 +45,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.replay_buffer = None
         self.demo_buffer = None
         self.update_step = 0
+        self.actor_update_step = 0
         self.rollout_rl_head_enabled = False
 
     # ---------------------------------------------------------------------
@@ -169,6 +170,18 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.ref_action_dropout_p = float(self.cfg.algorithm.get("ref_action_dropout_p", 0.5))
         self.target_policy_noise = float(self.cfg.algorithm.get("target_policy_noise", 0.2))
         self.target_noise_clip = float(self.cfg.algorithm.get("target_noise_clip", 0.5))
+        self.warmup_steps = int(self.cfg.algorithm.get("warmup_steps", 0))
+        self.rollout_actor_after_warmup = bool(
+            self.cfg.algorithm.get("rollout_actor_after_warmup", True)
+        )
+        self.rollout_actor_min_actor_updates = int(
+            self.cfg.algorithm.get("rollout_actor_min_actor_updates", 50)
+        )
+        self.utd_ratio = int(
+            self.cfg.algorithm.get(
+                "utd_ratio", self.cfg.algorithm.get("update_epoch", 1)
+            )
+        )
 
     # ---------------------------------------------------------------------
     # Helpers
@@ -179,6 +192,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
     def _maybe_enable_rollout_rl_head(self):
         if self.rollout_rl_head_enabled:
+            return
+        if not self.rollout_actor_after_warmup:
+            return
+        if len(self.replay_buffer) < self.warmup_steps:
+            return
+        if self.actor_update_step < self.rollout_actor_min_actor_updates:
             return
         policy = self._unwrap_policy(self.model)
         policy.set_use_rl_head_for_rollout(True)
@@ -213,7 +232,13 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     @torch.no_grad()
     def _convert_trajectory_for_gigawa(self, traj: Trajectory) -> Trajectory:
         assert traj.curr_obs and traj.next_obs, "Trajectory must contain curr_obs and next_obs."
-        traj_len = int(traj.actions.shape[0])
+        source_actions = None
+        if traj.forward_inputs and "model_action" in traj.forward_inputs:
+            source_actions = traj.forward_inputs["model_action"]
+        else:
+            source_actions = traj.actions
+        assert source_actions is not None, "Trajectory must contain actions or model_action."
+        traj_len = int(source_actions.shape[0])
 
         curr_visual_latents = []
         curr_robot_states = []
@@ -239,7 +264,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         return Trajectory(
             max_episode_length=traj.max_episode_length,
             model_weights_id=traj.model_weights_id,
-            actions=traj.actions.cpu().contiguous() if traj.actions is not None else None,
+            actions=source_actions.cpu().contiguous() if source_actions is not None else None,
             intervene_flags=traj.intervene_flags.cpu().contiguous() if traj.intervene_flags is not None else None,
             rewards=traj.rewards.cpu().contiguous() if traj.rewards is not None else None,
             terminations=traj.terminations.cpu().contiguous() if traj.terminations is not None else None,
@@ -297,6 +322,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         curr_obs = batch["curr_obs"]
         next_obs = batch["next_obs"]
+        # Replay buffer stores model-space actions; executable env-space actions are
+        # only used to interact with the simulator and compute rewards.
         actions = batch["actions"].to(self.device, dtype=self.torch_dtype)
         rewards = batch["rewards"]
         terminations = batch["terminations"]
@@ -457,6 +484,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.optimizer.step()
             self.lr_scheduler.step()
             actor_updated = True
+            self.actor_update_step += 1
             metrics_data.update(
                 {
                     "gigawa/actor_loss": np.mean(gbs_actor_loss),
@@ -512,14 +540,15 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.load_optimizer(self.device)
 
         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
-        if not self.replay_buffer.is_ready(min_buffer_size):
+        train_start_size = max(min_buffer_size, self.warmup_steps)
+        if not self.replay_buffer.is_ready(train_start_size):
             self.log_on_first_rank(
-                f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
+                f"Replay buffer size {len(self.replay_buffer)} < {train_start_size}, skipping training"
             )
             return {}
 
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
-        train_actor_steps = max(min_buffer_size, train_actor_steps)
+        train_actor_steps = max(train_start_size, train_actor_steps)
         train_actor = self.replay_buffer.is_ready(train_actor_steps)
 
         assert (
@@ -536,7 +565,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.model.train()
         metrics = {}
 
-        update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+        update_epoch = self.utd_ratio
         for _ in range(update_epoch):
             metrics_data = self.update_one_epoch(train_actor=train_actor)
             append_to_dict(metrics, metrics_data)

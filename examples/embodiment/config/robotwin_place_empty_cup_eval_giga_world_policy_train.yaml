@@ -13,7 +13,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor, env, rollout: 0-7
+    actor, env, rollout: 0-3
 
 runner:
   task_type: embodied
@@ -23,7 +23,7 @@ runner:
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 20
+  max_epochs: 200000 #test
   max_steps: -1
 
   only_eval: False
@@ -81,20 +81,24 @@ algorithm:
   gamma: 0.99
   gae_lambda: 0.95
 
-  reward_coef: 5.0
+  reward_coef: 1 #test
   filter_rewards: False
   rewards_lower_bound: 0.0
   rewards_upper_bound: 5.0
 
   update_epoch: 1
+  utd_ratio: 1 #test
   critic_actor_ratio: 2
   tau: 0.005
   target_update_freq: 1
   target_policy_noise: 0.2
   target_noise_clip: 0.5
   bc_coef: 1.0
-  ref_action_dropout_p: 0.5
-  train_actor_steps: 0
+  ref_action_dropout_p: 0.0 #test 0.5
+  warmup_steps: 20
+  train_actor_steps: 20
+  rollout_actor_after_warmup: false #test 
+  rollout_actor_min_actor_updates: 50000
 
   sampling_params:
     do_sample: False
@@ -203,7 +207,7 @@ actor:
       use_rl_head_for_rollout: False
       visual_feature_dim: 2048
       bc_coef: 1.0
-      ref_action_dropout_p: 0.5
+      ref_action_dropout_p: 0 #test 0.5
       target_tau: 0.005
       enable_latent_debug: False
       latent_debug_dir: "${runner.logger.log_path}/latent_debug"
