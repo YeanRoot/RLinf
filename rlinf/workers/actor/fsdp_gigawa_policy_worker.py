@@ -57,7 +57,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         policy = self._unwrap_policy(self.model)
         policy.soft_update_targets(tau=1.0)
-        policy.set_use_rl_head_for_rollout(False)
+
+        initial_rollout_flag = bool(
+            self.cfg.actor.model.giga_world_policy.get("use_rl_head_for_rollout", False)
+        )
+        policy.set_use_rl_head_for_rollout(initial_rollout_flag)
+        self.rollout_rl_head_enabled = initial_rollout_flag
 
         if self.cfg.actor.get("enable_offload", False):
             self.offload_param_and_grad()
@@ -405,6 +410,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             ref_action_dropout_p=self.ref_action_dropout_p,
             use_target=False,
         )
+
+        bc_loss = policy.compute_bc_loss(pi, ref_action)
         rl_state = actor_aux["rl_state"]
         q1_pi, q2_pi = self.model(
             forward_type=ForwardType.DEFAULT,
@@ -415,7 +422,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
         q_pi = torch.minimum(q1_pi, q2_pi)
 
-        bc_loss = policy.compute_bc_loss(pi, ref_action)
         actor_loss = (-q_pi).mean() + self.bc_coef * bc_loss
         return actor_loss, {
             "q_pi": q_pi.mean().item(),
@@ -467,7 +473,9 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         }
 
         actor_updated = False
-        if self.update_step % self.critic_actor_ratio == 0 and train_actor:
+        actor_update_due = self.update_step % self.critic_actor_ratio == 0
+
+        if actor_update_due and train_actor:
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             all_actor_metrics = {}
