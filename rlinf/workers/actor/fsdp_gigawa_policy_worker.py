@@ -188,6 +188,26 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             )
         )
 
+        self.training_stage = str(
+            self.cfg.algorithm.get("training_stage", "full_rl")
+        ).lower()
+        valid_stages = {"bc_actor_pretrain", "critic_warmup", "full_rl"}
+        if self.training_stage not in valid_stages:
+            raise ValueError(
+                f"Unsupported training_stage={self.training_stage}, expected one of {sorted(valid_stages)}"
+            )
+
+        self.stage_actor_bc_only = self.training_stage == "bc_actor_pretrain"
+        self.stage_freeze_actor = self.training_stage == "critic_warmup"
+        self.stage_full_rl = self.training_stage == "full_rl"
+        # Unified handoff rule:
+        #   - Stage 1 (bc_actor_pretrain): handoff is allowed iff rollout_actor_after_warmup=true
+        #   - Stage 2 (critic_warmup): handoff is always disabled
+        #   - Stage 3 (full_rl): handoff is allowed iff rollout_actor_after_warmup=true
+        # The actual switch still goes through _maybe_enable_rollout_rl_head(), which checks
+        # rollout_actor_after_warmup / warmup_steps / rollout_actor_min_actor_updates.
+        self.allow_rollout_actor_handoff = not self.stage_freeze_actor
+
     # ---------------------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------------------
@@ -198,6 +218,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     def _maybe_enable_rollout_rl_head(self):
         if self.rollout_rl_head_enabled:
             return
+        if not self.allow_rollout_actor_handoff:
+            return
         if not self.rollout_actor_after_warmup:
             return
         if len(self.replay_buffer) < self.warmup_steps:
@@ -207,6 +229,27 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         policy = self._unwrap_policy(self.model)
         policy.set_use_rl_head_for_rollout(True)
         self.rollout_rl_head_enabled = True
+
+    def _maybe_update_targets(self, actor_updated: bool, critic_updated: bool):
+        if self.update_step % self.target_update_freq != 0:
+            return
+
+        should_update = False
+        tau = self.target_tau
+        if self.stage_actor_bc_only:
+            should_update = actor_updated
+            tau = 1.0
+        elif self.stage_freeze_actor:
+            should_update = critic_updated
+        else:
+            should_update = actor_updated or critic_updated
+
+        if not should_update:
+            return
+
+        policy = self._unwrap_policy(self.model)
+        policy.soft_update_targets(tau=tau)
+        self._maybe_enable_rollout_rl_head()
 
     def _slice_obs_at_step(self, obs: dict[str, Any], t: int) -> dict[str, Any]:
         step_obs = {}
@@ -412,6 +455,20 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
 
         bc_loss = policy.compute_bc_loss(pi, ref_action)
+
+        metrics = {
+            "bc_loss": bc_loss.item(),
+            "ref_action_dropout_p": self.ref_action_dropout_p,
+            "training_stage": float(
+                0 if self.stage_actor_bc_only else 1 if self.stage_freeze_actor else 2
+            ),
+        }
+
+        if self.stage_actor_bc_only:
+            actor_loss = self.bc_coef * bc_loss
+            metrics["q_pi"] = 0.0
+            return actor_loss, metrics
+
         rl_state = actor_aux["rl_state"]
         q1_pi, q2_pi = self.model(
             forward_type=ForwardType.DEFAULT,
@@ -423,11 +480,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         q_pi = torch.minimum(q1_pi, q2_pi)
 
         actor_loss = (-q_pi).mean() + self.bc_coef * bc_loss
-        return actor_loss, {
-            "q_pi": q_pi.mean().item(),
-            "bc_loss": bc_loss.item(),
-            "ref_action_dropout_p": self.ref_action_dropout_p,
-        }
+        metrics["q_pi"] = q_pi.mean().item()
+        return actor_loss, metrics
 
     # ---------------------------------------------------------------------
     # Update loop
@@ -447,35 +501,49 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             put_tensor_device(batch, device=self.device) for batch in train_micro_batch_list
         ]
 
-        self.qf_optimizer.zero_grad()
-        gbs_critic_loss = []
-        all_critic_metrics = {}
-        for batch in train_micro_batch_list:
-            critic_loss, critic_metrics = self.forward_critic(batch)
-            critic_loss = critic_loss / self.gradient_accumulation
-            critic_loss.backward()
-            gbs_critic_loss.append(critic_loss.item() * self.gradient_accumulation)
-            append_to_dict(all_critic_metrics, critic_metrics)
-        all_critic_metrics = {
-            f"critic/{k}": np.mean(v) for k, v in all_critic_metrics.items()
-        }
-        qf_grad_norm = self.model.clip_grad_norm_(
-            max_norm=self.cfg.actor.critic_optim.clip_grad
-        )
-        self.qf_optimizer.step()
-        self.qf_lr_scheduler.step()
-
         metrics_data = {
-            "gigawa/critic_loss": np.mean(gbs_critic_loss),
-            "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
-            "critic/grad_norm": qf_grad_norm,
-            **all_critic_metrics,
+            "stage/is_bc_actor_pretrain": float(self.stage_actor_bc_only),
+            "stage/is_critic_warmup": float(self.stage_freeze_actor),
+            "stage/is_full_rl": float(self.stage_full_rl),
         }
+
+        critic_updated = False
+        if not self.stage_actor_bc_only:
+            self.qf_optimizer.zero_grad()
+            gbs_critic_loss = []
+            all_critic_metrics = {}
+            for batch in train_micro_batch_list:
+                critic_loss, critic_metrics = self.forward_critic(batch)
+                critic_loss = critic_loss / self.gradient_accumulation
+                critic_loss.backward()
+                gbs_critic_loss.append(critic_loss.item() * self.gradient_accumulation)
+                append_to_dict(all_critic_metrics, critic_metrics)
+            all_critic_metrics = {
+                f"critic/{k}": np.mean(v) for k, v in all_critic_metrics.items()
+            }
+            qf_grad_norm = self.model.clip_grad_norm_(
+                max_norm=self.cfg.actor.critic_optim.clip_grad
+            )
+            self.qf_optimizer.step()
+            self.qf_lr_scheduler.step()
+            critic_updated = True
+
+            metrics_data.update(
+                {
+                    "gigawa/critic_loss": np.mean(gbs_critic_loss),
+                    "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
+                    "critic/grad_norm": qf_grad_norm,
+                    **all_critic_metrics,
+                }
+            )
+        else:
+            metrics_data.update({"gigawa/critic_skipped": 1.0})
 
         actor_updated = False
-        actor_update_due = self.update_step % self.critic_actor_ratio == 0
+        actor_update_due = self.stage_actor_bc_only or (self.update_step % self.critic_actor_ratio == 0)
+        actor_train_enabled = train_actor and (not self.stage_freeze_actor)
 
-        if actor_update_due and train_actor:
+        if actor_update_due and actor_train_enabled:
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             all_actor_metrics = {}
@@ -501,11 +569,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     **all_actor_metrics,
                 }
             )
+        elif self.stage_freeze_actor:
+            metrics_data.update({"gigawa/actor_frozen": 1.0})
 
-        if actor_updated and self.update_step % self.target_update_freq == 0:
-            policy = self._unwrap_policy(self.model)
-            policy.soft_update_targets(tau=self.target_tau)
-            self._maybe_enable_rollout_rl_head()
+        self._maybe_update_targets(actor_updated=actor_updated, critic_updated=critic_updated)
 
         return metrics_data
 
@@ -639,4 +706,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 self.demo_buffer.load_checkpoint(demo_buffer_load_path)
 
         policy = self._unwrap_policy(self.model)
+        if self.stage_freeze_actor:
+            policy.soft_update_targets(tau=1.0)
         self.rollout_rl_head_enabled = policy.get_use_rl_head_for_rollout()

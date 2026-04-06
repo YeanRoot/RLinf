@@ -19,7 +19,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python eval_embodied_agent.py   --config-path ./con
 
 train
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
-python train_embodied_agent_gigawa.py   --config-path ./config   --config-name robotwin_place_empty_cup_eval_giga_world_policy_train   ++actor.fsdp_config.use_orig_params=true
+python train_embodied_agent_gigawa.py   --config-path ./config   --config-name robotwin_place_empty_cup_eval_giga_world_policy_train2   ++actor.fsdp_config.use_orig_params=true
 
 tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/test403_1_rl \
   --host 0.0.0.0 \

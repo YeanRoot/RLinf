@@ -18,17 +18,17 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "../results/test402_2"
+    log_path: "../results/test406_1_bc"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 200000 #test
+  max_epochs: 2000 #test
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 500
-  save_interval: 500
+  val_check_interval: 200
+  save_interval: 200
 
   resume_dir: null
   ckpt_path: null
@@ -86,22 +86,21 @@ algorithm:
   rewards_lower_bound: 0.0
   rewards_upper_bound: 5.0
 
+  training_stage: bc_actor_pretrain # bc_actor_pretrain / critic_warmup / full_rl
+
   update_epoch: 1
   utd_ratio: 5 #test
   critic_actor_ratio: 2
   tau: 0.005
   target_update_freq: 1
-  target_policy_noise: 0.2
-  target_noise_clip: 0.5
+  target_policy_noise: 0.0
+  target_noise_clip: 0.0
   bc_coef: 1.0
-  bc_only: True
-  bc_only_disable_critic: True
-  bc_target: ref_action
-  ref_action_dropout_p: 0.0 #test 0.5
+  ref_action_dropout_p: 0
   warmup_steps: 128
   train_actor_steps: 128
-  rollout_actor_after_warmup: True #test 
-  rollout_actor_min_actor_updates: 2500
+  rollout_actor_after_warmup: true
+  rollout_actor_min_actor_updates: 0
 
   sampling_params:
     do_sample: False
@@ -177,7 +176,7 @@ actor:
   enable_offload: False
 
   critic_optim:
-    lr: 0.000155
+    lr: 3.0e-5
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
@@ -209,8 +208,8 @@ actor:
       use_safetensors: False
       use_rl_head_for_rollout: False
       visual_feature_dim: 2048
-      bc_coef: 1.0
-      ref_action_dropout_p: 0 #test 0.5
+      bc_coef: 1
+      ref_action_dropout_p: 0
       target_tau: 0.005
       enable_latent_debug: False
       latent_debug_dir: "${runner.logger.log_path}/latent_debug"
