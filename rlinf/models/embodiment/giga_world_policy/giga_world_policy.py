@@ -292,6 +292,46 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self.ref_action_dropout_p = float(policy_cfg.get("ref_action_dropout_p", 0.5))
         self.target_tau = float(policy_cfg.get("target_tau", 0.005))
 
+        self.actor_output_mode = str(
+            policy_cfg.get("actor_output_mode", "learned")
+        ).lower()
+        valid_actor_output_modes = {"learned", "hard_copy_ref_action"}
+        if self.actor_output_mode not in valid_actor_output_modes:
+            raise ValueError(
+                f"Unsupported actor_output_mode={self.actor_output_mode}, "
+                f"expected one of {sorted(valid_actor_output_modes)}"
+            )
+
+        self.ref_action_input_mode = str(
+            policy_cfg.get("ref_action_input_mode", "normal")
+        ).lower()
+        valid_ref_action_input_modes = {"normal", "zero", "remove"}
+        if self.ref_action_input_mode not in valid_ref_action_input_modes:
+            raise ValueError(
+                f"Unsupported ref_action_input_mode={self.ref_action_input_mode}, "
+                f"expected one of {sorted(valid_ref_action_input_modes)}"
+            )
+
+        self.visual_input_mode = str(
+            policy_cfg.get("visual_input_mode", "normal")
+        ).lower()
+        valid_visual_input_modes = {"normal", "zero", "remove"}
+        if self.visual_input_mode not in valid_visual_input_modes:
+            raise ValueError(
+                f"Unsupported visual_input_mode={self.visual_input_mode}, "
+                f"expected one of {sorted(valid_visual_input_modes)}"
+            )
+
+        self.robot_state_input_mode = str(
+            policy_cfg.get("robot_state_input_mode", "normal")
+        ).lower()
+        valid_robot_state_input_modes = {"normal", "zero", "remove"}
+        if self.robot_state_input_mode not in valid_robot_state_input_modes:
+            raise ValueError(
+                f"Unsupported robot_state_input_mode={self.robot_state_input_mode}, "
+                f"expected one of {sorted(valid_robot_state_input_modes)}"
+            )
+
         vae = AutoencoderKLWan.from_pretrained(
             base_model_dir,
             subfolder="vae",
@@ -353,7 +393,12 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         )
         self.ref_action_flat_dim = self.action_chunk * self.model_action_dim
         self.robot_state_dim = self.model_action_dim
-        self.rl_state_dim = self.visual_feature_dim + self.robot_state_dim + self.ref_action_flat_dim
+        self.visual_cond_dim = 0 if self.visual_input_mode == "remove" else self.visual_feature_dim
+        self.robot_state_cond_dim = 0 if self.robot_state_input_mode == "remove" else self.robot_state_dim
+        self.ref_action_cond_dim = 0 if self.ref_action_input_mode == "remove" else self.ref_action_flat_dim
+        self.rl_state_dim = (
+            self.visual_cond_dim + self.robot_state_cond_dim + self.ref_action_cond_dim
+        )
 
         # actor outputs MODEL-SPACE action chunk directly. During rollout, the
         # model-space action is post-processed with the same WA logic used by the
@@ -798,9 +843,14 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         visual_feat: torch.Tensor,
         robot_state: torch.Tensor,
         ref_action: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
-        RL state x = [visual_feat, robot_state, ref_action_flat]
+        Build actor/critic state from the selected conditioning sources.
+
+        Each source can be:
+          - normal: keep the original tensor
+          - zero:   keep the same shape but replace with zeros
+          - remove: remove the source from the concatenated RL state
         """
         actor_param = next(self.actor_head.parameters())
         actor_device = actor_param.device
@@ -811,7 +861,39 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         ref_action_flat = ref_action.reshape(ref_action.shape[0], -1).to(
             device=actor_device, dtype=actor_dtype
         )
-        return torch.cat([visual_feat, robot_state, ref_action_flat], dim=-1)
+
+        parts = []
+        aux = {}
+
+        if self.visual_input_mode != "remove":
+            visual_feat_for_state = (
+                torch.zeros_like(visual_feat) if self.visual_input_mode == "zero" else visual_feat
+            )
+            parts.append(visual_feat_for_state)
+            aux["visual_feat_for_state"] = visual_feat_for_state
+
+        if self.robot_state_input_mode != "remove":
+            robot_state_for_state = (
+                torch.zeros_like(robot_state) if self.robot_state_input_mode == "zero" else robot_state
+            )
+            parts.append(robot_state_for_state)
+            aux["robot_state_for_state"] = robot_state_for_state
+
+        if self.ref_action_input_mode != "remove":
+            ref_action_flat_for_state = (
+                torch.zeros_like(ref_action_flat)
+                if self.ref_action_input_mode == "zero"
+                else ref_action_flat
+            )
+            parts.append(ref_action_flat_for_state)
+            aux["ref_action_flat_for_state"] = ref_action_flat_for_state
+
+        if not parts:
+            raise RuntimeError(
+                "RL state is empty. At least one of visual / robot_state / ref_action must remain in the actor input."
+            )
+
+        return torch.cat(parts, dim=-1), aux
 
     def _apply_ref_action_dropout(
         self,
@@ -856,7 +938,8 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         cond_ref_action, dropout_mask = self._apply_ref_action_dropout(
             ref_action, p=ref_action_dropout_p
         )
-        rl_state = self.build_rl_state(
+
+        rl_state, rl_state_aux = self.build_rl_state(
             visual_feat=visual_feat,
             robot_state=robot_state,
             ref_action=cond_ref_action,
@@ -864,12 +947,18 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
         head = self.actor_target if use_target else self.actor_head
         action_flat = head(rl_state)
-        action = action_flat.view(-1, self.action_chunk, self.model_action_dim)
+        learned_action = action_flat.view(-1, self.action_chunk, self.model_action_dim)
+
+        if self.actor_output_mode == "hard_copy_ref_action":
+            action = ref_action.to(dtype=rl_state.dtype) + 0.0 * learned_action
+        else:
+            action = learned_action
 
         aux = {
             "rl_state": rl_state,
             "cond_ref_action": cond_ref_action,
         }
+        aux.update(rl_state_aux)
         if dropout_mask is not None:
             aux["ref_dropout_mask"] = dropout_mask
         return action, aux

@@ -35,5 +35,18 @@ giga_world_policy:
   bc_coef: 1.0
   ref_action_dropout_p: 0.5
   target_tau: 0.005
+
+  # Debug / ablation knobs for BC-copy diagnosis:
+  #   actor_output_mode:
+  #     - learned: use the MLP actor head (default)
+  #     - hard_copy_ref_action: bypass the MLP and output ref_action directly
+  #   *_input_mode (for visual / robot_state / ref_action):
+  #     - normal: keep this input branch (default)
+  #     - zero: keep the same input shape but replace this branch with zeros
+  #     - remove: completely remove this branch from the actor/critic input
+  actor_output_mode: "learned"
+  visual_input_mode: "normal"
+  robot_state_input_mode: "normal"
+  ref_action_input_mode: "normal"
   enable_latent_debug: False
   latent_debug_dir: "./results/latent_debug"
