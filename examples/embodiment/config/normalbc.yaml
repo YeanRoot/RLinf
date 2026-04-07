@@ -18,7 +18,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "../results/test407_1_zero"
+    log_path: "../results/test407_1_norm"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -38,7 +38,7 @@ algorithm:
     enable_cache: True
     cache_size: 2000
     sample_window_size: 2000
-    min_buffer_size: 128
+    min_buffer_size: 64
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
@@ -97,8 +97,8 @@ algorithm:
   target_noise_clip: 0.0
   bc_coef: 1.0
   ref_action_dropout_p: 0
-  warmup_steps: 128
-  train_actor_steps: 128
+  warmup_steps: 64
+  train_actor_steps: 64
   rollout_actor_after_warmup: true
   rollout_actor_min_actor_updates: 500
 
@@ -214,8 +214,8 @@ actor:
       enable_latent_debug: False
       latent_debug_dir: "${runner.logger.log_path}/latent_debug"
       actor_output_mode: "learned"
-      visual_input_mode: "zero"
-      robot_state_input_mode: "zero"
+      visual_input_mode: "normal"
+      robot_state_input_mode: "normal"
       ref_action_input_mode: "normal"
 
   optim:
