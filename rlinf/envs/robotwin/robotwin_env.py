@@ -324,6 +324,57 @@ class RoboTwinEnv(gym.Env):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         num_envs = chunk_actions.shape[0]
         chunk_step = chunk_actions.shape[1]
+        chunk_step_mode = str(self.cfg.get("chunk_step_mode", "vectorized")).lower()
+
+        if chunk_step_mode == "sequential":
+            obs_list = []
+            infos_list = []
+            chunk_rewards = []
+            raw_chunk_terminations = []
+            raw_chunk_truncations = []
+
+            for i in range(chunk_step):
+                actions = chunk_actions[:, i]
+                extracted_obs, step_reward, terminations, truncations, infos = self.step(
+                    actions, auto_reset=False
+                )
+                obs_list.append(extracted_obs)
+                infos_list.append(infos)
+                chunk_rewards.append(step_reward)
+                raw_chunk_terminations.append(terminations)
+                raw_chunk_truncations.append(truncations)
+
+            chunk_rewards = torch.stack(chunk_rewards, dim=1)
+            raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+            raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+
+            past_terminations = raw_chunk_terminations.any(dim=1)
+            past_truncations = raw_chunk_truncations.any(dim=1)
+            past_dones = torch.logical_or(past_terminations, past_truncations)
+
+            if past_dones.any() and self.auto_reset:
+                obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                    past_dones, obs_list[-1], infos_list[-1]
+                )
+
+            if self.auto_reset or self.ignore_terminations:
+                chunk_terminations = torch.zeros_like(raw_chunk_terminations)
+                chunk_terminations[:, -1] = past_terminations
+
+                chunk_truncations = torch.zeros_like(raw_chunk_truncations)
+                chunk_truncations[:, -1] = past_truncations
+            else:
+                chunk_terminations = raw_chunk_terminations.clone()
+                chunk_truncations = raw_chunk_truncations.clone()
+
+            return (
+                obs_list,
+                chunk_rewards,
+                chunk_terminations,
+                chunk_truncations,
+                infos_list,
+            )
+
         obs_list = []
         infos_list = []
 

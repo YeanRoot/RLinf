@@ -12,14 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
-from pathlib import Path
 from typing import Any
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -213,22 +208,18 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         # rollout_actor_after_warmup / warmup_steps / rollout_actor_min_actor_updates.
         self.allow_rollout_actor_handoff = not self.stage_freeze_actor
 
-        diag_cfg = self.cfg.algorithm.get("action_diagnostics", None)
-        if diag_cfg is None:
-            diag_cfg = {}
-        self.action_diag_enable = bool(diag_cfg.get("enable", False))
-        self.action_diag_every_actor_updates = int(diag_cfg.get("every_actor_updates", 50))
-        self.action_diag_max_save_samples = int(diag_cfg.get("max_save_samples", 4))
-        self.action_diag_visual_feat_plot_dims = int(diag_cfg.get("visual_feat_plot_dims", 256))
-        self.action_diag_last_captured_actor_update = -1
-        self.action_diag_dir = Path(
-            diag_cfg.get(
-                "output_dir",
-                os.path.join(self.cfg.runner.logger.log_path, "action_diagnostics"),
-            )
+        sliding_cfg = self.cfg.algorithm.get("gigawa_sliding_window", None)
+        self.sliding_window_enable = bool(
+            sliding_cfg is not None and sliding_cfg.get("enable", False)
         )
-        if self.action_diag_enable and self._rank == 0:
-            self.action_diag_dir.mkdir(parents=True, exist_ok=True)
+        self.sliding_window_offset_stride = int(
+            sliding_cfg.get("offset_stride", 1) if sliding_cfg is not None else 1
+        )
+        self.sliding_window_max_offsets = (
+            int(sliding_cfg.get("max_offsets"))
+            if sliding_cfg is not None and sliding_cfg.get("max_offsets", None) is not None
+            else None
+        )
 
     # ---------------------------------------------------------------------
     # Helpers
@@ -236,189 +227,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     @staticmethod
     def _unwrap_policy(model):
         return model.module if hasattr(model, "module") else model
-
-    def _visual_mode(self) -> str:
-        policy = self._unwrap_policy(self.model)
-        return str(getattr(policy, "visual_input_mode", "normal")).lower()
-
-    def _build_visual_feat_for_actor(self, visual_latent: torch.Tensor) -> torch.Tensor:
-        policy = self._unwrap_policy(self.model)
-        mode = self._visual_mode()
-        if mode == "normal":
-            return self.model(
-                forward_type=ForwardType.DEFAULT,
-                mode="encode_visual",
-                visual_latent=visual_latent.to(self.device, dtype=self.torch_dtype),
-            )
-
-        batch_size = int(visual_latent.shape[0])
-        return torch.zeros(
-            batch_size,
-            int(policy.visual_feature_dim),
-            device=self.device,
-            dtype=self.torch_dtype,
-        )
-
-    def _should_capture_action_diagnostics(self) -> bool:
-        if not self.action_diag_enable:
-            return False
-        if self._rank != 0:
-            return False
-        interval = max(1, self.action_diag_every_actor_updates)
-        upcoming_actor_update = self.actor_update_step + 1
-        if upcoming_actor_update == self.action_diag_last_captured_actor_update:
-            return False
-        return (upcoming_actor_update % interval) == 0
-
-    @staticmethod
-    def _tensor_to_numpy(t: torch.Tensor) -> np.ndarray:
-        return t.detach().float().cpu().numpy()
-
-    def _save_action_diagnostics(self, debug_bundle: dict[str, Any]) -> dict[str, float]:
-        policy = self._unwrap_policy(self.model)
-        tag = debug_bundle["tag"]
-        out_dir = self.action_diag_dir / tag
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        ref_action = debug_bundle["ref_action"].detach().float()
-        pred_action = debug_bundle["pred_action"].detach().float()
-        robot_state = debug_bundle["robot_state"].detach().float()
-        visual_feat = debug_bundle["visual_feat"].detach().float()
-        visual_feat_for_state = debug_bundle["visual_feat_for_state"].detach().float()
-        robot_state_for_state = debug_bundle["robot_state_for_state"].detach().float()
-        ref_action_flat_for_state = debug_bundle["ref_action_flat_for_state"].detach().float()
-
-        with torch.no_grad():
-            ref_exec = policy.postprocess_action_model_batch(ref_action, robot_state)
-            pred_exec = policy.postprocess_action_model_batch(pred_action, robot_state)
-
-        model_diff = pred_action - ref_action
-        exec_diff = pred_exec - ref_exec
-
-        model_mse = float((model_diff.pow(2)).mean().item())
-        exec_mse = float((exec_diff.pow(2)).mean().item())
-        model_mae = float(model_diff.abs().mean().item())
-        exec_mae = float(exec_diff.abs().mean().item())
-        model_max_abs = float(model_diff.abs().max().item())
-        exec_max_abs = float(exec_diff.abs().max().item())
-
-        model_per_step_mse = model_diff.pow(2).mean(dim=(0, 2)).cpu().numpy()
-        exec_per_step_mse = exec_diff.pow(2).mean(dim=(0, 2)).cpu().numpy()
-        model_per_dim_mse = model_diff.pow(2).mean(dim=(0, 1)).cpu().numpy()
-        exec_per_dim_mse = exec_diff.pow(2).mean(dim=(0, 1)).cpu().numpy()
-
-        save_n = min(self.action_diag_max_save_samples, ref_action.shape[0])
-        np.savez_compressed(
-            out_dir / "action_diag_samples.npz",
-            ref_action_model=self._tensor_to_numpy(ref_action[:save_n]),
-            actor_action_model=self._tensor_to_numpy(pred_action[:save_n]),
-            diff_action_model=self._tensor_to_numpy(model_diff[:save_n]),
-            ref_action_exec=self._tensor_to_numpy(ref_exec[:save_n]),
-            actor_action_exec=self._tensor_to_numpy(pred_exec[:save_n]),
-            diff_action_exec=self._tensor_to_numpy(exec_diff[:save_n]),
-            robot_state=self._tensor_to_numpy(robot_state[:save_n]),
-            visual_feat=self._tensor_to_numpy(visual_feat[:save_n]),
-            visual_feat_for_state=self._tensor_to_numpy(visual_feat_for_state[:save_n]),
-            robot_state_for_state=self._tensor_to_numpy(robot_state_for_state[:save_n]),
-            ref_action_flat_for_state=self._tensor_to_numpy(ref_action_flat_for_state[:save_n]),
-            model_per_step_mse=model_per_step_mse,
-            exec_per_step_mse=exec_per_step_mse,
-            model_per_dim_mse=model_per_dim_mse,
-            exec_per_dim_mse=exec_per_dim_mse,
-        )
-
-        summary = {
-            "tag": tag,
-            "update_step": int(debug_bundle["update_step"]),
-            "actor_update_step": int(debug_bundle["actor_update_step"]),
-            "batch_size": int(ref_action.shape[0]),
-            "save_n": int(save_n),
-            "model_mse": model_mse,
-            "exec_mse": exec_mse,
-            "model_mae": model_mae,
-            "exec_mae": exec_mae,
-            "model_max_abs": model_max_abs,
-            "exec_max_abs": exec_max_abs,
-            "visual_feat_norm": float(visual_feat.norm(dim=-1).mean().item()),
-            "robot_state_norm": float(robot_state.norm(dim=-1).mean().item()),
-            "model_per_step_mse": model_per_step_mse.tolist(),
-            "exec_per_step_mse": exec_per_step_mse.tolist(),
-            "model_per_dim_mse": model_per_dim_mse.tolist(),
-            "exec_per_dim_mse": exec_per_dim_mse.tolist(),
-        }
-        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
-
-        sample_idx = 0
-        ref0 = self._tensor_to_numpy(ref_action[sample_idx])
-        pred0 = self._tensor_to_numpy(pred_action[sample_idx])
-        diff0 = self._tensor_to_numpy(model_diff[sample_idx])
-        ref_exec0 = self._tensor_to_numpy(ref_exec[sample_idx])
-        pred_exec0 = self._tensor_to_numpy(pred_exec[sample_idx])
-        diff_exec0 = self._tensor_to_numpy(exec_diff[sample_idx])
-        robot0 = self._tensor_to_numpy(robot_state[sample_idx])
-        visual0 = self._tensor_to_numpy(visual_feat_for_state[sample_idx])
-        plot_visual_dims = min(self.action_diag_visual_feat_plot_dims, visual0.shape[0])
-
-        fig, axes = plt.subplots(3, 4, figsize=(24, 14))
-        ax = axes.reshape(-1)
-        ims = []
-        ims.append(ax[0].imshow(ref0, aspect="auto")); ax[0].set_title("WA ref action (model)")
-        ims.append(ax[1].imshow(pred0, aspect="auto")); ax[1].set_title("Actor action (model)")
-        ims.append(ax[2].imshow(diff0, aspect="auto")); ax[2].set_title("Diff (model)")
-        ims.append(ax[3].imshow(ref_exec0, aspect="auto")); ax[3].set_title("WA ref action (exec)")
-        ims.append(ax[4].imshow(pred_exec0, aspect="auto")); ax[4].set_title("Actor action (exec)")
-        ims.append(ax[5].imshow(diff_exec0, aspect="auto")); ax[5].set_title("Diff (exec)")
-        for i in range(6):
-            fig.colorbar(ims[i], ax=ax[i], fraction=0.046, pad=0.04)
-            ax[i].set_xlabel("action dim")
-            ax[i].set_ylabel("chunk step")
-
-        ax[6].plot(model_per_step_mse, label="model")
-        ax[6].plot(exec_per_step_mse, label="exec")
-        ax[6].set_title("Per-step MSE")
-        ax[6].set_xlabel("chunk step")
-        ax[6].legend()
-
-        ax[7].plot(model_per_dim_mse, label="model")
-        ax[7].plot(exec_per_dim_mse, label="exec")
-        ax[7].set_title("Per-dim MSE")
-        ax[7].set_xlabel("action dim")
-        ax[7].legend()
-
-        ax[8].plot(robot0)
-        ax[8].set_title("Actor input robot_state (sample0)")
-        ax[8].set_xlabel("state dim")
-
-        ax[9].plot(visual0[:plot_visual_dims])
-        ax[9].set_title(f"Actor input visual feat first {plot_visual_dims} dims")
-        ax[9].set_xlabel("visual dim")
-
-        ax[10].hist(diff0.reshape(-1), bins=50)
-        ax[10].set_title("Model diff histogram (sample0)")
-
-        ax[11].axis("off")
-        ax[11].text(0.0, 1.0,
-            f"tag: {tag}\nmodel_mse: {model_mse:.6e}\nexec_mse: {exec_mse:.6e}\nmodel_mae: {model_mae:.6e}\nexec_mae: {exec_mae:.6e}\nmodel_max_abs: {model_max_abs:.6e}\nexec_max_abs: {exec_max_abs:.6e}\nvisual_feat_norm: {summary['visual_feat_norm']:.6e}\nrobot_state_norm: {summary['robot_state_norm']:.6e}",
-            va="top", family="monospace")
-
-        fig.tight_layout()
-        fig.savefig(out_dir / "action_diag_overview.png", dpi=180)
-        plt.close(fig)
-
-        self.action_diag_last_captured_actor_update = int(debug_bundle["actor_update_step"])
-        self.log_on_first_rank(
-            f"[action_diagnostics] saved to {out_dir} | model_mse={model_mse:.6e} | exec_mse={exec_mse:.6e}"
-        )
-
-        return {
-            "actor_debug/model_mse": model_mse,
-            "actor_debug/exec_mse": exec_mse,
-            "actor_debug/model_mae": model_mae,
-            "actor_debug/exec_mae": exec_mae,
-            "actor_debug/model_max_abs": model_max_abs,
-            "actor_debug/exec_max_abs": exec_max_abs,
-        }
 
     def _maybe_enable_rollout_rl_head(self):
         if self.rollout_rl_head_enabled:
@@ -482,15 +290,49 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "ref_action": feat["ref_action"].cpu().contiguous(),
         }
 
-    @torch.no_grad()
-    def _convert_trajectory_for_gigawa(self, traj: Trajectory) -> Trajectory:
-        assert traj.curr_obs and traj.next_obs, "Trajectory must contain curr_obs and next_obs."
-        source_actions = None
+    def _get_source_actions(self, traj: Trajectory) -> torch.Tensor:
         if traj.forward_inputs and "model_action" in traj.forward_inputs:
             source_actions = traj.forward_inputs["model_action"]
         else:
             source_actions = traj.actions
         assert source_actions is not None, "Trajectory must contain actions or model_action."
+        return source_actions
+
+    def _has_chunk_step_obs_seq(self, traj: Trajectory) -> bool:
+        return bool(
+            traj.curr_obs
+            and isinstance(traj.curr_obs, dict)
+            and "_chunk_step_states_seq" in traj.curr_obs
+        )
+
+    def _flatten_chunk_obs_sequence(self, seq_tensor: torch.Tensor) -> torch.Tensor:
+        # seq_tensor: [traj_len, batch, chunk+1, ...] -> [traj_len*chunk+1, batch, ...]
+        traj_len = int(seq_tensor.shape[0])
+        chunk_plus_one = int(seq_tensor.shape[2])
+        chunk = chunk_plus_one - 1
+        frames = [seq_tensor[0, :, 0].contiguous()]
+        for t in range(traj_len):
+            current_seq = seq_tensor[t]  # [batch, chunk+1, ...]
+            for k in range(1, chunk + 1):
+                frames.append(current_seq[:, k].contiguous())
+        return torch.stack(frames, dim=0).contiguous()
+
+    def _build_primitive_obs_dict(self, traj: Trajectory) -> dict[str, torch.Tensor]:
+        obs = {}
+        key_map = {
+            "_chunk_step_main_images_seq": "main_images",
+            "_chunk_step_wrist_images_seq": "wrist_images",
+            "_chunk_step_extra_view_images_seq": "extra_view_images",
+            "_chunk_step_states_seq": "states",
+        }
+        for seq_key, obs_key in key_map.items():
+            if seq_key in traj.curr_obs and isinstance(traj.curr_obs[seq_key], torch.Tensor):
+                obs[obs_key] = self._flatten_chunk_obs_sequence(traj.curr_obs[seq_key])
+        return obs
+
+    @torch.no_grad()
+    def _convert_standard_trajectory_for_gigawa(self, traj: Trajectory) -> Trajectory:
+        source_actions = self._get_source_actions(traj)
         traj_len = int(source_actions.shape[0])
 
         curr_visual_latents = []
@@ -517,7 +359,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         return Trajectory(
             max_episode_length=traj.max_episode_length,
             model_weights_id=traj.model_weights_id,
-            actions=source_actions.cpu().contiguous() if source_actions is not None else None,
+            actions=source_actions.cpu().contiguous(),
             intervene_flags=traj.intervene_flags.cpu().contiguous() if traj.intervene_flags is not None else None,
             rewards=traj.rewards.cpu().contiguous() if traj.rewards is not None else None,
             terminations=traj.terminations.cpu().contiguous() if traj.terminations is not None else None,
@@ -539,6 +381,150 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             },
         )
 
+    @torch.no_grad()
+    def _convert_sliding_window_trajectories_for_gigawa(self, traj: Trajectory) -> list[Trajectory]:
+        source_actions = self._get_source_actions(traj).cpu().contiguous()
+        assert traj.curr_obs and traj.next_obs, "Trajectory must contain curr_obs and next_obs."
+        primitive_obs = self._build_primitive_obs_dict(traj)
+        if "states" not in primitive_obs:
+            return [self._convert_standard_trajectory_for_gigawa(traj)]
+
+        traj_len, batch_size, action_flat_dim = source_actions.shape
+        action_chunk = int(self.cfg.actor.model.get("num_action_chunks", 1))
+        action_dim = action_flat_dim // action_chunk
+        primitive_actions = source_actions.view(
+            traj_len, batch_size, action_chunk, action_dim
+        ).permute(0, 2, 1, 3).reshape(
+            traj_len * action_chunk, batch_size, action_dim
+        )
+        primitive_rewards = traj.rewards.permute(0, 2, 1).reshape(
+            traj_len * action_chunk, batch_size
+        ).cpu().contiguous()
+        primitive_terminations = traj.terminations.permute(0, 2, 1).reshape(
+            traj_len * action_chunk, batch_size
+        ).to(torch.bool).cpu().contiguous()
+        primitive_truncations = traj.truncations.permute(0, 2, 1).reshape(
+            traj_len * action_chunk, batch_size
+        ).to(torch.bool).cpu().contiguous()
+        primitive_dones = traj.dones.permute(0, 2, 1).reshape(
+            traj_len * action_chunk, batch_size
+        ).to(torch.bool).cpu().contiguous()
+
+        primitive_intervene = None
+        if traj.intervene_flags is not None:
+            primitive_intervene = traj.intervene_flags.view(
+                traj_len, batch_size, action_chunk, action_dim
+            ).permute(0, 2, 1, 3).reshape(
+                traj_len * action_chunk, batch_size, action_dim
+            ).to(torch.bool).cpu().contiguous()
+
+        primitive_logprobs = None
+        if traj.prev_logprobs is not None:
+            primitive_logprobs = traj.prev_logprobs.permute(0, 2, 1).reshape(
+                traj_len * action_chunk, batch_size
+            ).cpu().contiguous()
+
+        total_primitive_steps = int(primitive_actions.shape[0])
+        max_offsets = action_chunk
+        if self.sliding_window_max_offsets is not None:
+            max_offsets = min(max_offsets, int(self.sliding_window_max_offsets))
+
+        converted_trajectories = []
+        for offset in range(0, max_offsets, max(1, self.sliding_window_offset_stride)):
+            window_count = (total_primitive_steps - offset) // action_chunk
+            if window_count <= 0:
+                continue
+
+            start_indices = offset + torch.arange(window_count, dtype=torch.long) * action_chunk
+            next_indices = start_indices + action_chunk
+
+            curr_visual_latents = []
+            curr_robot_states = []
+            curr_ref_actions = []
+            next_visual_latents = []
+            next_robot_states = []
+            next_ref_actions = []
+
+            for start_idx, next_idx in zip(start_indices.tolist(), next_indices.tolist()):
+                curr_step_obs = {
+                    key: value[start_idx] for key, value in primitive_obs.items()
+                }
+                next_step_obs = {
+                    key: value[next_idx] for key, value in primitive_obs.items()
+                }
+                curr_feat = self._extract_step_features(curr_step_obs)
+                next_feat = self._extract_step_features(next_step_obs)
+                curr_visual_latents.append(curr_feat["visual_latent"])
+                curr_robot_states.append(curr_feat["robot_state"])
+                curr_ref_actions.append(curr_feat["ref_action"])
+                next_visual_latents.append(next_feat["visual_latent"])
+                next_robot_states.append(next_feat["robot_state"])
+                next_ref_actions.append(next_feat["ref_action"])
+
+            window_actions = []
+            window_rewards = []
+            window_terminations = []
+            window_truncations = []
+            window_dones = []
+            window_intervene = [] if primitive_intervene is not None else None
+            window_logprobs = [] if primitive_logprobs is not None else None
+            for start_idx in start_indices.tolist():
+                end_idx = start_idx + action_chunk
+                action_chunk_tensor = primitive_actions[start_idx:end_idx].permute(1, 0, 2).reshape(batch_size, -1)
+                reward_chunk_tensor = primitive_rewards[start_idx:end_idx].permute(1, 0)
+                term_chunk_tensor = primitive_terminations[start_idx:end_idx].permute(1, 0)
+                trunc_chunk_tensor = primitive_truncations[start_idx:end_idx].permute(1, 0)
+                done_chunk_tensor = primitive_dones[start_idx:end_idx].permute(1, 0)
+                window_actions.append(action_chunk_tensor.cpu().contiguous())
+                window_rewards.append(reward_chunk_tensor.cpu().contiguous())
+                window_terminations.append(term_chunk_tensor.cpu().contiguous())
+                window_truncations.append(trunc_chunk_tensor.cpu().contiguous())
+                window_dones.append(done_chunk_tensor.cpu().contiguous())
+                if primitive_intervene is not None:
+                    intervene_chunk_tensor = primitive_intervene[start_idx:end_idx].permute(1, 0, 2).reshape(batch_size, -1)
+                    window_intervene.append(intervene_chunk_tensor.cpu().contiguous())
+                if primitive_logprobs is not None:
+                    logprob_chunk_tensor = primitive_logprobs[start_idx:end_idx].permute(1, 0)
+                    window_logprobs.append(logprob_chunk_tensor.cpu().contiguous())
+
+            version_source = traj.versions[:window_count].cpu().contiguous() if traj.versions is not None else None
+            value_source = traj.prev_values[:window_count].cpu().contiguous() if traj.prev_values is not None else None
+
+            converted_trajectories.append(
+                Trajectory(
+                    max_episode_length=traj.max_episode_length,
+                    model_weights_id=traj.model_weights_id,
+                    actions=torch.stack(window_actions, dim=0),
+                    intervene_flags=torch.stack(window_intervene, dim=0) if window_intervene is not None else None,
+                    rewards=torch.stack(window_rewards, dim=0),
+                    terminations=torch.stack(window_terminations, dim=0),
+                    truncations=torch.stack(window_truncations, dim=0),
+                    dones=torch.stack(window_dones, dim=0),
+                    prev_logprobs=torch.stack(window_logprobs, dim=0) if window_logprobs is not None else None,
+                    prev_values=value_source,
+                    versions=version_source,
+                    forward_inputs={},
+                    curr_obs={
+                        "visual_latent": torch.stack(curr_visual_latents, dim=0),
+                        "robot_state": torch.stack(curr_robot_states, dim=0),
+                        "ref_action": torch.stack(curr_ref_actions, dim=0),
+                    },
+                    next_obs={
+                        "visual_latent": torch.stack(next_visual_latents, dim=0),
+                        "robot_state": torch.stack(next_robot_states, dim=0),
+                        "ref_action": torch.stack(next_ref_actions, dim=0),
+                    },
+                )
+            )
+
+        return converted_trajectories if converted_trajectories else [self._convert_standard_trajectory_for_gigawa(traj)]
+
+    @torch.no_grad()
+    def _convert_trajectory_for_gigawa(self, traj: Trajectory) -> list[Trajectory]:
+        if self.sliding_window_enable and self._has_chunk_step_obs_seq(traj):
+            return self._convert_sliding_window_trajectories_for_gigawa(traj)
+        return [self._convert_standard_trajectory_for_gigawa(traj)]
+
     # ---------------------------------------------------------------------
     # Replay ingestion
     # ---------------------------------------------------------------------
@@ -554,7 +540,9 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
 
-        gigawa_list = [self._convert_trajectory_for_gigawa(traj) for traj in recv_list]
+        gigawa_list = []
+        for traj in recv_list:
+            gigawa_list.extend(self._convert_trajectory_for_gigawa(traj))
         self.replay_buffer.add_trajectories(gigawa_list)
 
         if self.demo_buffer is not None:
@@ -585,8 +573,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         done_mask = terminations.any(dim=-1, keepdim=True).to(self.torch_dtype)
 
         with torch.no_grad():
-            curr_visual_feat = self._build_visual_feat_for_actor(
-                curr_obs["visual_latent"]
+            curr_visual_feat = self.model(
+                forward_type=ForwardType.DEFAULT,
+                mode="encode_visual",
+                visual_latent=curr_obs["visual_latent"].to(self.device, dtype=self.torch_dtype),
             )
             _, curr_actor_aux = self.model(
                 forward_type=ForwardType.DEFAULT,
@@ -599,8 +589,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             )
             curr_rl_state = curr_actor_aux["rl_state"].detach()
 
-            next_visual_feat = self._build_visual_feat_for_actor(
-                next_obs["visual_latent"]
+            next_visual_feat = self.model(
+                forward_type=ForwardType.DEFAULT,
+                mode="encode_visual",
+                visual_latent=next_obs["visual_latent"].to(self.device, dtype=self.torch_dtype),
             )
             next_actions, next_actor_aux = policy.target_actor_forward(
                 visual_feat=next_visual_feat.detach(),
@@ -635,20 +627,21 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         }
 
     @Worker.timer("forward_actor")
-    def forward_actor(self, batch, capture_diagnostics: bool = False):
+    def forward_actor(self, batch):
         policy = self._unwrap_policy(self.model)
         curr_obs = batch["curr_obs"]
-        robot_state = curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype)
         ref_action = curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype)
 
-        visual_feat = self._build_visual_feat_for_actor(
-            curr_obs["visual_latent"]
+        visual_feat = self.model(
+            forward_type=ForwardType.DEFAULT,
+            mode="encode_visual",
+            visual_latent=curr_obs["visual_latent"].to(self.device, dtype=self.torch_dtype),
         )
         pi, actor_aux = self.model(
             forward_type=ForwardType.DEFAULT,
             mode="actor",
             visual_feat=visual_feat,
-            robot_state=robot_state,
+            robot_state=curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
             ref_action=ref_action,
             ref_action_dropout_p=self.ref_action_dropout_p,
             use_target=False,
@@ -664,41 +657,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             ),
         }
 
-        debug_bundle = None
-        if capture_diagnostics:
-            debug_bundle = {
-                "tag": f"update_{self.update_step + 1:07d}_actor_{self.actor_update_step + 1:07d}",
-                "update_step": self.update_step + 1,
-                "actor_update_step": self.actor_update_step + 1,
-                "ref_action": ref_action.detach(),
-                "pred_action": pi.detach(),
-                "robot_state": robot_state.detach(),
-                "visual_feat": visual_feat.detach(),
-                "visual_feat_for_state": actor_aux.get("visual_feat_for_state", visual_feat).detach(),
-                "robot_state_for_state": actor_aux.get("robot_state_for_state", robot_state).detach(),
-                "ref_action_flat_for_state": actor_aux.get(
-                    "ref_action_flat_for_state", ref_action.reshape(ref_action.shape[0], -1)
-                ).detach(),
-            }
-
         if self.stage_actor_bc_only:
             actor_loss = self.bc_coef * bc_loss
             metrics["q_pi"] = 0.0
-            return actor_loss, metrics, debug_bundle
-
-        rl_state = actor_aux["rl_state"]
-        q1_pi, q2_pi = self.model(
-            forward_type=ForwardType.DEFAULT,
-            mode="critic",
-            rl_state=rl_state,
-            action=pi,
-            use_target=False,
-        )
-        q_pi = torch.minimum(q1_pi, q2_pi)
-
-        actor_loss = (-q_pi).mean() + self.bc_coef * bc_loss
-        metrics["q_pi"] = q_pi.mean().item()
-        return actor_loss, metrics, debug_bundle
+            return actor_loss, metrics
 
         rl_state = actor_aux["rl_state"]
         q1_pi, q2_pi = self.model(
@@ -778,19 +740,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             all_actor_metrics = {}
-            capture_debug_this_update = self._should_capture_action_diagnostics()
-            debug_bundle_to_save = None
-            for batch_idx, batch in enumerate(train_micro_batch_list):
-                actor_loss, actor_metrics, debug_bundle = self.forward_actor(
-                    batch,
-                    capture_diagnostics=(capture_debug_this_update and batch_idx == 0),
-                )
+            for batch in train_micro_batch_list:
+                actor_loss, actor_metrics = self.forward_actor(batch)
                 actor_loss = actor_loss / self.gradient_accumulation
                 actor_loss.backward()
                 gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
                 append_to_dict(all_actor_metrics, actor_metrics)
-                if debug_bundle is not None:
-                    debug_bundle_to_save = debug_bundle
             all_actor_metrics = {f"actor/{k}": np.mean(v) for k, v in all_actor_metrics.items()}
             actor_grad_norm = self.model.clip_grad_norm_(
                 max_norm=self.cfg.actor.optim.clip_grad
@@ -799,8 +754,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.lr_scheduler.step()
             actor_updated = True
             self.actor_update_step += 1
-            if debug_bundle_to_save is not None:
-                metrics_data.update(self._save_action_diagnostics(debug_bundle_to_save))
             metrics_data.update(
                 {
                     "gigawa/actor_loss": np.mean(gbs_actor_loss),

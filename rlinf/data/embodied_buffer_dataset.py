@@ -30,20 +30,15 @@ logger = get_logger()
 class ReplayBufferDataset(IterableDataset):
     """Dataset that samples batches from replay and demonstration buffers.
 
-    This dataset provides an infinite iterator that yields batches sampled from
-    a replay buffer and optionally a demonstration buffer. When both buffers are
-    provided, batches are composed of half replay samples and half demonstration
-    samples.
+    Compared with the original fixed 50/50 mixing rule, this version supports
+    three regimes that are all useful for RLPD / offline-to-online training:
 
-    Attributes:
-        replay_buffer: Buffer storing online rollout trajectories.
-        demo_buffer: Optional buffer storing offline demonstration trajectories
-            and online human-in-the-loop trajectories.
-        min_replay_buffer_size: Minimum number of samples required in replay
-            buffer before sampling begins.
-        min_demo_buffer_size: Minimum number of samples required in demo buffer
-            before sampling begins (if demo_buffer is provided).
-        batch_size: Total number of samples per batch.
+    - replay only
+    - demo only
+    - replay + demo mixed with a configurable demo sampling ratio
+
+    If one source is temporarily unavailable, the dataset can optionally fall
+    back to the other source instead of stalling forever.
     """
 
     def __init__(
@@ -53,87 +48,118 @@ class ReplayBufferDataset(IterableDataset):
         batch_size: int,
         min_replay_buffer_size: int,
         min_demo_buffer_size: int,
+        demo_sample_ratio: float = 0.5,
+        allow_demo_only_fallback: bool = True,
+        allow_replay_only_fallback: bool = True,
         **kwargs: Any,
     ) -> None:
-        """Initializes the ReplayBufferDataset.
-
-        Args:
-            replay_buffer: Buffer storing online rollout trajectories.
-            demo_buffer: Optional buffer storing demonstration trajectories.
-                If None, only replay buffer is used.
-            batch_size: Total number of samples per batch. When demo_buffer is
-                provided, batch_size // 2 samples come from each buffer.
-            min_replay_buffer_size: Minimum number of samples required in replay
-                buffer before sampling begins.
-            min_demo_buffer_size: Minimum number of samples required in demo
-                buffer before sampling begins (ignored if demo_buffer is None).
-            **kwargs: Additional keyword arguments (unused, for compatibility).
-        """
         self.replay_buffer = replay_buffer
         self.demo_buffer = demo_buffer
-        self.min_replay_buffer_size = min_replay_buffer_size
-        self.min_demo_buffer_size = min_demo_buffer_size
+        self.min_replay_buffer_size = int(max(0, min_replay_buffer_size))
+        self.min_demo_buffer_size = int(max(0, min_demo_buffer_size))
+        self.batch_size = int(batch_size)
+        self.demo_sample_ratio = float(min(max(demo_sample_ratio, 0.0), 1.0))
+        self.allow_demo_only_fallback = bool(allow_demo_only_fallback)
+        self.allow_replay_only_fallback = bool(allow_replay_only_fallback)
 
-        self.batch_size = batch_size
+        self.replay_batch_size_target, self.demo_batch_size_target = self._compute_target_batch_sizes(
+            self.batch_size,
+            self.demo_sample_ratio,
+            has_demo_buffer=self.demo_buffer is not None,
+        )
+
+    @staticmethod
+    def _compute_target_batch_sizes(
+        batch_size: int,
+        demo_sample_ratio: float,
+        has_demo_buffer: bool,
+    ) -> tuple[int, int]:
+        if batch_size <= 0:
+            raise ValueError(f"{batch_size=} must be positive")
+
+        if not has_demo_buffer or demo_sample_ratio <= 0.0:
+            return batch_size, 0
+        if demo_sample_ratio >= 1.0:
+            return 0, batch_size
+
+        demo_batch_size = int(round(batch_size * demo_sample_ratio))
+        demo_batch_size = max(1, min(batch_size - 1, demo_batch_size))
+        replay_batch_size = batch_size - demo_batch_size
+        return replay_batch_size, demo_batch_size
+
+    def _is_replay_requested(self) -> bool:
+        return self.replay_batch_size_target > 0
+
+    def _is_demo_requested(self) -> bool:
+        return self.demo_buffer is not None and self.demo_batch_size_target > 0
+
+    def _is_replay_ready(self) -> bool:
+        if not self._is_replay_requested():
+            return False
+        return self.replay_buffer.is_ready(self.min_replay_buffer_size)
+
+    def _is_demo_ready(self) -> bool:
+        if not self._is_demo_requested():
+            return False
+        return self.demo_buffer.is_ready(self.min_demo_buffer_size)
+
+    def resolve_sampling_plan(self) -> Optional[tuple[int, int]]:
+        replay_requested = self._is_replay_requested()
+        demo_requested = self._is_demo_requested()
+        replay_ready = self._is_replay_ready()
+        demo_ready = self._is_demo_ready()
+
+        if replay_requested and demo_requested:
+            if replay_ready and demo_ready:
+                return self.replay_batch_size_target, self.demo_batch_size_target
+            if demo_ready and self.allow_demo_only_fallback:
+                return 0, self.batch_size
+            if replay_ready and self.allow_replay_only_fallback:
+                return self.batch_size, 0
+            return None
+
+        if replay_requested:
+            return (self.batch_size, 0) if replay_ready else None
+
+        if demo_requested:
+            return (0, self.batch_size) if demo_ready else None
+
+        return None
+
+    def sample_once(self) -> Optional[dict[str, torch.Tensor]]:
+        plan = self.resolve_sampling_plan()
+        if plan is None:
+            return None
+
+        replay_batch_size, demo_batch_size = plan
+        if replay_batch_size > 0 and demo_batch_size > 0:
+            replay_batch = self.replay_buffer.sample(replay_batch_size)
+            demo_batch = self.demo_buffer.sample(demo_batch_size)
+            return concat_batch(replay_batch, demo_batch)
+        if replay_batch_size > 0:
+            return self.replay_buffer.sample(replay_batch_size)
+        if demo_batch_size > 0:
+            return self.demo_buffer.sample(demo_batch_size)
+        return None
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        """Returns an infinite iterator that yields batches.
-
-        Waits until both buffers (if demo_buffer is provided) reach their
-        minimum size requirements before yielding batches. When ready, samples
-        from replay buffer only or from both replay and demo buffers.
-
-        Yields:
-            Batch dictionary containing sampled trajectories. Keys and structure
-            depend on the buffer's trajectory format.
-        """
         while True:
-            is_ready = True
-            if not self.replay_buffer.is_ready(self.min_replay_buffer_size):
-                is_ready = False
-            if self.demo_buffer is not None and not self.demo_buffer.is_ready(
-                self.min_demo_buffer_size
-            ):
-                is_ready = False
-
-            if is_ready:
-                if self.demo_buffer is not None:
-                    replay_batch = self.replay_buffer.sample(self.batch_size // 2)
-                    demo_batch = self.demo_buffer.sample(self.batch_size // 2)
-                    batch = concat_batch(replay_batch, demo_batch)
-                else:
-                    batch = self.replay_buffer.sample(self.batch_size)
-                yield batch
+            batch = self.sample_once()
+            if batch is None:
+                time.sleep(1)
+                continue
+            yield batch
 
     def close(self) -> None:
-        """Releases references to replay and demo buffers."""
         del self.replay_buffer
         del self.demo_buffer
 
     def __del__(self) -> None:
-        """Destructor that ensures buffers are cleaned up."""
         self.close()
 
 
 class PreloadReplayBufferDataset(ReplayBufferDataset):
-    """Dataset that prefetches batches from replay and demo buffers in background.
-
-    This dataset extends ReplayBufferDataset by prefetching batches in a
-    background thread, which can improve throughput by overlapping sampling
-    with training. Batches are stored in a queue of configurable size.
-
-    Attributes:
-        replay_buffer: Buffer storing online rollout trajectories.
-        demo_buffer: Optional buffer storing demonstration trajectories.
-        min_replay_buffer_size: Minimum number of samples required in replay
-            buffer before sampling begins.
-        min_demo_buffer_size: Minimum number of samples required in demo buffer
-            before sampling begins (if demo_buffer is provided).
-        batch_size: Total number of samples per batch.
-        prefetch_size: Maximum number of batches to prefetch and store in queue.
-        preload_queue: Queue holding prefetched batches.
-        sample_thread: Background thread that samples batches.
-    """
+    """Dataset that prefetches replay/demo batches in a background thread."""
 
     def __init__(
         self,
@@ -142,68 +168,37 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
         batch_size: int,
         min_replay_buffer_size: int,
         min_demo_buffer_size: int,
+        demo_sample_ratio: float = 0.5,
+        allow_demo_only_fallback: bool = True,
+        allow_replay_only_fallback: bool = True,
         prefetch_size: int = 5,
     ) -> None:
-        """Initializes the PreloadReplayBufferDataset.
-
-        Args:
-            replay_buffer: Buffer storing online rollout trajectories.
-            demo_buffer: Optional buffer storing demonstration trajectories.
-                If None, only replay buffer is used.
-            batch_size: Total number of samples per batch. When demo_buffer is
-                provided, batch_size // 2 samples come from each buffer.
-            min_replay_buffer_size: Minimum number of samples required in replay
-                buffer before sampling begins.
-            min_demo_buffer_size: Minimum number of samples required in demo
-                buffer before sampling begins (ignored if demo_buffer is None).
-            prefetch_size: Maximum number of batches to prefetch and store in
-                the queue. Defaults to 10.
-        """
+        super().__init__(
+            replay_buffer=replay_buffer,
+            demo_buffer=demo_buffer,
+            batch_size=batch_size,
+            min_replay_buffer_size=min_replay_buffer_size,
+            min_demo_buffer_size=min_demo_buffer_size,
+            demo_sample_ratio=demo_sample_ratio,
+            allow_demo_only_fallback=allow_demo_only_fallback,
+            allow_replay_only_fallback=allow_replay_only_fallback,
+        )
         self._stop_event = threading.Event()
-
-        self.replay_buffer = replay_buffer
-        self.demo_buffer = demo_buffer
-        self.min_replay_buffer_size = min_replay_buffer_size
-        self.min_demo_buffer_size = min_demo_buffer_size
-
-        self.batch_size = batch_size
         self.prefetch_size = prefetch_size
         assert self.prefetch_size > 0, f"{self.prefetch_size=} must be greater than 0"
-
         self.preload_queue = queue.Queue(maxsize=prefetch_size)
         self.sample_thread = None
         self._exception = None
 
     def _sample_buffer(self) -> None:
-        """Background thread target that continuously samples batches.
-
-        Runs in a loop until stop event is set. Waits for buffers to be ready,
-        samples batches, and puts them in the preload queue. If the queue is
-        full, skips the sample and retries. Sleeps when buffers are not ready
-        or when errors occur.
-        """
         while not self._stop_event.is_set():
             if self.preload_queue.full():
                 time.sleep(0.1)
                 continue
 
-            is_ready = True
-            if not self.replay_buffer.is_ready(self.min_replay_buffer_size):
-                is_ready = False
-            if self.demo_buffer is not None and not self.demo_buffer.is_ready(
-                self.min_demo_buffer_size
-            ):
-                is_ready = False
-
-            if is_ready:
-                if self.demo_buffer is not None:
-                    replay_batch = self.replay_buffer.sample(self.batch_size // 2)
-                    demo_batch = self.demo_buffer.sample(self.batch_size // 2)
-                    batch = concat_batch(replay_batch, demo_batch)
-                else:
-                    batch = self.replay_buffer.sample(self.batch_size)
-            else:
-                time.sleep(3)
+            batch = self.sample_once()
+            if batch is None:
+                time.sleep(1)
                 continue
 
             try:
@@ -219,19 +214,8 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
                 break
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        """Returns an iterator that yields prefetched batches.
-
-        Starts the background sampling thread on first call. Retrieves batches
-        from the preload queue and yields them. Stops when the stop event is set.
-
-        Yields:
-            Batch dictionary containing sampled trajectories. Keys and structure
-            depend on the buffer's trajectory format.
-        """
         if self.sample_thread is None:
-            self.sample_thread = threading.Thread(
-                target=self._sample_buffer, daemon=True
-            )
+            self.sample_thread = threading.Thread(target=self._sample_buffer, daemon=True)
             self.sample_thread.start()
 
         while not self._stop_event.is_set():
@@ -240,32 +224,23 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
                 yield batch
             except queue.Empty:
                 if self._stop_event.is_set():
-                    # Check if thread died with exception
-                    if hasattr(self, "_exception"):
-                        raise RuntimeError(
-                            "Sampling thread failed"
-                        ) from self._exception
+                    if self._exception is not None:
+                        raise RuntimeError("Sampling thread failed") from self._exception
                     break
                 continue
 
     def close(self) -> None:
-        """Stops the background sampling thread and cleans up resources.
-
-        Sets the stop event and waits up to 10 seconds for the sampling thread
-        to terminate. Logs a warning if the thread does not terminate in time.
-        """
         self._stop_event.set()
-
         thread_timeout = 10
-        if self.sample_thread.is_alive():
+        if self.sample_thread is not None and self.sample_thread.is_alive():
             self.sample_thread.join(timeout=thread_timeout)
             if self.sample_thread.is_alive():
                 logger.warning(
                     f"Sample thread is still alive after {thread_timeout} seconds, force killing"
                 )
+        super().close()
 
     def __del__(self) -> None:
-        """Destructor that ensures the sampling thread is stopped."""
         if not self._stop_event.is_set():
             self.close()
 

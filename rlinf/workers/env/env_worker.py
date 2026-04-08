@@ -58,6 +58,11 @@ class EnvWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.stage_num = self.cfg.rollout.pipeline_stage_num
 
+        sliding_cfg = self.cfg.algorithm.get("gigawa_sliding_window", None)
+        self.collect_chunk_step_obs_seq = bool(
+            sliding_cfg is not None and sliding_cfg.get("enable", False)
+        )
+
         # Env configurations
         self.enable_offload = self.cfg.env.train.get("enable_offload", False)
         self.only_eval = getattr(self.cfg.runner, "only_eval", False)
@@ -253,6 +258,44 @@ class EnvWorker(Worker):
             if self.enable_offload and hasattr(self.env_list[i], "offload"):
                 self.env_list[i].offload()
 
+    def _augment_curr_obs_with_chunk_step_seq(
+        self,
+        curr_obs: dict[str, Any],
+        chunk_step_obs_list: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        if not self.collect_chunk_step_obs_seq or not chunk_step_obs_list:
+            return curr_obs
+
+        augmented_obs = dict(curr_obs)
+        obs_key_to_seq_key = {
+            "main_images": "_chunk_step_main_images_seq",
+            "wrist_images": "_chunk_step_wrist_images_seq",
+            "extra_view_images": "_chunk_step_extra_view_images_seq",
+            "states": "_chunk_step_states_seq",
+        }
+        for obs_key, seq_key in obs_key_to_seq_key.items():
+            curr_value = curr_obs.get(obs_key, None)
+            if curr_value is None or not isinstance(curr_value, torch.Tensor):
+                continue
+
+            seq_values = [curr_value]
+            valid = True
+            for step_obs in chunk_step_obs_list:
+                if step_obs is None:
+                    valid = False
+                    break
+                value = step_obs.get(obs_key, None)
+                if value is None or not isinstance(value, torch.Tensor):
+                    valid = False
+                    break
+                seq_values.append(value)
+            if not valid:
+                continue
+
+            augmented_obs[seq_key] = torch.stack(seq_values, dim=1).contiguous()
+
+        return augmented_obs
+
     @Worker.timer("env_interact_step")
     def env_interact_step(
         self, chunk_actions: torch.Tensor, stage_id: int
@@ -316,6 +359,7 @@ class EnvWorker(Worker):
             truncations=chunk_truncations,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
+            chunk_step_obs_list=obs_list if isinstance(obs_list, (list, tuple)) else None,
         )
         return env_output, env_info
 
@@ -743,8 +787,12 @@ class EnvWorker(Worker):
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
                             else env_output.obs
                         )
+                        curr_obs_for_storage = self._augment_curr_obs_with_chunk_step_seq(
+                            curr_obs,
+                            env_output.chunk_step_obs_list,
+                        )
                         self.rollout_results[stage_id].append_transitions(
-                            curr_obs, next_obs
+                            curr_obs_for_storage, next_obs
                         )
 
                     env_outputs[stage_id] = env_output

@@ -58,6 +58,13 @@ class EnvOutput:
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
 
+    # Optional list of per-substep observations returned by env.chunk_step().
+    # Each element follows the same schema as `obs` and corresponds to the
+    # observation after one primitive action inside the chunk. This field is
+    # kept local to env workers / actor workers and is intentionally omitted
+    # from `to_dict()` so rollout serving stays unchanged.
+    chunk_step_obs_list: Optional[list[dict[str, Any]]] = None
+
     def __post_init__(self):
         self.obs = put_tensor_device(self.obs, "cpu")
         self.final_obs = (
@@ -89,6 +96,11 @@ class EnvOutput:
             if self.intervene_flags is not None
             else None
         )
+        if self.chunk_step_obs_list is not None:
+            self.chunk_step_obs_list = [
+                put_tensor_device(obs, "cpu") if obs is not None else None
+                for obs in self.chunk_step_obs_list
+            ]
 
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
         image_tensor = obs["main_images"] if "main_images" in obs else None
