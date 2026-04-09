@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
+from pathlib import Path
 from typing import Any
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -47,6 +52,15 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.update_step = 0
         self.actor_update_step = 0
         self.rollout_rl_head_enabled = False
+        self.offline_collection_enable = False
+        self.offline_collection_buffers = {}
+        self.offline_collection_output_dir = None
+        self.offline_collection_summary_path = None
+        self.offline_collection_success_threshold = 0.5
+        self.offline_collection_quality_mode = "reward_max"
+        self.offline_collection_summary_flush_every = 100
+        self.offline_collection_summary_buffer = []
+        self.offline_collection_num_received = 0
 
     # ---------------------------------------------------------------------
     # Init / setup
@@ -96,7 +110,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
     def setup_gigawa_components(self):
         seed = self.cfg.actor.get("seed", 1234)
-        auto_save_path = self.cfg.algorithm.replay_buffer.get("auto_save_path", None)
+        replay_cfg = self.cfg.algorithm.replay_buffer
+        auto_save_path = replay_cfg.get("auto_save_path", None)
         if auto_save_path is None:
             auto_save_path = os.path.join(
                 self.cfg.runner.logger.log_path, f"gigawa_replay_buffer/rank_{self._rank}"
@@ -106,16 +121,35 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         self.replay_buffer = TrajectoryReplayBuffer(
             seed=seed,
-            enable_cache=self.cfg.algorithm.replay_buffer.enable_cache,
-            cache_size=self.cfg.algorithm.replay_buffer.cache_size,
-            sample_window_size=self.cfg.algorithm.replay_buffer.sample_window_size,
-            auto_save=self.cfg.algorithm.replay_buffer.get("auto_save", False),
+            enable_cache=replay_cfg.enable_cache,
+            cache_size=replay_cfg.cache_size,
+            sample_window_size=replay_cfg.sample_window_size,
+            auto_save=replay_cfg.get("auto_save", False),
             auto_save_path=auto_save_path,
-            trajectory_format=self.cfg.algorithm.replay_buffer.get("trajectory_format", "pt"),
+            trajectory_format=replay_cfg.get("trajectory_format", "pt"),
+        )
+
+        self.store_online_replay = bool(replay_cfg.get("store_online_data", True))
+        self.replay_min_buffer_size = int(replay_cfg.get("min_buffer_size", 0))
+        self.replay_train_actor_steps = int(
+            replay_cfg.get(
+                "train_actor_steps",
+                self.cfg.algorithm.get("train_actor_steps", 0),
+            )
+        )
+        self.replay_required_for_training = bool(
+            replay_cfg.get("require_for_training", True)
         )
 
         self.demo_buffer = None
-        min_demo_buffer_size = 0
+        self.demo_min_buffer_size = 0
+        self.demo_train_actor_steps = 0
+        self.demo_sample_ratio = 0.0
+        self.allow_demo_only_fallback = True
+        self.allow_replay_only_fallback = True
+        self.allow_train_on_demo_only = False
+        self.store_online_demo_interventions = True
+
         demo_cfg = self.cfg.algorithm.get("demo_buffer", None)
         if demo_cfg is not None and demo_cfg.get("enable", False):
             auto_save_path = demo_cfg.get("auto_save_path", None)
@@ -134,7 +168,27 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 auto_save_path=auto_save_path,
                 trajectory_format=demo_cfg.get("trajectory_format", "pt"),
             )
-            min_demo_buffer_size = demo_cfg.min_buffer_size
+            self.demo_min_buffer_size = int(demo_cfg.get("min_buffer_size", 0))
+            self.demo_train_actor_steps = int(
+                demo_cfg.get(
+                    "train_actor_steps",
+                    self.cfg.algorithm.get("train_actor_steps", 0),
+                )
+            )
+            self.demo_sample_ratio = float(demo_cfg.get("sample_ratio", 0.5))
+            self.demo_sample_ratio = min(max(self.demo_sample_ratio, 0.0), 1.0)
+            self.allow_demo_only_fallback = bool(
+                demo_cfg.get("allow_demo_only_fallback", True)
+            )
+            self.allow_replay_only_fallback = bool(
+                demo_cfg.get("allow_replay_only_fallback", True)
+            )
+            self.allow_train_on_demo_only = bool(
+                demo_cfg.get("allow_train_on_demo_only", self.demo_sample_ratio >= 1.0)
+            )
+            self.store_online_demo_interventions = bool(
+                demo_cfg.get("store_online_interventions", True)
+            )
             if demo_cfg.get("load_path", None) is not None:
                 self.demo_buffer.load_checkpoint(
                     demo_cfg.load_path,
@@ -142,19 +196,24 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     local_rank=self._rank,
                     world_size=self._world_size,
                 )
+        else:
+            self.replay_required_for_training = True
 
         buffer_dataset_cls = (
             PreloadReplayBufferDataset
-            if self.cfg.algorithm.replay_buffer.get("enable_preload", False)
+            if replay_cfg.get("enable_preload", False)
             else ReplayBufferDataset
         )
         self.buffer_dataset = buffer_dataset_cls(
             replay_buffer=self.replay_buffer,
             demo_buffer=self.demo_buffer,
             batch_size=self.cfg.actor.global_batch_size // self._world_size,
-            min_replay_buffer_size=self.cfg.algorithm.replay_buffer.min_buffer_size,
-            min_demo_buffer_size=min_demo_buffer_size,
-            prefetch_size=self.cfg.algorithm.replay_buffer.get("prefetch_size", 10),
+            min_replay_buffer_size=self.replay_min_buffer_size,
+            min_demo_buffer_size=self.demo_min_buffer_size,
+            demo_sample_ratio=self.demo_sample_ratio,
+            allow_demo_only_fallback=self.allow_demo_only_fallback,
+            allow_replay_only_fallback=self.allow_replay_only_fallback,
+            prefetch_size=replay_cfg.get("prefetch_size", 10),
         )
         self.buffer_dataloader = DataLoader(
             self.buffer_dataset,
@@ -164,6 +223,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             collate_fn=replay_buffer_collate_fn,
         )
         self.buffer_dataloader_iter = iter(self.buffer_dataloader)
+
+        self.target_replay_batch_size = int(getattr(self.buffer_dataset, "replay_batch_size_target", 0))
+        self.target_demo_batch_size = int(getattr(self.buffer_dataset, "demo_batch_size_target", 0))
+        self.training_uses_demo = self.demo_buffer is not None and self.target_demo_batch_size > 0
+        self.training_uses_replay = self.target_replay_batch_size > 0
 
         self.critic_actor_ratio = int(self.cfg.algorithm.get("critic_actor_ratio", 2))
         self.discount = float(self.cfg.algorithm.gamma) ** int(
@@ -200,12 +264,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.stage_actor_bc_only = self.training_stage == "bc_actor_pretrain"
         self.stage_freeze_actor = self.training_stage == "critic_warmup"
         self.stage_full_rl = self.training_stage == "full_rl"
-        # Unified handoff rule:
-        #   - Stage 1 (bc_actor_pretrain): handoff is allowed iff rollout_actor_after_warmup=true
-        #   - Stage 2 (critic_warmup): handoff is always disabled
-        #   - Stage 3 (full_rl): handoff is allowed iff rollout_actor_after_warmup=true
-        # The actual switch still goes through _maybe_enable_rollout_rl_head(), which checks
-        # rollout_actor_after_warmup / warmup_steps / rollout_actor_min_actor_updates.
         self.allow_rollout_actor_handoff = not self.stage_freeze_actor
 
         sliding_cfg = self.cfg.algorithm.get("gigawa_sliding_window", None)
@@ -221,12 +279,352 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             else None
         )
 
+        diag_cfg = self.cfg.algorithm.get("action_diagnostics", None)
+        if diag_cfg is None:
+            diag_cfg = {}
+        self.action_diag_enable = bool(diag_cfg.get("enable", False))
+        self.action_diag_every_actor_updates = int(diag_cfg.get("every_actor_updates", 50))
+        self.action_diag_max_save_samples = int(diag_cfg.get("max_save_samples", 4))
+        self.action_diag_visual_feat_plot_dims = int(diag_cfg.get("visual_feat_plot_dims", 256))
+        self.action_diag_last_captured_actor_update = -1
+        self.action_diag_dir = Path(
+            diag_cfg.get(
+                "output_dir",
+                os.path.join(self.cfg.runner.logger.log_path, "action_diagnostics"),
+            )
+        )
+        if self.action_diag_enable and self._rank == 0:
+            self.action_diag_dir.mkdir(parents=True, exist_ok=True)
+
+        self._setup_offline_collection(seed=seed)
+
+    def _setup_offline_collection(self, seed: int) -> None:
+        collect_cfg = self.cfg.algorithm.get("offline_collection", None)
+        if collect_cfg is None:
+            return
+        self.offline_collection_enable = bool(collect_cfg.get("enable", False))
+        if not self.offline_collection_enable:
+            return
+
+        base_dir = collect_cfg.get(
+            "output_dir",
+            os.path.join(self.cfg.runner.logger.log_path, "offline_collection"),
+        )
+        self.offline_collection_output_dir = Path(base_dir) / f"rank_{self._rank}"
+        self.offline_collection_output_dir.mkdir(parents=True, exist_ok=True)
+        self.offline_collection_quality_mode = str(collect_cfg.get("quality_mode", "reward_max")).lower()
+        self.offline_collection_success_threshold = float(collect_cfg.get("success_threshold", 0.5))
+        self.offline_collection_summary_flush_every = int(collect_cfg.get("summary_flush_every", 100))
+        self.offline_collection_summary_path = self.offline_collection_output_dir / "trajectory_summaries.jsonl"
+
+        buffer_common = {
+            "seed": seed,
+            "enable_cache": bool(collect_cfg.get("enable_cache", False)),
+            "cache_size": int(collect_cfg.get("cache_size", 64)),
+            "sample_window_size": int(collect_cfg.get("sample_window_size", 1024)),
+            "auto_save": True,
+            "trajectory_format": str(collect_cfg.get("trajectory_format", "pt")),
+        }
+        resume_existing = bool(collect_cfg.get("resume_existing", True))
+
+        buffer_specs = {
+            "all": bool(collect_cfg.get("save_all", True)),
+            "success": bool(collect_cfg.get("save_success", True)),
+            "failure": bool(collect_cfg.get("save_failure", True)),
+        }
+        for name, enabled in buffer_specs.items():
+            if not enabled:
+                continue
+            save_dir = self.offline_collection_output_dir / name
+            save_dir.mkdir(parents=True, exist_ok=True)
+            buffer = TrajectoryReplayBuffer(
+                auto_save_path=str(save_dir),
+                **buffer_common,
+            )
+            metadata_path = save_dir / "metadata.json"
+            if resume_existing and metadata_path.exists():
+                buffer.load_checkpoint(str(save_dir), is_distributed=False)
+            self.offline_collection_buffers[name] = buffer
+
+    def _compute_offline_collection_quality(self, traj: Trajectory) -> dict:
+        rewards = traj.rewards.float().cpu() if traj.rewards is not None else torch.zeros(1)
+        terminations = traj.terminations.bool().cpu() if traj.terminations is not None else None
+        dones = traj.dones.bool().cpu() if traj.dones is not None else None
+        reward_sum = float(rewards.sum().item())
+        reward_max = float(rewards.max().item()) if rewards.numel() > 0 else 0.0
+        terminal_any = bool(terminations.any().item()) if terminations is not None else False
+        done_any = bool(dones.any().item()) if dones is not None else False
+
+        mode = self.offline_collection_quality_mode
+        threshold = self.offline_collection_success_threshold
+        if mode == "reward_sum":
+            is_success = reward_sum >= threshold
+        elif mode == "any_positive":
+            is_success = reward_max > 0.0
+        elif mode == "terminal_and_reward":
+            is_success = terminal_any and reward_max >= threshold
+        else:
+            is_success = reward_max >= threshold
+
+        num_samples = int(traj.actions.shape[0]) if traj.actions is not None else 0
+        return {
+            "reward_sum": reward_sum,
+            "reward_max": reward_max,
+            "terminal_any": terminal_any,
+            "done_any": done_any,
+            "is_success": is_success,
+            "num_samples": num_samples,
+        }
+
+    def _flush_offline_collection_summary(self) -> None:
+        if not self.offline_collection_enable or self.offline_collection_summary_path is None:
+            return
+        if len(self.offline_collection_summary_buffer) == 0:
+            return
+        with open(self.offline_collection_summary_path, "a", encoding="utf-8") as f:
+            for row in self.offline_collection_summary_buffer:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self.offline_collection_summary_buffer.clear()
+
+    def _store_offline_collection_trajectories(self, trajs: list[Trajectory]) -> None:
+        if not self.offline_collection_enable or len(trajs) == 0:
+            return
+
+        grouped = {"all": [], "success": [], "failure": []}
+        summary_rows = []
+        for traj in trajs:
+            quality = self._compute_offline_collection_quality(traj)
+            self.offline_collection_num_received += 1
+            row = {
+                "collection_index": int(self.offline_collection_num_received),
+                "rank": int(self._rank),
+                "model_weights_id": str(traj.model_weights_id),
+                **quality,
+            }
+            summary_rows.append(row)
+            if "all" in self.offline_collection_buffers:
+                grouped["all"].append(traj)
+            key = "success" if quality["is_success"] else "failure"
+            if key in self.offline_collection_buffers:
+                grouped[key].append(traj)
+
+        for key, group in grouped.items():
+            if key in self.offline_collection_buffers and len(group) > 0:
+                self.offline_collection_buffers[key].add_trajectories(group)
+
+        self.offline_collection_summary_buffer.extend(summary_rows)
+        if len(self.offline_collection_summary_buffer) >= self.offline_collection_summary_flush_every:
+            self._flush_offline_collection_summary()
+
+    def get_offline_collection_stats(self) -> dict[str, Any]:
+        stats = {
+            "enabled": self.offline_collection_enable,
+            "quality_mode": self.offline_collection_quality_mode,
+            "success_threshold": self.offline_collection_success_threshold,
+        }
+        for name, buffer in self.offline_collection_buffers.items():
+            buf_stats = buffer.get_stats()
+            stats[name] = {
+                "num_trajectories": int(buf_stats.get("num_trajectories", 0)),
+                "total_samples": int(buf_stats.get("total_samples", 0)),
+            }
+        return stats
+
+    def finalize_offline_collection(self) -> dict[str, Any]:
+        self._flush_offline_collection_summary()
+        for buffer in self.offline_collection_buffers.values():
+            buffer.close(wait=True)
+        return self.get_offline_collection_stats()
+
     # ---------------------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------------------
     @staticmethod
     def _unwrap_policy(model):
         return model.module if hasattr(model, "module") else model
+
+    def _visual_mode(self) -> str:
+        policy = self._unwrap_policy(self.model)
+        return str(getattr(policy, "visual_input_mode", "normal")).lower()
+
+    def _build_visual_feat_for_actor(self, visual_latent: torch.Tensor) -> torch.Tensor:
+        policy = self._unwrap_policy(self.model)
+        mode = self._visual_mode()
+        if mode == "normal":
+            return self.model(
+                forward_type=ForwardType.DEFAULT,
+                mode="encode_visual",
+                visual_latent=visual_latent.to(self.device, dtype=self.torch_dtype),
+            )
+
+        batch_size = int(visual_latent.shape[0])
+        return torch.zeros(
+            batch_size,
+            int(policy.visual_feature_dim),
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
+
+    def _should_capture_action_diagnostics(self) -> bool:
+        if not self.action_diag_enable:
+            return False
+        if self._rank != 0:
+            return False
+        interval = max(1, self.action_diag_every_actor_updates)
+        upcoming_actor_update = self.actor_update_step + 1
+        if upcoming_actor_update == self.action_diag_last_captured_actor_update:
+            return False
+        return (upcoming_actor_update % interval) == 0
+
+    @staticmethod
+    def _tensor_to_numpy(t: torch.Tensor) -> np.ndarray:
+        return t.detach().float().cpu().numpy()
+
+    def _save_action_diagnostics(self, debug_bundle: dict[str, Any]) -> dict[str, float]:
+        policy = self._unwrap_policy(self.model)
+        tag = debug_bundle["tag"]
+        out_dir = self.action_diag_dir / tag
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        ref_action = debug_bundle["ref_action"].detach().float()
+        pred_action = debug_bundle["pred_action"].detach().float()
+        robot_state = debug_bundle["robot_state"].detach().float()
+        visual_feat = debug_bundle["visual_feat"].detach().float()
+        visual_feat_for_state = debug_bundle["visual_feat_for_state"].detach().float()
+        robot_state_for_state = debug_bundle["robot_state_for_state"].detach().float()
+        ref_action_flat_for_state = debug_bundle["ref_action_flat_for_state"].detach().float()
+
+        with torch.no_grad():
+            ref_exec = policy.postprocess_action_model_batch(ref_action, robot_state)
+            pred_exec = policy.postprocess_action_model_batch(pred_action, robot_state)
+
+        model_diff = pred_action - ref_action
+        exec_diff = pred_exec - ref_exec
+
+        model_mse = float((model_diff.pow(2)).mean().item())
+        exec_mse = float((exec_diff.pow(2)).mean().item())
+        model_mae = float(model_diff.abs().mean().item())
+        exec_mae = float(exec_diff.abs().mean().item())
+        model_max_abs = float(model_diff.abs().max().item())
+        exec_max_abs = float(exec_diff.abs().max().item())
+
+        model_per_step_mse = model_diff.pow(2).mean(dim=(0, 2)).cpu().numpy()
+        exec_per_step_mse = exec_diff.pow(2).mean(dim=(0, 2)).cpu().numpy()
+        model_per_dim_mse = model_diff.pow(2).mean(dim=(0, 1)).cpu().numpy()
+        exec_per_dim_mse = exec_diff.pow(2).mean(dim=(0, 1)).cpu().numpy()
+
+        save_n = min(self.action_diag_max_save_samples, ref_action.shape[0])
+        np.savez_compressed(
+            out_dir / "action_diag_samples.npz",
+            ref_action_model=self._tensor_to_numpy(ref_action[:save_n]),
+            actor_action_model=self._tensor_to_numpy(pred_action[:save_n]),
+            diff_action_model=self._tensor_to_numpy(model_diff[:save_n]),
+            ref_action_exec=self._tensor_to_numpy(ref_exec[:save_n]),
+            actor_action_exec=self._tensor_to_numpy(pred_exec[:save_n]),
+            diff_action_exec=self._tensor_to_numpy(exec_diff[:save_n]),
+            robot_state=self._tensor_to_numpy(robot_state[:save_n]),
+            visual_feat=self._tensor_to_numpy(visual_feat[:save_n]),
+            visual_feat_for_state=self._tensor_to_numpy(visual_feat_for_state[:save_n]),
+            robot_state_for_state=self._tensor_to_numpy(robot_state_for_state[:save_n]),
+            ref_action_flat_for_state=self._tensor_to_numpy(ref_action_flat_for_state[:save_n]),
+            model_per_step_mse=model_per_step_mse,
+            exec_per_step_mse=exec_per_step_mse,
+            model_per_dim_mse=model_per_dim_mse,
+            exec_per_dim_mse=exec_per_dim_mse,
+        )
+
+        summary = {
+            "tag": tag,
+            "update_step": int(debug_bundle["update_step"]),
+            "actor_update_step": int(debug_bundle["actor_update_step"]),
+            "batch_size": int(ref_action.shape[0]),
+            "save_n": int(save_n),
+            "model_mse": model_mse,
+            "exec_mse": exec_mse,
+            "model_mae": model_mae,
+            "exec_mae": exec_mae,
+            "model_max_abs": model_max_abs,
+            "exec_max_abs": exec_max_abs,
+            "visual_feat_norm": float(visual_feat.norm(dim=-1).mean().item()),
+            "robot_state_norm": float(robot_state.norm(dim=-1).mean().item()),
+            "model_per_step_mse": model_per_step_mse.tolist(),
+            "exec_per_step_mse": exec_per_step_mse.tolist(),
+            "model_per_dim_mse": model_per_dim_mse.tolist(),
+            "exec_per_dim_mse": exec_per_dim_mse.tolist(),
+        }
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+
+        sample_idx = 0
+        ref0 = self._tensor_to_numpy(ref_action[sample_idx])
+        pred0 = self._tensor_to_numpy(pred_action[sample_idx])
+        diff0 = self._tensor_to_numpy(model_diff[sample_idx])
+        ref_exec0 = self._tensor_to_numpy(ref_exec[sample_idx])
+        pred_exec0 = self._tensor_to_numpy(pred_exec[sample_idx])
+        diff_exec0 = self._tensor_to_numpy(exec_diff[sample_idx])
+        robot0 = self._tensor_to_numpy(robot_state[sample_idx])
+        visual0 = self._tensor_to_numpy(visual_feat_for_state[sample_idx])
+        plot_visual_dims = min(self.action_diag_visual_feat_plot_dims, visual0.shape[0])
+
+        fig, axes = plt.subplots(3, 4, figsize=(24, 14))
+        ax = axes.reshape(-1)
+        ims = []
+        ims.append(ax[0].imshow(ref0, aspect="auto")); ax[0].set_title("WA ref action (model)")
+        ims.append(ax[1].imshow(pred0, aspect="auto")); ax[1].set_title("Actor action (model)")
+        ims.append(ax[2].imshow(diff0, aspect="auto")); ax[2].set_title("Diff (model)")
+        ims.append(ax[3].imshow(ref_exec0, aspect="auto")); ax[3].set_title("WA ref action (exec)")
+        ims.append(ax[4].imshow(pred_exec0, aspect="auto")); ax[4].set_title("Actor action (exec)")
+        ims.append(ax[5].imshow(diff_exec0, aspect="auto")); ax[5].set_title("Diff (exec)")
+        for i in range(6):
+            fig.colorbar(ims[i], ax=ax[i], fraction=0.046, pad=0.04)
+            ax[i].set_xlabel("action dim")
+            ax[i].set_ylabel("chunk step")
+
+        ax[6].plot(model_per_step_mse, label="model")
+        ax[6].plot(exec_per_step_mse, label="exec")
+        ax[6].set_title("Per-step MSE")
+        ax[6].set_xlabel("chunk step")
+        ax[6].legend()
+
+        ax[7].plot(model_per_dim_mse, label="model")
+        ax[7].plot(exec_per_dim_mse, label="exec")
+        ax[7].set_title("Per-dim MSE")
+        ax[7].set_xlabel("action dim")
+        ax[7].legend()
+
+        ax[8].plot(robot0)
+        ax[8].set_title("Actor input robot_state (sample0)")
+        ax[8].set_xlabel("state dim")
+
+        ax[9].plot(visual0[:plot_visual_dims])
+        ax[9].set_title(f"Actor input visual feat first {plot_visual_dims} dims")
+        ax[9].set_xlabel("visual dim")
+
+        ax[10].hist(diff0.reshape(-1), bins=50)
+        ax[10].set_title("Model diff histogram (sample0)")
+
+        ax[11].axis("off")
+        ax[11].text(0.0, 1.0,
+            f"tag: {tag}\nmodel_mse: {model_mse:.6e}\nexec_mse: {exec_mse:.6e}\nmodel_mae: {model_mae:.6e}\nexec_mae: {exec_mae:.6e}\nmodel_max_abs: {model_max_abs:.6e}\nexec_max_abs: {exec_max_abs:.6e}\nvisual_feat_norm: {summary['visual_feat_norm']:.6e}\nrobot_state_norm: {summary['robot_state_norm']:.6e}",
+            va="top", family="monospace")
+
+        fig.tight_layout()
+        fig.savefig(out_dir / "action_diag_overview.png", dpi=180)
+        plt.close(fig)
+
+        self.action_diag_last_captured_actor_update = int(debug_bundle["actor_update_step"])
+        self.log_on_first_rank(
+            f"[action_diagnostics] saved to {out_dir} | model_mse={model_mse:.6e} | exec_mse={exec_mse:.6e}"
+        )
+
+        return {
+            "actor_debug/model_mse": model_mse,
+            "actor_debug/exec_mse": exec_mse,
+            "actor_debug/model_mae": model_mae,
+            "actor_debug/exec_mae": exec_mae,
+            "actor_debug/model_max_abs": model_max_abs,
+            "actor_debug/exec_max_abs": exec_max_abs,
+        }
 
     def _maybe_enable_rollout_rl_head(self):
         if self.rollout_rl_head_enabled:
@@ -242,6 +640,91 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         policy = self._unwrap_policy(self.model)
         policy.set_use_rl_head_for_rollout(True)
         self.rollout_rl_head_enabled = True
+
+    def _resolve_buffer_usage(self, replay_min_size: int, demo_min_size: int):
+        replay_min_size = int(max(0, replay_min_size))
+        demo_min_size = int(max(0, demo_min_size))
+        wants_replay = self.training_uses_replay
+        wants_demo = self.training_uses_demo
+        replay_ready = wants_replay and self.replay_buffer.is_ready(replay_min_size)
+        demo_ready = wants_demo and self.demo_buffer is not None and self.demo_buffer.is_ready(demo_min_size)
+
+        use_replay = False
+        use_demo = False
+        if wants_replay and wants_demo:
+            if replay_ready and demo_ready:
+                use_replay = True
+                use_demo = True
+            elif demo_ready and self.allow_demo_only_fallback:
+                use_demo = True
+            elif replay_ready and self.allow_replay_only_fallback:
+                use_replay = True
+        elif wants_replay:
+            use_replay = replay_ready
+        elif wants_demo:
+            use_demo = demo_ready
+
+        return {
+            "wants_replay": wants_replay,
+            "wants_demo": wants_demo,
+            "replay_ready": replay_ready,
+            "demo_ready": demo_ready,
+            "use_replay": use_replay,
+            "use_demo": use_demo,
+        }
+
+    def _get_training_readiness(self):
+        replay_start_size = max(self.replay_min_buffer_size, self.warmup_steps) if self.training_uses_replay else 0
+        demo_start_size = self.demo_min_buffer_size if self.training_uses_demo else 0
+        start_status = self._resolve_buffer_usage(
+            replay_min_size=replay_start_size,
+            demo_min_size=demo_start_size,
+        )
+
+        train_actor_steps_cfg = int(self.cfg.algorithm.get("train_actor_steps", 0))
+        replay_actor_threshold = 0
+        demo_actor_threshold = 0
+        if self.training_uses_replay:
+            replay_actor_threshold = max(
+                replay_start_size,
+                train_actor_steps_cfg,
+                self.replay_train_actor_steps,
+            )
+        if self.training_uses_demo:
+            demo_actor_threshold = max(
+                demo_start_size,
+                train_actor_steps_cfg,
+                self.demo_train_actor_steps,
+            )
+        actor_status = self._resolve_buffer_usage(
+            replay_min_size=replay_actor_threshold,
+            demo_min_size=demo_actor_threshold,
+        )
+
+        can_train = start_status["use_replay"] or start_status["use_demo"]
+        if not can_train and self.allow_train_on_demo_only and start_status["demo_ready"]:
+            can_train = True
+            start_status["use_demo"] = True
+
+        train_actor = actor_status["use_replay"] or actor_status["use_demo"]
+        if not train_actor and self.allow_train_on_demo_only and actor_status["demo_ready"]:
+            train_actor = True
+            actor_status["use_demo"] = True
+
+        if self.replay_required_for_training and self.training_uses_replay and not start_status["replay_ready"]:
+            can_train = False
+            train_actor = False
+
+        return {
+            "can_train": can_train,
+            "train_actor": train_actor,
+            "start_status": start_status,
+            "actor_status": actor_status,
+            "replay_start_size": replay_start_size,
+            "demo_start_size": demo_start_size,
+            "replay_actor_threshold": replay_actor_threshold,
+            "demo_actor_threshold": demo_actor_threshold,
+        }
 
     def _maybe_update_targets(self, actor_updated: bool, critic_updated: bool):
         if self.update_step % self.target_update_freq != 0:
@@ -312,12 +795,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         chunk = chunk_plus_one - 1
         frames = [seq_tensor[0, :, 0].contiguous()]
         for t in range(traj_len):
-            current_seq = seq_tensor[t]  # [batch, chunk+1, ...]
+            current_seq = seq_tensor[t]
             for k in range(1, chunk + 1):
                 frames.append(current_seq[:, k].contiguous())
         return torch.stack(frames, dim=0).contiguous()
 
-    def _build_primitive_obs_dict(self, traj: Trajectory) -> dict[str, torch.Tensor]:
+    def _build_primitive_obs_dict(self, traj: Trajectory, traj_len: int | None = None) -> dict[str, torch.Tensor]:
         obs = {}
         key_map = {
             "_chunk_step_main_images_seq": "main_images",
@@ -327,11 +810,49 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         }
         for seq_key, obs_key in key_map.items():
             if seq_key in traj.curr_obs and isinstance(traj.curr_obs[seq_key], torch.Tensor):
-                obs[obs_key] = self._flatten_chunk_obs_sequence(traj.curr_obs[seq_key])
+                seq_tensor = traj.curr_obs[seq_key]
+                if traj_len is not None:
+                    seq_tensor = seq_tensor[:traj_len]
+                obs[obs_key] = self._flatten_chunk_obs_sequence(seq_tensor)
         return obs
+
+    def _get_effective_traj_len(self, traj: Trajectory, source_actions: torch.Tensor) -> int:
+        candidate_lengths = [int(source_actions.shape[0])]
+
+        for tensor in [traj.rewards, traj.terminations, traj.truncations, traj.dones, traj.prev_logprobs, traj.prev_values, traj.versions]:
+            if isinstance(tensor, torch.Tensor):
+                candidate_lengths.append(int(tensor.shape[0]))
+
+        if isinstance(traj.curr_obs, dict):
+            for value in traj.curr_obs.values():
+                if isinstance(value, torch.Tensor):
+                    candidate_lengths.append(int(value.shape[0]))
+        if isinstance(traj.next_obs, dict):
+            for value in traj.next_obs.values():
+                if isinstance(value, torch.Tensor):
+                    candidate_lengths.append(int(value.shape[0]))
+
+        effective_len = min(candidate_lengths)
+        if effective_len <= 0:
+            raise RuntimeError(f"Invalid effective trajectory length: {effective_len}, candidates={candidate_lengths}")
+        if effective_len != candidate_lengths[0]:
+            self.log_on_first_rank(
+                f"[gigawa_sliding_window] cropping inconsistent trajectory lengths to {effective_len}; candidates={candidate_lengths}"
+            )
+        return effective_len
+
+    def _slice_obs_dict(self, obs: dict[str, Any], traj_len: int) -> dict[str, Any]:
+        out = {}
+        for k, v in obs.items():
+            if isinstance(v, torch.Tensor):
+                out[k] = v[:traj_len]
+            else:
+                out[k] = v
+        return out
 
     @torch.no_grad()
     def _convert_standard_trajectory_for_gigawa(self, traj: Trajectory) -> Trajectory:
+        assert traj.curr_obs and traj.next_obs, "Trajectory must contain curr_obs and next_obs."
         source_actions = self._get_source_actions(traj)
         traj_len = int(source_actions.shape[0])
 
@@ -343,8 +864,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         next_ref_actions = []
 
         for t in range(traj_len):
-            curr_step_obs = self._slice_obs_at_step(traj.curr_obs, t)
-            next_step_obs = self._slice_obs_at_step(traj.next_obs, t)
+            curr_step_obs = self._slice_obs_at_step(curr_obs, t)
+            next_step_obs = self._slice_obs_at_step(next_obs, t)
 
             curr_feat = self._extract_step_features(curr_step_obs)
             next_feat = self._extract_step_features(next_step_obs)
@@ -361,13 +882,13 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             model_weights_id=traj.model_weights_id,
             actions=source_actions.cpu().contiguous(),
             intervene_flags=traj.intervene_flags.cpu().contiguous() if traj.intervene_flags is not None else None,
-            rewards=traj.rewards.cpu().contiguous() if traj.rewards is not None else None,
-            terminations=traj.terminations.cpu().contiguous() if traj.terminations is not None else None,
-            truncations=traj.truncations.cpu().contiguous() if traj.truncations is not None else None,
-            dones=traj.dones.cpu().contiguous() if traj.dones is not None else None,
-            prev_logprobs=traj.prev_logprobs.cpu().contiguous() if traj.prev_logprobs is not None else None,
-            prev_values=traj.prev_values.cpu().contiguous() if traj.prev_values is not None else None,
-            versions=traj.versions.cpu().contiguous() if traj.versions is not None else None,
+            rewards=traj.rewards[:traj_len].cpu().contiguous() if traj.rewards is not None else None,
+            terminations=traj.terminations[:traj_len].cpu().contiguous() if traj.terminations is not None else None,
+            truncations=traj.truncations[:traj_len].cpu().contiguous() if traj.truncations is not None else None,
+            dones=traj.dones[:traj_len].cpu().contiguous() if traj.dones is not None else None,
+            prev_logprobs=traj.prev_logprobs[:traj_len].cpu().contiguous() if traj.prev_logprobs is not None else None,
+            prev_values=traj.prev_values[:traj_len].cpu().contiguous() if traj.prev_values is not None else None,
+            versions=traj.versions[:traj_len].cpu().contiguous() if traj.versions is not None else None,
             forward_inputs=traj.forward_inputs,
             curr_obs={
                 "visual_latent": torch.stack(curr_visual_latents, dim=0),
@@ -385,7 +906,17 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     def _convert_sliding_window_trajectories_for_gigawa(self, traj: Trajectory) -> list[Trajectory]:
         source_actions = self._get_source_actions(traj).cpu().contiguous()
         assert traj.curr_obs and traj.next_obs, "Trajectory must contain curr_obs and next_obs."
-        primitive_obs = self._build_primitive_obs_dict(traj)
+        traj_len = self._get_effective_traj_len(traj, source_actions)
+        source_actions = source_actions[:traj_len].cpu().contiguous()
+        rewards = traj.rewards[:traj_len] if traj.rewards is not None else None
+        terminations = traj.terminations[:traj_len] if traj.terminations is not None else None
+        truncations = traj.truncations[:traj_len] if traj.truncations is not None else None
+        dones = traj.dones[:traj_len] if traj.dones is not None else None
+        prev_logprobs = traj.prev_logprobs[:traj_len] if traj.prev_logprobs is not None else None
+        prev_values = traj.prev_values[:traj_len] if traj.prev_values is not None else None
+        versions = traj.versions[:traj_len] if traj.versions is not None else None
+        intervene_flags = traj.intervene_flags[:traj_len] if traj.intervene_flags is not None else None
+        primitive_obs = self._build_primitive_obs_dict(traj, traj_len=traj_len)
         if "states" not in primitive_obs:
             return [self._convert_standard_trajectory_for_gigawa(traj)]
 
@@ -397,30 +928,30 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         ).permute(0, 2, 1, 3).reshape(
             traj_len * action_chunk, batch_size, action_dim
         )
-        primitive_rewards = traj.rewards.permute(0, 2, 1).reshape(
+        primitive_rewards = rewards.permute(0, 2, 1).reshape(
             traj_len * action_chunk, batch_size
         ).cpu().contiguous()
-        primitive_terminations = traj.terminations.permute(0, 2, 1).reshape(
+        primitive_terminations = terminations.permute(0, 2, 1).reshape(
             traj_len * action_chunk, batch_size
         ).to(torch.bool).cpu().contiguous()
-        primitive_truncations = traj.truncations.permute(0, 2, 1).reshape(
+        primitive_truncations = truncations.permute(0, 2, 1).reshape(
             traj_len * action_chunk, batch_size
         ).to(torch.bool).cpu().contiguous()
-        primitive_dones = traj.dones.permute(0, 2, 1).reshape(
+        primitive_dones = dones.permute(0, 2, 1).reshape(
             traj_len * action_chunk, batch_size
         ).to(torch.bool).cpu().contiguous()
 
         primitive_intervene = None
-        if traj.intervene_flags is not None:
-            primitive_intervene = traj.intervene_flags.view(
+        if intervene_flags is not None:
+            primitive_intervene = intervene_flags.view(
                 traj_len, batch_size, action_chunk, action_dim
             ).permute(0, 2, 1, 3).reshape(
                 traj_len * action_chunk, batch_size, action_dim
             ).to(torch.bool).cpu().contiguous()
 
         primitive_logprobs = None
-        if traj.prev_logprobs is not None:
-            primitive_logprobs = traj.prev_logprobs.permute(0, 2, 1).reshape(
+        if prev_logprobs is not None:
+            primitive_logprobs = prev_logprobs.permute(0, 2, 1).reshape(
                 traj_len * action_chunk, batch_size
             ).cpu().contiguous()
 
@@ -446,12 +977,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             next_ref_actions = []
 
             for start_idx, next_idx in zip(start_indices.tolist(), next_indices.tolist()):
-                curr_step_obs = {
-                    key: value[start_idx] for key, value in primitive_obs.items()
-                }
-                next_step_obs = {
-                    key: value[next_idx] for key, value in primitive_obs.items()
-                }
+                curr_step_obs = {key: value[start_idx] for key, value in primitive_obs.items()}
+                next_step_obs = {key: value[next_idx] for key, value in primitive_obs.items()}
                 curr_feat = self._extract_step_features(curr_step_obs)
                 next_feat = self._extract_step_features(next_step_obs)
                 curr_visual_latents.append(curr_feat["visual_latent"])
@@ -487,8 +1014,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     logprob_chunk_tensor = primitive_logprobs[start_idx:end_idx].permute(1, 0)
                     window_logprobs.append(logprob_chunk_tensor.cpu().contiguous())
 
-            version_source = traj.versions[:window_count].cpu().contiguous() if traj.versions is not None else None
-            value_source = traj.prev_values[:window_count].cpu().contiguous() if traj.prev_values is not None else None
+            version_source = versions[:window_count].cpu().contiguous() if versions is not None else None
+            value_source = prev_values[:window_count].cpu().contiguous() if prev_values is not None else None
 
             converted_trajectories.append(
                 Trajectory(
@@ -543,9 +1070,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         gigawa_list = []
         for traj in recv_list:
             gigawa_list.extend(self._convert_trajectory_for_gigawa(traj))
-        self.replay_buffer.add_trajectories(gigawa_list)
+        if self.store_online_replay:
+            self.replay_buffer.add_trajectories(gigawa_list)
 
-        if self.demo_buffer is not None:
+        self._store_offline_collection_trajectories(gigawa_list)
+
+        if self.demo_buffer is not None and self.store_online_demo_interventions:
             intervene_traj_list = []
             for traj in gigawa_list:
                 intervene_trajs = traj.extract_intervene_traj()
@@ -573,10 +1103,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         done_mask = terminations.any(dim=-1, keepdim=True).to(self.torch_dtype)
 
         with torch.no_grad():
-            curr_visual_feat = self.model(
-                forward_type=ForwardType.DEFAULT,
-                mode="encode_visual",
-                visual_latent=curr_obs["visual_latent"].to(self.device, dtype=self.torch_dtype),
+            curr_visual_feat = self._build_visual_feat_for_actor(
+                curr_obs["visual_latent"]
             )
             _, curr_actor_aux = self.model(
                 forward_type=ForwardType.DEFAULT,
@@ -589,10 +1117,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             )
             curr_rl_state = curr_actor_aux["rl_state"].detach()
 
-            next_visual_feat = self.model(
-                forward_type=ForwardType.DEFAULT,
-                mode="encode_visual",
-                visual_latent=next_obs["visual_latent"].to(self.device, dtype=self.torch_dtype),
+            next_visual_feat = self._build_visual_feat_for_actor(
+                next_obs["visual_latent"]
             )
             next_actions, next_actor_aux = policy.target_actor_forward(
                 visual_feat=next_visual_feat.detach(),
@@ -627,21 +1153,20 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         }
 
     @Worker.timer("forward_actor")
-    def forward_actor(self, batch):
+    def forward_actor(self, batch, capture_diagnostics: bool = False):
         policy = self._unwrap_policy(self.model)
         curr_obs = batch["curr_obs"]
+        robot_state = curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype)
         ref_action = curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype)
 
-        visual_feat = self.model(
-            forward_type=ForwardType.DEFAULT,
-            mode="encode_visual",
-            visual_latent=curr_obs["visual_latent"].to(self.device, dtype=self.torch_dtype),
+        visual_feat = self._build_visual_feat_for_actor(
+            curr_obs["visual_latent"]
         )
         pi, actor_aux = self.model(
             forward_type=ForwardType.DEFAULT,
             mode="actor",
             visual_feat=visual_feat,
-            robot_state=curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
+            robot_state=robot_state,
             ref_action=ref_action,
             ref_action_dropout_p=self.ref_action_dropout_p,
             use_target=False,
@@ -657,10 +1182,27 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             ),
         }
 
+        debug_bundle = None
+        if capture_diagnostics:
+            debug_bundle = {
+                "tag": f"update_{self.update_step + 1:07d}_actor_{self.actor_update_step + 1:07d}",
+                "update_step": self.update_step + 1,
+                "actor_update_step": self.actor_update_step + 1,
+                "ref_action": ref_action.detach(),
+                "pred_action": pi.detach(),
+                "robot_state": robot_state.detach(),
+                "visual_feat": visual_feat.detach(),
+                "visual_feat_for_state": actor_aux.get("visual_feat_for_state", visual_feat).detach(),
+                "robot_state_for_state": actor_aux.get("robot_state_for_state", robot_state).detach(),
+                "ref_action_flat_for_state": actor_aux.get(
+                    "ref_action_flat_for_state", ref_action.reshape(ref_action.shape[0], -1)
+                ).detach(),
+            }
+
         if self.stage_actor_bc_only:
             actor_loss = self.bc_coef * bc_loss
             metrics["q_pi"] = 0.0
-            return actor_loss, metrics
+            return actor_loss, metrics, debug_bundle
 
         rl_state = actor_aux["rl_state"]
         q1_pi, q2_pi = self.model(
@@ -674,7 +1216,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         actor_loss = (-q_pi).mean() + self.bc_coef * bc_loss
         metrics["q_pi"] = q_pi.mean().item()
-        return actor_loss, metrics
+        return actor_loss, metrics, debug_bundle
 
     # ---------------------------------------------------------------------
     # Update loop
@@ -740,12 +1282,19 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             all_actor_metrics = {}
-            for batch in train_micro_batch_list:
-                actor_loss, actor_metrics = self.forward_actor(batch)
+            capture_debug_this_update = self._should_capture_action_diagnostics()
+            debug_bundle_to_save = None
+            for batch_idx, batch in enumerate(train_micro_batch_list):
+                actor_loss, actor_metrics, debug_bundle = self.forward_actor(
+                    batch,
+                    capture_diagnostics=(capture_debug_this_update and batch_idx == 0),
+                )
                 actor_loss = actor_loss / self.gradient_accumulation
                 actor_loss.backward()
                 gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
                 append_to_dict(all_actor_metrics, actor_metrics)
+                if debug_bundle is not None:
+                    debug_bundle_to_save = debug_bundle
             all_actor_metrics = {f"actor/{k}": np.mean(v) for k, v in all_actor_metrics.items()}
             actor_grad_norm = self.model.clip_grad_norm_(
                 max_norm=self.cfg.actor.optim.clip_grad
@@ -754,6 +1303,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.lr_scheduler.step()
             actor_updated = True
             self.actor_update_step += 1
+            if debug_bundle_to_save is not None:
+                metrics_data.update(self._save_action_diagnostics(debug_bundle_to_save))
             metrics_data.update(
                 {
                     "gigawa/actor_loss": np.mean(gbs_actor_loss),
@@ -783,6 +1334,17 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             }
             append_to_dict(metrics, demo_buffer_stats)
 
+        append_to_dict(
+            metrics,
+            {
+                "buffer_mix/demo_sample_ratio_target": self.demo_sample_ratio,
+                "buffer_mix/replay_batch_size_target": float(self.target_replay_batch_size),
+                "buffer_mix/demo_batch_size_target": float(self.target_demo_batch_size),
+                "buffer_mix/store_online_replay": float(self.store_online_replay),
+                "buffer_mix/store_online_demo_interventions": float(self.store_online_demo_interventions),
+            },
+        )
+
         mean_metric_dict = {}
         for key, value in metrics.items():
             if isinstance(value, list) and len(value) > 0:
@@ -807,17 +1369,19 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)
 
-        min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
-        train_start_size = max(min_buffer_size, self.warmup_steps)
-        if not self.replay_buffer.is_ready(train_start_size):
+        readiness = self._get_training_readiness()
+        if not readiness["can_train"]:
+            start_status = readiness["start_status"]
             self.log_on_first_rank(
-                f"Replay buffer size {len(self.replay_buffer)} < {train_start_size}, skipping training"
+                "Skipping training because buffers are not ready: "
+                f"replay_ready={start_status['replay_ready']} "
+                f"(need {readiness['replay_start_size']}, have {len(self.replay_buffer)}), "
+                f"demo_ready={start_status['demo_ready']} "
+                f"(need {readiness['demo_start_size']}, have {len(self.demo_buffer) if self.demo_buffer is not None else 0})"
             )
             return {}
 
-        train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
-        train_actor_steps = max(train_start_size, train_actor_steps)
-        train_actor = self.replay_buffer.is_ready(train_actor_steps)
+        train_actor = readiness["train_actor"]
 
         assert (
             self.cfg.actor.global_batch_size
@@ -831,7 +1395,15 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
 
         self.model.train()
-        metrics = {}
+        metrics = {
+            "buffer_mix/use_replay_this_step": float(readiness["start_status"]["use_replay"]),
+            "buffer_mix/use_demo_this_step": float(readiness["start_status"]["use_demo"]),
+            "buffer_mix/train_actor": float(train_actor),
+            "buffer_mix/replay_ready": float(readiness["start_status"]["replay_ready"]),
+            "buffer_mix/demo_ready": float(readiness["start_status"]["demo_ready"]),
+            "buffer_mix/replay_required_for_training": float(self.replay_required_for_training),
+            "buffer_mix/allow_train_on_demo_only": float(self.allow_train_on_demo_only),
+        }
 
         update_epoch = self.utd_ratio
         for _ in range(update_epoch):

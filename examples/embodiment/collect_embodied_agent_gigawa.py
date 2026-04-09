@@ -18,6 +18,32 @@ from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 mp.set_start_method("spawn", force=True)
 
 
+
+
+def _aggregate_collection_stats(stats):
+    if isinstance(stats, dict):
+        return stats
+    if not isinstance(stats, list):
+        return {}
+    agg = {"enabled": False, "quality_mode": None, "success_threshold": None}
+    for item in stats:
+        if not isinstance(item, dict):
+            continue
+        agg["enabled"] = agg["enabled"] or bool(item.get("enabled", False))
+        if agg["quality_mode"] is None:
+            agg["quality_mode"] = item.get("quality_mode", None)
+        if agg["success_threshold"] is None:
+            agg["success_threshold"] = item.get("success_threshold", None)
+        for key in ["all", "success", "failure"]:
+            sub = item.get(key, None)
+            if not isinstance(sub, dict):
+                continue
+            if key not in agg:
+                agg[key] = {"num_trajectories": 0, "total_samples": 0}
+            agg[key]["num_trajectories"] += int(sub.get("num_trajectories", 0))
+            agg[key]["total_samples"] += int(sub.get("total_samples", 0))
+    return agg
+
 def _avg_env_metrics(metrics: dict) -> dict:
     out = {}
     for k, v in (metrics or {}).items():
@@ -34,7 +60,7 @@ def _avg_env_metrics(metrics: dict) -> dict:
 @hydra.main(
     version_base="1.1",
     config_path="config",
-    config_name="robotwin_place_empty_cup_collect_gigawa_offline",
+    config_name="robotwin_place_empty_cup_collect_gigawa_offline_fixed",
 )
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
@@ -99,8 +125,7 @@ def main(cfg) -> None:
     while step < max_collection_steps:
         env_handle = env_group.interact(
             input_channel=env_channel,
-            rollout_channel=rollout_channel,
-            reward_channel=None,
+            output_channel=rollout_channel,
             actor_channel=actor_channel,
         )
         rollout_handle = rollout_group.generate(
@@ -112,7 +137,9 @@ def main(cfg) -> None:
         rollout_handle.wait()
         step += 1
 
-        stats = actor_group.get_offline_collection_stats().wait()
+        stats = _aggregate_collection_stats(
+            actor_group.get_offline_collection_stats().wait()
+        )
         all_stats = stats.get("all", {})
         collected_traj = int(all_stats.get("num_trajectories", 0))
         collected_samples = int(all_stats.get("total_samples", 0))
@@ -149,7 +176,9 @@ def main(cfg) -> None:
         if should_stop:
             break
 
-    final_stats = actor_group.finalize_offline_collection().wait()
+    final_stats = _aggregate_collection_stats(
+        actor_group.finalize_offline_collection().wait()
+    )
     print("[collect] finalized offline collection:")
     print(json.dumps(final_stats, indent=2))
 
