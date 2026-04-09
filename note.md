@@ -26,6 +26,20 @@ python train_embodied_agent_gigawa.py   --config-path ./config   --config-name z
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
 python train_embodied_agent_gigawa.py   --config-path ./config   --config-name delete  ++actor.fsdp_config.use_orig_params=true
 
+cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
+python collect_embodied_agent_gigawa.py \
+  --config-path ./config \
+  --config-name collect_cup_data
+
+cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
+python reshard_offline_collection.py \
+  --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect/offline_collection \
+  --bucket all \
+  --output-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect/mergeall \
+  --target-world-size 4 \
+  --shuffle \
+  --source-cache-size 256
+
 tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/test403_1_rl \
   --host 0.0.0.0 \
   --port 6006

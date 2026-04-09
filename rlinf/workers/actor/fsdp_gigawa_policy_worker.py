@@ -854,7 +854,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     def _convert_standard_trajectory_for_gigawa(self, traj: Trajectory) -> Trajectory:
         assert traj.curr_obs and traj.next_obs, "Trajectory must contain curr_obs and next_obs."
         source_actions = self._get_source_actions(traj)
-        traj_len = int(source_actions.shape[0])
+        traj_len = self._get_effective_traj_len(traj, source_actions)
+        source_actions = source_actions[:traj_len]
+        curr_obs = self._slice_obs_dict(traj.curr_obs, traj_len)
+        next_obs = self._slice_obs_dict(traj.next_obs, traj_len)
 
         curr_visual_latents = []
         curr_robot_states = []
@@ -881,7 +884,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             max_episode_length=traj.max_episode_length,
             model_weights_id=traj.model_weights_id,
             actions=source_actions.cpu().contiguous(),
-            intervene_flags=traj.intervene_flags.cpu().contiguous() if traj.intervene_flags is not None else None,
+            intervene_flags=traj.intervene_flags[:traj_len].cpu().contiguous() if traj.intervene_flags is not None else None,
             rewards=traj.rewards[:traj_len].cpu().contiguous() if traj.rewards is not None else None,
             terminations=traj.terminations[:traj_len].cpu().contiguous() if traj.terminations is not None else None,
             truncations=traj.truncations[:traj_len].cpu().contiguous() if traj.truncations is not None else None,
@@ -901,6 +904,42 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 "ref_action": torch.stack(next_ref_actions, dim=0),
             },
         )
+
+    def _pad_primitive_action_chunk(
+        self,
+        primitive_actions: torch.Tensor,
+        start_idx: int,
+        valid_len: int,
+        action_chunk: int,
+    ) -> torch.Tensor:
+        valid_actions = primitive_actions[start_idx : start_idx + valid_len]  # [valid_len, B, A]
+        assert valid_actions.shape[0] > 0, "valid_len must be positive"
+        if valid_len < action_chunk:
+            pad_count = action_chunk - valid_len
+            pad_actions = valid_actions[-1:].expand(pad_count, -1, -1)
+            valid_actions = torch.cat([valid_actions, pad_actions], dim=0)
+        return valid_actions.permute(1, 0, 2).reshape(valid_actions.shape[1], -1).cpu().contiguous()
+
+    def _pad_primitive_scalar_chunk(
+        self,
+        primitive_tensor: torch.Tensor,
+        start_idx: int,
+        valid_len: int,
+        action_chunk: int,
+        fill_value: int | float | bool = 0,
+    ) -> torch.Tensor:
+        valid_values = primitive_tensor[start_idx : start_idx + valid_len]  # [valid_len, B]
+        assert valid_values.shape[0] > 0, "valid_len must be positive"
+        if valid_len < action_chunk:
+            pad_count = action_chunk - valid_len
+            pad_values = torch.full(
+                (pad_count, valid_values.shape[1]),
+                fill_value=fill_value,
+                dtype=valid_values.dtype,
+                device=valid_values.device,
+            )
+            valid_values = torch.cat([valid_values, pad_values], dim=0)
+        return valid_values.permute(1, 0).cpu().contiguous()
 
     @torch.no_grad()
     def _convert_sliding_window_trajectories_for_gigawa(self, traj: Trajectory) -> list[Trajectory]:
@@ -930,16 +969,16 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
         primitive_rewards = rewards.permute(0, 2, 1).reshape(
             traj_len * action_chunk, batch_size
-        ).cpu().contiguous()
+        ).cpu().contiguous() if rewards is not None else None
         primitive_terminations = terminations.permute(0, 2, 1).reshape(
             traj_len * action_chunk, batch_size
-        ).to(torch.bool).cpu().contiguous()
+        ).to(torch.bool).cpu().contiguous() if terminations is not None else None
         primitive_truncations = truncations.permute(0, 2, 1).reshape(
             traj_len * action_chunk, batch_size
-        ).to(torch.bool).cpu().contiguous()
+        ).to(torch.bool).cpu().contiguous() if truncations is not None else None
         primitive_dones = dones.permute(0, 2, 1).reshape(
             traj_len * action_chunk, batch_size
-        ).to(torch.bool).cpu().contiguous()
+        ).to(torch.bool).cpu().contiguous() if dones is not None else None
 
         primitive_intervene = None
         if intervene_flags is not None:
@@ -962,12 +1001,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         converted_trajectories = []
         for offset in range(0, max_offsets, max(1, self.sliding_window_offset_stride)):
-            window_count = (total_primitive_steps - offset) // action_chunk
-            if window_count <= 0:
+            if offset >= total_primitive_steps:
                 continue
 
-            start_indices = offset + torch.arange(window_count, dtype=torch.long) * action_chunk
-            next_indices = start_indices + action_chunk
+            start_indices = list(range(offset, total_primitive_steps, action_chunk))
+            if len(start_indices) == 0:
+                continue
 
             curr_visual_latents = []
             curr_robot_states = []
@@ -976,7 +1015,21 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             next_robot_states = []
             next_ref_actions = []
 
-            for start_idx, next_idx in zip(start_indices.tolist(), next_indices.tolist()):
+            window_actions = []
+            window_rewards = []
+            window_terminations = []
+            window_truncations = []
+            window_dones = []
+            window_intervene = [] if primitive_intervene is not None else None
+            window_logprobs = [] if primitive_logprobs is not None else None
+            source_chunk_indices = []
+
+            for start_idx in start_indices:
+                valid_len = min(action_chunk, total_primitive_steps - start_idx)
+                if valid_len <= 0:
+                    continue
+                next_idx = start_idx + valid_len
+
                 curr_step_obs = {key: value[start_idx] for key, value in primitive_obs.items()}
                 next_step_obs = {key: value[next_idx] for key, value in primitive_obs.items()}
                 curr_feat = self._extract_step_features(curr_step_obs)
@@ -988,34 +1041,62 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 next_robot_states.append(next_feat["robot_state"])
                 next_ref_actions.append(next_feat["ref_action"])
 
-            window_actions = []
-            window_rewards = []
-            window_terminations = []
-            window_truncations = []
-            window_dones = []
-            window_intervene = [] if primitive_intervene is not None else None
-            window_logprobs = [] if primitive_logprobs is not None else None
-            for start_idx in start_indices.tolist():
-                end_idx = start_idx + action_chunk
-                action_chunk_tensor = primitive_actions[start_idx:end_idx].permute(1, 0, 2).reshape(batch_size, -1)
-                reward_chunk_tensor = primitive_rewards[start_idx:end_idx].permute(1, 0)
-                term_chunk_tensor = primitive_terminations[start_idx:end_idx].permute(1, 0)
-                trunc_chunk_tensor = primitive_truncations[start_idx:end_idx].permute(1, 0)
-                done_chunk_tensor = primitive_dones[start_idx:end_idx].permute(1, 0)
-                window_actions.append(action_chunk_tensor.cpu().contiguous())
-                window_rewards.append(reward_chunk_tensor.cpu().contiguous())
-                window_terminations.append(term_chunk_tensor.cpu().contiguous())
-                window_truncations.append(trunc_chunk_tensor.cpu().contiguous())
-                window_dones.append(done_chunk_tensor.cpu().contiguous())
+                window_actions.append(
+                    self._pad_primitive_action_chunk(
+                        primitive_actions, start_idx, valid_len, action_chunk
+                    )
+                )
+                if primitive_rewards is not None:
+                    window_rewards.append(
+                        self._pad_primitive_scalar_chunk(
+                            primitive_rewards, start_idx, valid_len, action_chunk, fill_value=0.0
+                        )
+                    )
+                if primitive_terminations is not None:
+                    window_terminations.append(
+                        self._pad_primitive_scalar_chunk(
+                            primitive_terminations, start_idx, valid_len, action_chunk, fill_value=False
+                        )
+                    )
+                if primitive_truncations is not None:
+                    window_truncations.append(
+                        self._pad_primitive_scalar_chunk(
+                            primitive_truncations, start_idx, valid_len, action_chunk, fill_value=False
+                        )
+                    )
+                if primitive_dones is not None:
+                    window_dones.append(
+                        self._pad_primitive_scalar_chunk(
+                            primitive_dones, start_idx, valid_len, action_chunk, fill_value=False
+                        )
+                    )
                 if primitive_intervene is not None:
-                    intervene_chunk_tensor = primitive_intervene[start_idx:end_idx].permute(1, 0, 2).reshape(batch_size, -1)
-                    window_intervene.append(intervene_chunk_tensor.cpu().contiguous())
+                    padded_intervene = primitive_intervene[start_idx : start_idx + valid_len]
+                    if valid_len < action_chunk:
+                        pad_count = action_chunk - valid_len
+                        pad_intervene = torch.zeros(
+                            (pad_count, padded_intervene.shape[1], padded_intervene.shape[2]),
+                            dtype=padded_intervene.dtype,
+                            device=padded_intervene.device,
+                        )
+                        padded_intervene = torch.cat([padded_intervene, pad_intervene], dim=0)
+                    window_intervene.append(
+                        padded_intervene.permute(1, 0, 2).reshape(batch_size, -1).cpu().contiguous()
+                    )
                 if primitive_logprobs is not None:
-                    logprob_chunk_tensor = primitive_logprobs[start_idx:end_idx].permute(1, 0)
-                    window_logprobs.append(logprob_chunk_tensor.cpu().contiguous())
+                    window_logprobs.append(
+                        self._pad_primitive_scalar_chunk(
+                            primitive_logprobs, start_idx, valid_len, action_chunk, fill_value=0.0
+                        )
+                    )
+                source_chunk_indices.append(start_idx // action_chunk)
 
-            version_source = versions[:window_count].cpu().contiguous() if versions is not None else None
-            value_source = prev_values[:window_count].cpu().contiguous() if prev_values is not None else None
+            if len(window_actions) == 0:
+                continue
+
+            source_chunk_index_tensor = torch.as_tensor(source_chunk_indices, dtype=torch.long)
+            version_source = versions[source_chunk_index_tensor].cpu().contiguous() if versions is not None else None
+            value_source = prev_values[source_chunk_index_tensor].cpu().contiguous() if prev_values is not None else None
 
             converted_trajectories.append(
                 Trajectory(
@@ -1023,10 +1104,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     model_weights_id=traj.model_weights_id,
                     actions=torch.stack(window_actions, dim=0),
                     intervene_flags=torch.stack(window_intervene, dim=0) if window_intervene is not None else None,
-                    rewards=torch.stack(window_rewards, dim=0),
-                    terminations=torch.stack(window_terminations, dim=0),
-                    truncations=torch.stack(window_truncations, dim=0),
-                    dones=torch.stack(window_dones, dim=0),
+                    rewards=torch.stack(window_rewards, dim=0) if primitive_rewards is not None else None,
+                    terminations=torch.stack(window_terminations, dim=0) if primitive_terminations is not None else None,
+                    truncations=torch.stack(window_truncations, dim=0) if primitive_truncations is not None else None,
+                    dones=torch.stack(window_dones, dim=0) if primitive_dones is not None else None,
                     prev_logprobs=torch.stack(window_logprobs, dim=0) if window_logprobs is not None else None,
                     prev_values=value_source,
                     versions=version_source,
