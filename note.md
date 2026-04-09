@@ -40,6 +40,11 @@ python reshard_offline_collection.py \
   --shuffle \
   --source-cache-size 256
 
-tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/test403_1_rl \
+cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
+  python train_embodied_agent_gigawa_offline_bc.py \
+  --config-path ./config \
+  --config-name offline_bc_pretrain_mergeall
+
+tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/test409_1_norm \
   --host 0.0.0.0 \
   --port 6006

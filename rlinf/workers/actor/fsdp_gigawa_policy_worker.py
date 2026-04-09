@@ -61,6 +61,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.offline_collection_summary_flush_every = 100
         self.offline_collection_summary_buffer = []
         self.offline_collection_num_received = 0
+        self.offline_bc_pretrain_enable = False
+        self.offline_bc_train_buffer = None
+        self.offline_bc_val_buffer = None
+        self.offline_bc_steps_per_epoch = 0
+        self.offline_bc_val_steps = 0
+        self.offline_bc_global_batch_per_rank = 0
 
     # ---------------------------------------------------------------------
     # Init / setup
@@ -190,12 +196,28 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 demo_cfg.get("store_online_interventions", True)
             )
             if demo_cfg.get("load_path", None) is not None:
-                self.demo_buffer.load_checkpoint(
-                    demo_cfg.load_path,
-                    is_distributed=True,
-                    local_rank=self._rank,
-                    world_size=self._world_size,
-                )
+                demo_load_path = demo_cfg.load_path
+                rank_shard_path = os.path.join(demo_load_path, f"rank_{self._rank}")
+                if os.path.exists(os.path.join(demo_load_path, "metadata.json")):
+                    # Single-shard checkpoint root.
+                    self.demo_buffer.load_checkpoint(
+                        demo_load_path,
+                        is_distributed=False,
+                    )
+                elif os.path.exists(os.path.join(rank_shard_path, "metadata.json")):
+                    # Resharded distributed layout: root/rank_i/metadata.json
+                    self.demo_buffer.load_checkpoint(
+                        rank_shard_path,
+                        is_distributed=False,
+                    )
+                else:
+                    # Fall back to original behavior for older layouts.
+                    self.demo_buffer.load_checkpoint(
+                        demo_load_path,
+                        is_distributed=True,
+                        local_rank=self._rank,
+                        world_size=self._world_size,
+                    )
         else:
             self.replay_required_for_training = True
 
@@ -297,6 +319,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.action_diag_dir.mkdir(parents=True, exist_ok=True)
 
         self._setup_offline_collection(seed=seed)
+        self._setup_offline_bc_pretrain(seed=seed)
 
     def _setup_offline_collection(self, seed: int) -> None:
         collect_cfg = self.cfg.algorithm.get("offline_collection", None)
@@ -435,6 +458,174 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         for buffer in self.offline_collection_buffers.values():
             buffer.close(wait=True)
         return self.get_offline_collection_stats()
+
+    def _make_subset_buffer(
+        self,
+        source_buffer: TrajectoryReplayBuffer,
+        selected_ids: list[int],
+        seed: int,
+    ) -> TrajectoryReplayBuffer:
+        subset = TrajectoryReplayBuffer(
+            seed=seed,
+            enable_cache=True,
+            cache_size=max(1, int(self.cfg.algorithm.demo_buffer.get("cache_size", 2000))),
+            sample_window_size=0,
+            auto_save=False,
+            trajectory_format=source_buffer.trajectory_format,
+        )
+        subset._trajectory_id_list = list(selected_ids)
+        subset._trajectory_index = {
+            int(tid): dict(source_buffer._trajectory_index[int(tid)])
+            for tid in subset._trajectory_id_list
+        }
+        subset._trajectory_file_path = {
+            int(tid): source_buffer._trajectory_file_path[int(tid)]
+            for tid in subset._trajectory_id_list
+        }
+        subset.size = len(subset._trajectory_id_list)
+        subset._total_samples = sum(
+            info.get("num_samples", 0) for info in subset._trajectory_index.values()
+        )
+        subset._trajectory_counter = max(subset._trajectory_id_list, default=-1) + 1
+        subset._index_version += 1
+        return subset
+
+    def _setup_offline_bc_pretrain(self, seed: int) -> None:
+        offline_bc_cfg = self.cfg.algorithm.get("offline_bc_pretrain", None)
+        if offline_bc_cfg is None:
+            return
+        self.offline_bc_pretrain_enable = bool(offline_bc_cfg.get("enable", False))
+        if not self.offline_bc_pretrain_enable:
+            return
+        if self.demo_buffer is None:
+            raise RuntimeError("offline_bc_pretrain requires algorithm.demo_buffer.enable=true and a valid load_path")
+
+        all_ids = list(self.demo_buffer._trajectory_id_list)
+        if len(all_ids) < 2:
+            raise RuntimeError(f"offline_bc_pretrain needs at least 2 trajectories, got {len(all_ids)}")
+
+        split_seed = int(offline_bc_cfg.get("split_seed", seed))
+        val_ratio = float(offline_bc_cfg.get("val_ratio", 0.2))
+        val_ratio = min(max(val_ratio, 0.0), 0.9)
+        gen = torch.Generator().manual_seed(split_seed + self._rank)
+        perm = torch.randperm(len(all_ids), generator=gen).tolist()
+        shuffled_ids = [all_ids[i] for i in perm]
+        val_count = max(1, int(round(len(shuffled_ids) * val_ratio)))
+        if len(shuffled_ids) - val_count < 1:
+            val_count = max(1, len(shuffled_ids) - 1)
+        train_ids = shuffled_ids[:-val_count]
+        val_ids = shuffled_ids[-val_count:]
+        self.offline_bc_train_buffer = self._make_subset_buffer(self.demo_buffer, train_ids, seed + 101)
+        self.offline_bc_val_buffer = self._make_subset_buffer(self.demo_buffer, val_ids, seed + 202)
+
+        self.offline_bc_global_batch_per_rank = self.cfg.actor.global_batch_size // self._world_size
+        default_steps = max(1, self.offline_bc_train_buffer.total_samples // max(1, self.offline_bc_global_batch_per_rank))
+        self.offline_bc_steps_per_epoch = int(offline_bc_cfg.get("steps_per_epoch", default_steps))
+        default_val_steps = max(1, min(50, self.offline_bc_val_buffer.total_samples // max(1, self.offline_bc_global_batch_per_rank)))
+        self.offline_bc_val_steps = int(offline_bc_cfg.get("val_steps_per_epoch", default_val_steps))
+
+        self.log_on_first_rank(
+            f"[offline_bc_pretrain] enabled | train_traj={self.offline_bc_train_buffer.size} | "
+            f"val_traj={self.offline_bc_val_buffer.size} | train_samples={self.offline_bc_train_buffer.total_samples} | "
+            f"val_samples={self.offline_bc_val_buffer.total_samples} | steps_per_epoch={self.offline_bc_steps_per_epoch} | "
+            f"val_steps={self.offline_bc_val_steps}"
+        )
+
+    def init_offline_bc_worker(self):
+        self.setup_model_and_optimizer()
+        self.setup_gigawa_components()
+        policy = self._unwrap_policy(self.model)
+        policy.soft_update_targets(tau=1.0)
+        policy.set_use_rl_head_for_rollout(False)
+        self.rollout_rl_head_enabled = False
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_param_and_grad()
+            self.offload_optimizer()
+        if self.cfg.actor.get("compile_model", False):
+            self.model = torch.compile(self.model, mode="default")
+
+    def _offline_bc_sample_batch(self, train: bool = True) -> dict[str, torch.Tensor]:
+        buffer = self.offline_bc_train_buffer if train else self.offline_bc_val_buffer
+        assert buffer is not None, "offline BC buffers are not initialized"
+        batch = buffer.sample(max(1, self.offline_bc_global_batch_per_rank))
+        return put_tensor_device(batch, device=self.device)
+
+    @Worker.timer("run_offline_bc_epoch")
+    def run_offline_bc_epoch(self):
+        if not self.offline_bc_pretrain_enable:
+            raise RuntimeError("offline_bc_pretrain is not enabled in config")
+        if self.cfg.actor.get("enable_offload", False):
+            self.load_param_and_grad(self.device)
+            self.load_optimizer(self.device)
+
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        )
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
+        )
+
+        self.model.train()
+        train_losses = []
+        grad_norms = []
+        for _ in range(self.offline_bc_steps_per_epoch):
+            global_batch = self._offline_bc_sample_batch(train=True)
+            train_micro_batch_list = split_dict_to_chunk(
+                global_batch,
+                max(1, self.offline_bc_global_batch_per_rank // self.cfg.actor.micro_batch_size),
+            )
+            self.optimizer.zero_grad()
+            step_losses = []
+            for batch in train_micro_batch_list:
+                actor_loss, actor_metrics, _ = self.forward_actor(batch, capture_diagnostics=False)
+                actor_loss = actor_loss / self.gradient_accumulation
+                actor_loss.backward()
+                step_losses.append(float(actor_metrics["bc_loss"]))
+            actor_grad_norm = self.model.clip_grad_norm_(
+                max_norm=self.cfg.actor.optim.clip_grad
+            )
+            self.optimizer.step()
+            self.lr_scheduler.step()
+            self.actor_update_step += 1
+            self.update_step += 1
+            train_losses.append(float(np.mean(step_losses)))
+            grad_norms.append(float(actor_grad_norm))
+
+        self.model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for _ in range(self.offline_bc_val_steps):
+                global_batch = self._offline_bc_sample_batch(train=False)
+                val_micro_batch_list = split_dict_to_chunk(
+                    global_batch,
+                    max(1, self.offline_bc_global_batch_per_rank // self.cfg.actor.micro_batch_size),
+                )
+                for batch in val_micro_batch_list:
+                    actor_loss, actor_metrics, _ = self.forward_actor(batch, capture_diagnostics=False)
+                    val_losses.append(float(actor_metrics["bc_loss"]))
+
+        metrics = {
+            "offline_bc/train_bc_loss": float(np.mean(train_losses)) if train_losses else 0.0,
+            "offline_bc/val_bc_loss": float(np.mean(val_losses)) if val_losses else 0.0,
+            "offline_bc/overfit_gap": (float(np.mean(val_losses)) - float(np.mean(train_losses))) if train_losses and val_losses else 0.0,
+            "offline_bc/train_num_trajectories": float(self.offline_bc_train_buffer.size),
+            "offline_bc/val_num_trajectories": float(self.offline_bc_val_buffer.size),
+            "offline_bc/train_total_samples": float(self.offline_bc_train_buffer.total_samples),
+            "offline_bc/val_total_samples": float(self.offline_bc_val_buffer.total_samples),
+            "offline_bc/steps_per_epoch": float(self.offline_bc_steps_per_epoch),
+            "offline_bc/val_steps": float(self.offline_bc_val_steps),
+            "actor/lr": float(self.optimizer.param_groups[0]["lr"]),
+            "actor/grad_norm": float(np.mean(grad_norms)) if grad_norms else 0.0,
+        }
+        metrics = all_reduce_dict(metrics, op=torch.distributed.ReduceOp.AVG)
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_param_and_grad()
+            self.offload_optimizer()
+        return metrics
 
     # ---------------------------------------------------------------------
     # Helpers

@@ -842,6 +842,12 @@ class EnvWorker(Worker):
         output_channel: Channel,
         actor_channel: Channel | None = None,
     ):
+        # In only-eval runs, the scheduler still invokes `interact`, but the
+        # train envs are intentionally not initialized. Route directly to the
+        # eval path so we do not touch self.env_list / bootstrap_step.
+        if self.only_eval:
+            return self.evaluate(input_channel, output_channel)
+
         env_metrics = await self._run_interact_once(
             input_channel,
             output_channel,

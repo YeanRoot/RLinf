@@ -192,29 +192,54 @@ def train_one_model(
 # =========================
 if __name__ == "__main__":
     # 情况1：前 2048+14 维全 0
-    model_zero = train_one_model(
-        mode="zero",
-        num_samples=2000,
-        batch_size=128,
-        epochs=100,
-        lr=1e-3,
-    )
-
-    # 情况2：前 2048+14 维是噪声
+    # model_zero = train_one_model(
+    #     mode="zero",
+    #     num_samples=20000,
+    #     batch_size=128,
+    #     epochs=100,
+    #     lr=1e-3,
+    # )
     model_noise = train_one_model(
         mode="noise",
-        num_samples=20000,
+        num_samples=20000000,
         batch_size=128,
         epochs=100,
         lr=1e-3,
         noise_std=1.0,
     )
+    # model_noise = train_one_model(
+    #     mode="noise",
+    #     num_samples=2000,
+    #     batch_size=128,
+    #     epochs=100,
+    #     lr=1e-3,
+    #     noise_std=1.0,
+    # )
+
+    # model_noise = train_one_model(
+    #     mode="noise",
+    #     num_samples=20000,
+    #     batch_size=128,
+    #     epochs=100,
+    #     lr=1e-3,
+    #     noise_std=1.0,
+    # )
+
+    # # 情况2：前 2048+14 维是噪声
+    # model_noise = train_one_model(
+    #     mode="noise",
+    #     num_samples=200000,
+    #     batch_size=128,
+    #     epochs=100,
+    #     lr=1e-3,
+    #     noise_std=1.0,
+    # )
 
     # 情况3：直接删掉前 2048+14 维，只输入 168 维真值
-    model_remove = train_one_model(
-        mode="remove",
-        num_samples=200000,
-        batch_size=128,
-        epochs=100,
-        lr=1e-3,
-    )
+    # model_remove = train_one_model(
+    #     mode="remove",
+    #     num_samples=200000,
+    #     batch_size=128,
+    #     epochs=100,
+    #     lr=1e-3,
+    # )
