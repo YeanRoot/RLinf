@@ -251,6 +251,29 @@ class EmbodiedRunner:
     def run(self):
         start_step = self.global_step
         start_time = time.time()
+
+        # Important: only-eval runs must bypass the normal training loop.
+        # The normal loop launches env.interact() + rollout.generate() +
+        # actor.recv_rollout_trajectories(), which is the train/data-collection
+        # path. In only-eval mode that can deadlock because env/rollout should
+        # communicate over the eval channels and no trajectories should be sent
+        # to the actor.
+        if self.cfg.runner.only_eval:
+            with self.timer("sync_weights"):
+                self.update_rollout_weights()
+            with self.timer("eval"):
+                eval_metrics = self.evaluate()
+                eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                self.metric_logger.log(data=eval_metrics, step=self.global_step)
+                print_metrics_table(
+                    self.global_step,
+                    max(self.max_steps, self.global_step + 1),
+                    start_time,
+                    eval_metrics,
+                    start_step,
+                )
+            return
+
         for _step in range(start_step, self.max_steps):
             # set global step
             self.actor.set_global_step(self.global_step)

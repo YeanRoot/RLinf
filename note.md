@@ -45,6 +45,11 @@ cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodime
   --config-path ./config \
   --config-name offline_bc_pretrain_mergeall
 
+python train_embodied_agent_gigawa.py \
+  --config-path ./config \
+  --config-name normalbc_pretrained \
+  ++actor.fsdp_config.use_orig_params=true
+
 tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/test409_1_norm \
   --host 0.0.0.0 \
   --port 6006
