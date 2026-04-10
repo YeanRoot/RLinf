@@ -18,7 +18,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "../results/test409_1_norm"
+    log_path: "../results/test410_2_norm"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -30,7 +30,7 @@ runner:
   val_check_interval: 200
   save_interval: 200
 
-  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall/robotwin_train_giga_world_policy/checkpoints/global_step_80
+  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall/robotwin_train_giga_world_policy/checkpoints/global_step_740
   ckpt_path: null
 
 algorithm:
@@ -38,7 +38,7 @@ algorithm:
     enable_cache: True
     cache_size: 2000
     sample_window_size: 2000
-    min_buffer_size: 64
+    min_buffer_size: 0
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
@@ -50,7 +50,7 @@ algorithm:
     enable_cache: True
     cache_size: 2000
     sample_window_size: 2000
-    min_buffer_size: 10
+    min_buffer_size: 0
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
@@ -97,8 +97,8 @@ algorithm:
   target_noise_clip: 0.0
   bc_coef: 1.0
   ref_action_dropout_p: 0
-  warmup_steps: 32
-  train_actor_steps: 32
+  warmup_steps: 0
+  train_actor_steps: 0
   rollout_actor_after_warmup: true
   rollout_actor_min_actor_updates: 0
 

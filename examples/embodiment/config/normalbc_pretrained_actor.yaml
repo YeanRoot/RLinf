@@ -13,34 +13,32 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor, env, rollout: 4-7
+    actor, env, rollout: 0-3
 
 runner:
   task_type: embodied
   logger:
-    log_path: "../results/test407_1_norm"
+    log_path: "../results/test410_3_norm"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 2000 #test
+  max_epochs: 20000 #test
   max_steps: -1
 
   only_eval: False
   val_check_interval: 200
   save_interval: 200
 
-  resume_dir: null
+  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall/robotwin_train_giga_world_policy/checkpoints/global_step_740
   ckpt_path: null
 
 algorithm:
   replay_buffer:
     enable_cache: True
     cache_size: 2000
-    sample_window_size: 2000
+    sample_window_size: 5000
     min_buffer_size: 0
-    require_for_training: false
-    store_online_data: false
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
@@ -48,17 +46,17 @@ algorithm:
     prefetch_size: 10
 
   demo_buffer:
-    enable: true
+    enable: True
     enable_cache: True
     cache_size: 2000
-    sample_window_size: 2000
+    sample_window_size: 5000
     min_buffer_size: 32
     train_actor_steps: 32
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
     load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect/mergeall
-    sample_ratio: 1.0
+    sample_ratio: 1
     allow_train_on_demo_only: true
     allow_demo_only_fallback: true
     allow_replay_only_fallback: false
@@ -97,7 +95,7 @@ algorithm:
   training_stage: bc_actor_pretrain # bc_actor_pretrain / critic_warmup / full_rl
 
   update_epoch: 1
-  utd_ratio: 5 #test
+  utd_ratio: 1 #test
   critic_actor_ratio: 2
   tau: 0.005
   target_update_freq: 1
@@ -108,7 +106,7 @@ algorithm:
   warmup_steps: 0
   train_actor_steps: 0
   rollout_actor_after_warmup: true
-  rollout_actor_min_actor_updates: 500
+  rollout_actor_min_actor_updates: 0
 
   sampling_params:
     do_sample: False
@@ -214,7 +212,7 @@ actor:
       single_view_height: 192
       prompt: null
       use_safetensors: False
-      use_rl_head_for_rollout: False
+      use_rl_head_for_rollout: true
       visual_feature_dim: 2048
       bc_coef: 1
       ref_action_dropout_p: 0
