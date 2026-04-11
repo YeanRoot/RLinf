@@ -1721,10 +1721,25 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.demo_buffer.save_checkpoint(demo_buffer_save_path)
 
     def load_checkpoint(self, load_base_path):
+        load_optimizer_and_scheduler_state = bool(
+            self.cfg.runner.get("resume_load_optimizer_and_scheduler_state", True)
+        )
+        if load_optimizer_and_scheduler_state:
+            optimizers = [self.optimizer, self.qf_optimizer]
+            lr_schedulers = [self.lr_scheduler, self.qf_lr_scheduler]
+        else:
+            # RLinf Checkpoint(...) expects iterables here and will call tuple(...).
+            # Use empty lists for model-only resume instead of None.
+            optimizers = []
+            lr_schedulers = []
+            self.log_on_first_rank(
+                "Resuming actor model weights only; optimizer and lr_scheduler states are not restored."
+            )
+
         self._strategy.load_checkpoint(
             model=self.model,
-            optimizers=[self.optimizer, self.qf_optimizer],
-            lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
+            optimizers=optimizers,
+            lr_schedulers=lr_schedulers,
             load_path=load_base_path,
             checkpoint_format="local_shard" if self.cfg.actor.fsdp_config.use_orig_params else "dcp",
         )
