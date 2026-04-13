@@ -18,7 +18,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "../results/test410_4_norm"
+    log_path: "../results/test410_4_norm_zhanka"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -39,7 +39,7 @@ algorithm:
     enable_cache: True
     cache_size: 2000
     sample_window_size: 5000
-    min_buffer_size: 0
+    min_buffer_size: 64
     auto_save: False
     auto_save_path: null
     trajectory_format: pt

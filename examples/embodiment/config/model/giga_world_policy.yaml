@@ -5,7 +5,7 @@ model_path: "/path/to/wa_transformer_ckpt"
 
 precision: bf16
 
-num_action_chunks: 48
+num_action_chunks: 12
 action_dim: 14
 
 is_lora: False
@@ -28,6 +28,7 @@ giga_world_policy:
   single_view_height: 192
   prompt: null
   use_safetensors: False
+  wa_num_action_chunks: 48
 
   # route A: keep frozen WA backbone + latent compressor + small RL heads
   use_rl_head_for_rollout: False

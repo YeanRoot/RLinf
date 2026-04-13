@@ -18,7 +18,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "../results/gigawa_offline_collect3"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect4_12chunk"
     project_name: rlinf
     experiment_name: "robotwin_collect_gigawa_offline"
     logger_backends: ["tensorboard"]
@@ -101,7 +101,7 @@ algorithm:
   gigawa_sliding_window:
     enable: true
     offset_stride: 2
-    max_offsets: 46
+    max_offsets: 12
 
   offline_collection:
     enable: true
@@ -211,7 +211,7 @@ actor:
 
   model:
     model_path: "/shared_disk/users/angen.ye/code/world_module_rollout/checkpoints/checkpoint_epoch_2_step_100000/transformer"
-    num_action_chunks: 48
+    num_action_chunks: 12
     action_dim: 14
     precision: bf16
     giga_world_policy:
@@ -227,6 +227,7 @@ actor:
       single_view_height: 192
       prompt: null
       use_safetensors: False
+      wa_num_action_chunks: 48
       use_rl_head_for_rollout: False
       visual_feature_dim: 2048
       bc_coef: 1

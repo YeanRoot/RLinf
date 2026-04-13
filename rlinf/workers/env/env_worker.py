@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
@@ -79,9 +79,19 @@ class EnvWorker(Worker):
             self.cfg.env.train.max_steps_per_rollout_epoch
             // self.cfg.actor.model.num_action_chunks
         )
+        self.eval_execute_action_horizon = int(
+            self.cfg.actor.model.giga_world_policy.get(
+                "eval_execute_action_horizon",
+                self.cfg.actor.model.num_action_chunks,
+            )
+        )
+        self.eval_execute_action_horizon = max(
+            1,
+            min(self.eval_execute_action_horizon, self.cfg.actor.model.num_action_chunks),
+        )
         self.n_eval_chunk_steps = (
             self.cfg.env.eval.max_steps_per_rollout_epoch
-            // self.cfg.actor.model.num_action_chunks
+            // self.eval_execute_action_horizon
         )
         self.actor_split_num = self.get_actor_split_num()
 
@@ -173,6 +183,34 @@ class EnvWorker(Worker):
             base_eval_cfg = update_nested_cfg(base_eval_cfg, general_eval_override_cfg)
             base_eval_cfg = update_nested_cfg(base_eval_cfg, eval_override_cfg)
             setattr(self.cfg.env.eval, "override_cfg", OmegaConf.create(base_eval_cfg))
+
+        eval_render_all_steps = bool(
+            self.cfg.actor.model.giga_world_policy.get("enable_eval_render_all_steps", False)
+        )
+        if self.enable_eval and eval_render_all_steps:
+            force_sequential = bool(
+                self.cfg.actor.model.giga_world_policy.get(
+                    "force_eval_chunk_step_mode_sequential", True
+                )
+            )
+            force_render_freq_one = bool(
+                self.cfg.actor.model.giga_world_policy.get(
+                    "force_eval_render_freq_one", True
+                )
+            )
+            if force_sequential:
+                with open_dict(self.cfg.env.eval):
+                    self.cfg.env.eval.chunk_step_mode = "sequential"
+            if force_render_freq_one:
+                task_cfg = getattr(self.cfg.env.eval, "task_config", None)
+                if task_cfg is not None:
+                    setattr(task_cfg, "render_freq", 1)
+            self.log_info(
+                "Enabled single-policy eval full-frame rendering: "
+                f"chunk_step_mode={self.cfg.env.eval.get('chunk_step_mode', 'vectorized')}, "
+                f"render_freq={getattr(getattr(self.cfg.env.eval, 'task_config', None), 'render_freq', 'N/A')}, "
+                f"video_base_dir={getattr(self.cfg.env.eval.video_cfg, 'video_base_dir', None)}"
+            )
 
     def _setup_env_and_wrappers(self, env_cls, env_cfg, num_envs_per_stage: int):
         env_list = []
@@ -378,6 +416,12 @@ class EnvWorker(Worker):
             policy=self.cfg.actor.model.get("policy_setup", None),
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),
         )
+        if self.eval_execute_action_horizon < chunk_actions.shape[1]:
+            chunk_actions = chunk_actions[:, : self.eval_execute_action_horizon]
+            if isinstance(chunk_actions, torch.Tensor):
+                chunk_actions = chunk_actions.contiguous()
+            else:
+                chunk_actions = np.ascontiguousarray(chunk_actions)
         env_info = {}
 
         obs_list, _, chunk_terminations, chunk_truncations, infos_list = (

@@ -33,12 +33,12 @@ python collect_embodied_agent_gigawa.py \
 
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
 python reshard_offline_collection.py \
-  --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect/offline_collection \
+  --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect4_12chunk/offline_collection \
   --bucket all \
-  --output-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect/mergeall \
+  --output-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect4_12chunk/mergeall \
   --target-world-size 4 \
   --shuffle \
-  --source-cache-size 256
+  --source-cache-size 2048
 
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
   python train_embodied_agent_gigawa_offline_bc.py \
@@ -47,7 +47,7 @@ cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodime
 
 python train_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name normalbc_pretrained \
+  --config-name normalbc_pretrained_actor_offline_eval \
   ++actor.fsdp_config.use_orig_params=true
 
 tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/test409_1_norm \

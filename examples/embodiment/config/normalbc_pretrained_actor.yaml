@@ -57,7 +57,7 @@ algorithm:
     auto_save_path: null
     trajectory_format: pt
     load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect/mergeall
-    sample_ratio: 0.75
+    sample_ratio: 1
     allow_train_on_demo_only: true
     allow_demo_only_fallback: true
     allow_replay_only_fallback: false

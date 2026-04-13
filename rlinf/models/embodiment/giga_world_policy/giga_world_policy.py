@@ -21,6 +21,9 @@ import types
 from datetime import datetime
 from typing import Any, Optional
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -247,6 +250,11 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self.cfg = cfg
         self.dtype = torch_dtype
         self.action_chunk = int(cfg.num_action_chunks)
+        self.wa_action_chunk = int(policy_cfg.get("wa_num_action_chunks", self.action_chunk))
+        if self.wa_action_chunk < self.action_chunk:
+            raise ValueError(
+                f"wa_num_action_chunks ({self.wa_action_chunk}) must be >= actor/runtime num_action_chunks ({self.action_chunk})."
+            )
         self.env_action_dim = int(cfg.action_dim)
         self.num_inference_steps = int(policy_cfg.num_inference_steps)
         self.guidance_scale = float(policy_cfg.guidance_scale)
@@ -276,6 +284,29 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         )
         self._latent_debug_dumped = False
         self._latent_debug_warned = False
+
+        self.enable_action_compare_debug = bool(
+            policy_cfg.get("enable_action_compare_debug", False)
+        )
+        self.action_compare_debug_dir = str(
+            policy_cfg.get(
+                "action_compare_debug_dir",
+                "/shared_disk/users/angen.ye/code/world_module_rollout/results/action_compare_debug",
+            )
+        )
+        self.action_compare_debug_max_batches = int(
+            policy_cfg.get("action_compare_debug_max_batches", 1)
+        )
+        self.action_compare_debug_max_items = int(
+            policy_cfg.get("action_compare_debug_max_items", 1)
+        )
+        self.action_compare_debug_print_full_tensors = bool(
+            policy_cfg.get("action_compare_debug_print_full_tensors", True)
+        )
+        self.action_compare_debug_save_full_tensors = bool(
+            policy_cfg.get("action_compare_debug_save_full_tensors", True)
+        )
+        self._action_compare_debug_dump_count = 0
 
         # rollout switch: keep base WA by default until RL worker is ready.
         # This flag must live in the state_dict so actor->rollout weight sync can carry it.
@@ -650,6 +681,209 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
         self._latent_debug_dumped = True
 
+    def _dump_action_compare_debug(
+        self,
+        env_obs: dict[str, Any],
+        wa_action_model: torch.Tensor,
+        wa_action_exec: torch.Tensor,
+        actor_action_model: torch.Tensor,
+        actor_action_exec: torch.Tensor,
+    ) -> None:
+        if not self.enable_action_compare_debug:
+            return
+        if self._action_compare_debug_dump_count >= self.action_compare_debug_max_batches:
+            return
+
+        os.makedirs(self.action_compare_debug_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        pid = os.getpid()
+        dump_idx = self._action_compare_debug_dump_count
+        self._action_compare_debug_dump_count += 1
+
+        wa_action_model_cpu = wa_action_model.detach().float().cpu()
+        wa_action_exec_cpu = wa_action_exec.detach().float().cpu()
+        actor_action_model_cpu = actor_action_model.detach().float().cpu()
+        actor_action_exec_cpu = actor_action_exec.detach().float().cpu()
+
+        diff_model = actor_action_model_cpu - wa_action_model_cpu
+        diff_exec = actor_action_exec_cpu - wa_action_exec_cpu
+        mse_model_per_sample = diff_model.pow(2).mean(dim=(1, 2))
+        mse_exec_per_sample = diff_exec.pow(2).mean(dim=(1, 2))
+        mse_model_global = float(diff_model.pow(2).mean().item())
+        mse_exec_global = float(diff_exec.pow(2).mean().item())
+
+        task_descriptions = env_obs.get("task_descriptions", None)
+        state_tensor = env_obs.get("states", None)
+
+        batch_pt_path = os.path.join(
+            self.action_compare_debug_dir,
+            f"action_compare_batch_{dump_idx:04d}_pid{pid}_{timestamp}.pt",
+        )
+        if self.action_compare_debug_save_full_tensors:
+            torch.save(
+                {
+                    "wa_action_model": wa_action_model_cpu,
+                    "wa_action_exec": wa_action_exec_cpu,
+                    "actor_action_model": actor_action_model_cpu,
+                    "actor_action_exec": actor_action_exec_cpu,
+                    "diff_model": diff_model,
+                    "diff_exec": diff_exec,
+                    "mse_model_per_sample": mse_model_per_sample,
+                    "mse_exec_per_sample": mse_exec_per_sample,
+                    "states": state_tensor.detach().cpu() if torch.is_tensor(state_tensor) else state_tensor,
+                    "task_descriptions": task_descriptions,
+                },
+                batch_pt_path,
+            )
+
+        summary_lines = [
+            f"pid={pid}",
+            f"dump_idx={dump_idx}",
+            f"task={task_descriptions[0] if task_descriptions else ''}",
+            f"batch_size={wa_action_model_cpu.shape[0]}",
+            f"use_rl_head_for_rollout={self.get_use_rl_head_for_rollout()}",
+            f"mse_model_global={mse_model_global:.10f}",
+            f"mse_exec_global={mse_exec_global:.10f}",
+            f"runtime_action_chunk={self.action_chunk}",
+            f"wa_action_chunk={self.wa_action_chunk}",
+            f"mse_model_per_sample={mse_model_per_sample.tolist()}",
+            f"mse_exec_per_sample={mse_exec_per_sample.tolist()}",
+        ]
+
+        txt_path = os.path.join(
+            self.action_compare_debug_dir,
+            f"action_compare_summary_{dump_idx:04d}_pid{pid}_{timestamp}.txt",
+        )
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(summary_lines))
+
+        max_items = min(int(wa_action_model_cpu.shape[0]), self.action_compare_debug_max_items)
+        for item_idx in range(max_items):
+            item_json_path = os.path.join(
+                self.action_compare_debug_dir,
+                f"action_compare_item_{dump_idx:04d}_sample{item_idx:02d}_pid{pid}_{timestamp}.json",
+            )
+            item_payload = {
+                "pid": pid,
+                "dump_idx": dump_idx,
+                "sample_idx": item_idx,
+                "task_description": (
+                    str(task_descriptions[item_idx])
+                    if task_descriptions is not None and item_idx < len(task_descriptions)
+                    else ""
+                ),
+                "use_rl_head_for_rollout": bool(self.get_use_rl_head_for_rollout()),
+                "mse_model": float(mse_model_per_sample[item_idx].item()),
+                "mse_exec": float(mse_exec_per_sample[item_idx].item()),
+                "state": (
+                    state_tensor[item_idx].detach().cpu().float().tolist()
+                    if torch.is_tensor(state_tensor)
+                    else None
+                ),
+                "wa_action_model": wa_action_model_cpu[item_idx].tolist(),
+                "actor_action_model": actor_action_model_cpu[item_idx].tolist(),
+                "diff_action_model": diff_model[item_idx].tolist(),
+                "wa_action_exec": wa_action_exec_cpu[item_idx].tolist(),
+                "actor_action_exec": actor_action_exec_cpu[item_idx].tolist(),
+                "diff_action_exec": diff_exec[item_idx].tolist(),
+            }
+            with open(item_json_path, "w", encoding="utf-8") as f:
+                json.dump(item_payload, f, ensure_ascii=False, indent=2)
+
+            fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+            fig.suptitle(
+                (
+                    f"sample={item_idx} | mse_model={mse_model_per_sample[item_idx].item():.8f} | "
+                    f"mse_exec={mse_exec_per_sample[item_idx].item():.8f}"
+                ),
+                fontsize=12,
+            )
+
+            model_panels = [
+                (wa_action_model_cpu[item_idx].numpy(), "WA model action"),
+                (actor_action_model_cpu[item_idx].numpy(), "Actor model action"),
+                (diff_model[item_idx].abs().numpy(), "|Model diff|"),
+            ]
+            exec_panels = [
+                (wa_action_exec_cpu[item_idx].numpy(), "WA exec action"),
+                (actor_action_exec_cpu[item_idx].numpy(), "Actor exec action"),
+                (diff_exec[item_idx].abs().numpy(), "|Exec diff|"),
+            ]
+
+            for col, (panel, title) in enumerate(model_panels):
+                ax = axes[0, col]
+                im = ax.imshow(panel, aspect="auto")
+                ax.set_title(title)
+                ax.set_xlabel("action dim")
+                ax.set_ylabel("chunk idx")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            for col, (panel, title) in enumerate(exec_panels):
+                ax = axes[1, col]
+                im = ax.imshow(panel, aspect="auto")
+                ax.set_title(title)
+                ax.set_xlabel("action dim")
+                ax.set_ylabel("chunk idx")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+            fig_path = os.path.join(
+                self.action_compare_debug_dir,
+                f"action_compare_item_{dump_idx:04d}_sample{item_idx:02d}_pid{pid}_{timestamp}.png",
+            )
+            fig.savefig(fig_path, dpi=160)
+            plt.close(fig)
+
+            print(
+                "[giga_world_policy][action_compare] "
+                f"saved sample={item_idx} figure to {fig_path} | "
+                f"json to {item_json_path} | "
+                f"mse_model={mse_model_per_sample[item_idx].item():.10f} | "
+                f"mse_exec={mse_exec_per_sample[item_idx].item():.10f}",
+                flush=True,
+            )
+            print(
+                "[giga_world_policy][action_compare] "
+                f"sample={item_idx} wa_action_model_summary={self._tensor_summary(wa_action_model_cpu[item_idx])} | "
+                f"actor_action_model_summary={self._tensor_summary(actor_action_model_cpu[item_idx])}",
+                flush=True,
+            )
+            print(
+                "[giga_world_policy][action_compare] "
+                f"sample={item_idx} wa_action_exec_summary={self._tensor_summary(wa_action_exec_cpu[item_idx])} | "
+                f"actor_action_exec_summary={self._tensor_summary(actor_action_exec_cpu[item_idx])}",
+                flush=True,
+            )
+            if self.action_compare_debug_print_full_tensors:
+                print(
+                    "[giga_world_policy][action_compare][full] "
+                    f"sample={item_idx} wa_action_model={wa_action_model_cpu[item_idx].tolist()}",
+                    flush=True,
+                )
+                print(
+                    "[giga_world_policy][action_compare][full] "
+                    f"sample={item_idx} actor_action_model={actor_action_model_cpu[item_idx].tolist()}",
+                    flush=True,
+                )
+                print(
+                    "[giga_world_policy][action_compare][full] "
+                    f"sample={item_idx} wa_action_exec={wa_action_exec_cpu[item_idx].tolist()}",
+                    flush=True,
+                )
+                print(
+                    "[giga_world_policy][action_compare][full] "
+                    f"sample={item_idx} actor_action_exec={actor_action_exec_cpu[item_idx].tolist()}",
+                    flush=True,
+                )
+
+        print(
+            "[giga_world_policy][action_compare] "
+            f"saved batch summary to {txt_path} | "
+            f"batch_pt_path={batch_pt_path if self.action_compare_debug_save_full_tensors else 'disabled'} | "
+            f"mse_model_global={mse_model_global:.10f} | mse_exec_global={mse_exec_global:.10f}",
+            flush=True,
+        )
+
     @torch.no_grad()
     def _run_pipe(
         self,
@@ -665,7 +899,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         common_kwargs = dict(
             height=self.full_image_size[1],
             width=self.full_image_size[0],
-            action_chunk=self.action_chunk,
+            action_chunk=self.wa_action_chunk,
             state=norm_state,
             num_frames=self.num_frames,
             guidance_scale=self.guidance_scale,
@@ -734,7 +968,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             generator=None,
             latents=None,
             last_image=None,
-            action_chunk=self.action_chunk,
+            action_chunk=self.wa_action_chunk,
             action_dim=self.model_action_dim,
             return_latent_debug=False,
         )
@@ -777,6 +1011,13 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         )
         if debug_dict is not None:
             self._dump_latent_debug(debug_dict, prompt=prompt)
+
+        if pred_delta_norm.shape[1] < self.action_chunk:
+            raise RuntimeError(
+                f"WA planner returned only {pred_delta_norm.shape[1]} steps, fewer than actor/runtime num_action_chunks={self.action_chunk}."
+            )
+
+        pred_delta_norm = pred_delta_norm[:, : self.action_chunk]
 
         # `ref_action_model` stays in the WA model space (normalized delta space).
         # The executed action is obtained by applying the same WA post-process used
@@ -1182,6 +1423,12 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         if debug_dict is not None:
             self._dump_latent_debug(debug_dict, prompt=prompt)
 
+        if pred_delta_norm.shape[1] < self.action_chunk:
+            raise RuntimeError(
+                f"WA planner returned only {pred_delta_norm.shape[1]} steps, fewer than actor/runtime num_action_chunks={self.action_chunk}."
+            )
+        pred_delta_norm = pred_delta_norm[:, : self.action_chunk]
+
         pred_action_exec = self._postprocess_pred_delta(pred_delta_norm, state_pad)
         pred_action_model = pred_delta_norm.float()
         return pred_action_exec[0], pred_action_model[0]
@@ -1197,30 +1444,57 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         del mode, compute_values, kwargs
         batch_size = int(env_obs["states"].shape[0])
 
-        if not self.get_use_rl_head_for_rollout():
-            exec_chunks = []
-            model_chunks = []
-            for idx in range(batch_size):
-                action_exec, action_model = self._plan_single(env_obs, idx)
-                exec_chunks.append(action_exec)
-                model_chunks.append(action_model)
-            actions_exec = torch.stack(exec_chunks, dim=0).to(self.device_ref)
-            actions_model = torch.stack(model_chunks, dim=0).to(self.device_ref)
-        else:
+        rollout_uses_actor = self.get_use_rl_head_for_rollout()
+        backbone = None
+        wa_actions_model = None
+        wa_actions_exec = None
+        actor_actions_model = None
+        actor_actions_exec = None
+
+        if rollout_uses_actor or self.enable_action_compare_debug:
             backbone = self.extract_frozen_backbone_batch(env_obs)
+            wa_actions_model = backbone["ref_action"].to(self.device_ref)
+            wa_actions_exec = backbone["ref_action_exec"].to(self.device_ref)
+
             visual_feat = self.encode_visual(backbone["visual_latent"])
-            actions_model, _ = self.actor_forward(
+            actor_actions_model, _ = self.actor_forward(
                 visual_feat=visual_feat,
                 robot_state=backbone["robot_state"],
                 ref_action=backbone["ref_action"],
                 ref_action_dropout_p=0.0,
                 use_target=False,
             )
-            actions_model = actions_model.to(self.device_ref)
-            actions_exec = self.postprocess_action_model_batch(
-                action_model=actions_model,
+            actor_actions_model = actor_actions_model.to(self.device_ref)
+            actor_actions_exec = self.postprocess_action_model_batch(
+                action_model=actor_actions_model,
                 robot_state=backbone["robot_state"],
             ).to(self.device_ref)
+
+            if self.enable_action_compare_debug:
+                self._dump_action_compare_debug(
+                    env_obs=env_obs,
+                    wa_action_model=wa_actions_model,
+                    wa_action_exec=wa_actions_exec,
+                    actor_action_model=actor_actions_model,
+                    actor_action_exec=actor_actions_exec,
+                )
+
+        if rollout_uses_actor:
+            actions_model = actor_actions_model
+            actions_exec = actor_actions_exec
+        else:
+            if wa_actions_model is None or wa_actions_exec is None:
+                exec_chunks = []
+                model_chunks = []
+                for idx in range(batch_size):
+                    action_exec, action_model = self._plan_single(env_obs, idx)
+                    exec_chunks.append(action_exec)
+                    model_chunks.append(action_model)
+                actions_exec = torch.stack(exec_chunks, dim=0).to(self.device_ref)
+                actions_model = torch.stack(model_chunks, dim=0).to(self.device_ref)
+            else:
+                actions_model = wa_actions_model
+                actions_exec = wa_actions_exec
 
         result = {
             "prev_logprobs": torch.zeros(

@@ -76,13 +76,24 @@ class MultiStepRolloutWorker(Worker):
             cfg.env.train.max_steps_per_rollout_epoch
             // cfg.actor.model.num_action_chunks
         )
+        self.eval_execute_action_horizon = int(
+            cfg.actor.model.giga_world_policy.get(
+                "eval_execute_action_horizon",
+                cfg.actor.model.num_action_chunks,
+            )
+        )
+        self.eval_execute_action_horizon = max(
+            1,
+            min(self.eval_execute_action_horizon, cfg.actor.model.num_action_chunks),
+        )
         self.n_eval_chunk_steps = (
             cfg.env.eval.max_steps_per_rollout_epoch
-            // cfg.actor.model.num_action_chunks
+            // self.eval_execute_action_horizon
         )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
+        self.eval_inference_call_count = 0
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -144,6 +155,13 @@ class MultiStepRolloutWorker(Worker):
 
         self.log_info(f"Rollout worker initialized with dst_ranks: {self.dst_ranks}")
         self.log_info(f"Rollout worker initialized with src_ranks: {self.src_ranks}")
+        self.log_info(
+            "Eval rollout inference plan: "
+            f"predicted_chunks={self.cfg.actor.model.num_action_chunks}, "
+            f"eval_execute_action_horizon={self.eval_execute_action_horizon}, "
+            f"n_eval_chunk_steps={self.n_eval_chunk_steps}, "
+            f"use_rl_head_for_rollout={self.cfg.actor.model.giga_world_policy.get('use_rl_head_for_rollout', False)}"
+        )
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
@@ -417,14 +435,27 @@ class MultiStepRolloutWorker(Worker):
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
-        for _ in tqdm(
+        for eval_epoch_idx in tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            for _ in range(self.n_eval_chunk_steps):
-                for _ in range(self.num_pipeline_stages):
+            for eval_chunk_step_idx in range(self.n_eval_chunk_steps):
+                for pipeline_stage_idx in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
+                    batch_size = self._infer_env_batch_size(env_output)
+                    self.eval_inference_call_count += 1
+                    self.log_info(
+                        "[WA_EVAL_INFER] "
+                        f"call={self.eval_inference_call_count} | "
+                        f"eval_epoch={eval_epoch_idx + 1}/{self.cfg.algorithm.eval_rollout_epoch} | "
+                        f"chunk_step={eval_chunk_step_idx + 1}/{self.n_eval_chunk_steps} | "
+                        f"pipeline_stage={pipeline_stage_idx + 1}/{self.num_pipeline_stages} | "
+                        f"batch_size={batch_size} | "
+                        f"predicted_chunks={self.cfg.actor.model.num_action_chunks} | "
+                        f"execute_horizon={self.eval_execute_action_horizon} | "
+                        f"use_rl_head_for_rollout={self.cfg.actor.model.giga_world_policy.get('use_rl_head_for_rollout', False)}"
+                    )
                     actions, _ = self.predict(env_output["obs"], mode="eval")
                     self.send_chunk_actions(output_channel, actions, mode="eval")
 

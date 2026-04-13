@@ -71,18 +71,25 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     # ---------------------------------------------------------------------
     # Init / setup
     # ---------------------------------------------------------------------
+    def _apply_rollout_flag_from_config(self, context: str) -> bool:
+        rollout_flag = bool(
+            self.cfg.actor.model.giga_world_policy.get("use_rl_head_for_rollout", False)
+        )
+        policy = self._unwrap_policy(self.model)
+        policy.set_use_rl_head_for_rollout(rollout_flag)
+        self.rollout_rl_head_enabled = rollout_flag
+        self.log_on_first_rank(
+            f"[{context}] Applied rollout flag from config: use_rl_head_for_rollout={rollout_flag}."
+        )
+        return rollout_flag
+
     def init_worker(self):
         self.setup_model_and_optimizer()
         self.setup_gigawa_components()
 
         policy = self._unwrap_policy(self.model)
         policy.soft_update_targets(tau=1.0)
-
-        initial_rollout_flag = bool(
-            self.cfg.actor.model.giga_world_policy.get("use_rl_head_for_rollout", False)
-        )
-        policy.set_use_rl_head_for_rollout(initial_rollout_flag)
-        self.rollout_rl_head_enabled = initial_rollout_flag
+        self._apply_rollout_flag_from_config("init_worker")
 
         if self.cfg.actor.get("enable_offload", False):
             self.offload_param_and_grad()
@@ -1760,4 +1767,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         policy = self._unwrap_policy(self.model)
         if self.stage_freeze_actor:
             policy.soft_update_targets(tau=1.0)
-        self.rollout_rl_head_enabled = policy.get_use_rl_head_for_rollout()
+
+        checkpoint_rollout_flag = policy.get_use_rl_head_for_rollout()
+        self.log_on_first_rank(
+            "Checkpoint restored rollout flag before config override: "
+            f"use_rl_head_for_rollout={checkpoint_rollout_flag}."
+        )
+        self._apply_rollout_flag_from_config("load_checkpoint")
