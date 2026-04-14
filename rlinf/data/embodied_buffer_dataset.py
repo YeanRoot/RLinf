@@ -23,8 +23,79 @@ from torch.utils.data import IterableDataset
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import concat_batch
+import copy
 
 logger = get_logger()
+
+
+def _infer_batch_size(batch: dict[str, Any]) -> int:
+    for key in ("actions", "rewards", "dones", "terminations", "truncations", "prev_logprobs", "prev_values", "versions"):
+        value = batch.get(key)
+        if isinstance(value, torch.Tensor):
+            return int(value.shape[0])
+    for parent_key in ("curr_obs", "next_obs", "forward_inputs"):
+        nested = batch.get(parent_key)
+        if isinstance(nested, dict):
+            for value in nested.values():
+                if isinstance(value, torch.Tensor):
+                    return int(value.shape[0])
+    raise ValueError("Unable to infer batch size for compatibility padding.")
+
+
+def _zeros_like_batch_dim(ref: torch.Tensor, batch_size: int) -> torch.Tensor:
+    shape = list(ref.shape)
+    shape[0] = batch_size
+    return torch.zeros(shape, dtype=ref.dtype, device=ref.device)
+
+
+def _build_forward_inputs_fallback(batch: dict[str, Any]) -> dict[str, torch.Tensor]:
+    actions = batch.get("actions")
+    if not isinstance(actions, torch.Tensor):
+        return {}
+    return {
+        "action": actions.clone(),
+        "model_action": actions.clone(),
+    }
+
+
+def _align_forward_inputs_for_concat(
+    replay_batch: dict[str, Any],
+    demo_batch: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    replay_batch = copy.deepcopy(replay_batch)
+    demo_batch = copy.deepcopy(demo_batch)
+
+    replay_fi = replay_batch.get("forward_inputs")
+    demo_fi = demo_batch.get("forward_inputs")
+
+    if not isinstance(replay_fi, dict):
+        replay_fi = _build_forward_inputs_fallback(replay_batch)
+        replay_batch["forward_inputs"] = replay_fi
+    if not isinstance(demo_fi, dict):
+        demo_fi = _build_forward_inputs_fallback(demo_batch)
+        demo_batch["forward_inputs"] = demo_fi
+
+    if not replay_fi and not demo_fi:
+        return replay_batch, demo_batch
+
+    replay_bs = _infer_batch_size(replay_batch)
+    demo_bs = _infer_batch_size(demo_batch)
+    all_keys = set(replay_fi.keys()) | set(demo_fi.keys())
+
+    for key in all_keys:
+        replay_tensor = replay_fi.get(key)
+        demo_tensor = demo_fi.get(key)
+
+        if replay_tensor is None and demo_tensor is None:
+            continue
+        if replay_tensor is None and isinstance(demo_tensor, torch.Tensor):
+            replay_fi[key] = _zeros_like_batch_dim(demo_tensor, replay_bs)
+            continue
+        if demo_tensor is None and isinstance(replay_tensor, torch.Tensor):
+            demo_fi[key] = _zeros_like_batch_dim(replay_tensor, demo_bs)
+            continue
+
+    return replay_batch, demo_batch
 
 
 class ReplayBufferDataset(IterableDataset):
@@ -135,6 +206,7 @@ class ReplayBufferDataset(IterableDataset):
         if replay_batch_size > 0 and demo_batch_size > 0:
             replay_batch = self.replay_buffer.sample(replay_batch_size)
             demo_batch = self.demo_buffer.sample(demo_batch_size)
+            replay_batch, demo_batch = _align_forward_inputs_for_concat(replay_batch, demo_batch)
             return concat_batch(replay_batch, demo_batch)
         if replay_batch_size > 0:
             return self.replay_buffer.sample(replay_batch_size)
