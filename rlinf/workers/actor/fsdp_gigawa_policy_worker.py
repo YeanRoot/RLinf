@@ -1045,7 +1045,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         }
 
     @Worker.timer("run_offline_critic_epoch")
-    def run_offline_critic_epoch(self):
+    def run_offline_critic_epoch(self, do_validation: bool = True, do_class_eval: bool = True):
         if not self.offline_critic_pretrain_enable:
             raise RuntimeError("offline_critic_pretrain is not enabled in config")
         if self.cfg.actor.get("enable_offload", False):
@@ -1101,38 +1101,31 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             target_q_means.append(float(np.mean(step_target_q)))
             q_logged_means.append(float(np.mean(step_q_logged)))
 
-        self.model.eval()
         val_losses = []
         val_q1_means = []
         val_q2_means = []
         val_target_q_means = []
         val_q_logged_means = []
-        with torch.no_grad():
-            for _ in range(self.offline_critic_val_steps):
-                global_batch = self._offline_critic_sample_batch(train=False)
-                for batch in self._offline_critic_microbatches(global_batch):
-                    critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
-                    q_logged = torch.minimum(q1, q2)
-                    val_losses.append(float(critic_loss.item()))
-                    val_q1_means.append(float(q1.mean().item()))
-                    val_q2_means.append(float(q2.mean().item()))
-                    val_target_q_means.append(float(target_q_values.mean().item()))
-                    val_q_logged_means.append(float(q_logged.mean().item()))
+        if do_validation:
+            self.model.eval()
+            with torch.no_grad():
+                for _ in range(self.offline_critic_val_steps):
+                    global_batch = self._offline_critic_sample_batch(train=False)
+                    for batch in self._offline_critic_microbatches(global_batch):
+                        critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                        q_logged = torch.minimum(q1, q2)
+                        val_losses.append(float(critic_loss.item()))
+                        val_q1_means.append(float(q1.mean().item()))
+                        val_q2_means.append(float(q2.mean().item()))
+                        val_target_q_means.append(float(target_q_values.mean().item()))
+                        val_q_logged_means.append(float(q_logged.mean().item()))
 
         metrics = {
             "offline_critic/train_critic_loss": float(np.mean(train_losses)) if train_losses else 0.0,
-            "offline_critic/val_critic_loss": float(np.mean(val_losses)) if val_losses else 0.0,
-            "offline_critic/overfit_gap": (
-                float(np.mean(val_losses)) - float(np.mean(train_losses))
-            ) if train_losses and val_losses else 0.0,
             "offline_critic/train_q1_mean": float(np.mean(q1_means)) if q1_means else 0.0,
             "offline_critic/train_q2_mean": float(np.mean(q2_means)) if q2_means else 0.0,
             "offline_critic/train_q_logged_mean": float(np.mean(q_logged_means)) if q_logged_means else 0.0,
             "offline_critic/train_target_q_mean": float(np.mean(target_q_means)) if target_q_means else 0.0,
-            "offline_critic/val_q1_mean": float(np.mean(val_q1_means)) if val_q1_means else 0.0,
-            "offline_critic/val_q2_mean": float(np.mean(val_q2_means)) if val_q2_means else 0.0,
-            "offline_critic/val_q_logged_mean": float(np.mean(val_q_logged_means)) if val_q_logged_means else 0.0,
-            "offline_critic/val_target_q_mean": float(np.mean(val_target_q_means)) if val_target_q_means else 0.0,
             "offline_critic/train_num_trajectories": float(self.offline_critic_train_buffer.size),
             "offline_critic/val_num_trajectories": float(self.offline_critic_val_buffer.size),
             "offline_critic/train_success_num_trajectories": float(self.offline_critic_train_success_buffer.size if self.offline_critic_train_success_buffer is not None else 0),
@@ -1144,53 +1137,67 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "offline_critic/steps_per_epoch": float(self.offline_critic_steps_per_epoch),
             "offline_critic/val_steps": float(self.offline_critic_val_steps),
             "offline_critic/class_eval_steps": float(self.offline_critic_eval_steps),
+            "offline_critic/did_validation": float(bool(do_validation)),
+            "offline_critic/did_class_eval": float(bool(do_class_eval)),
             "critic/lr": float(self.qf_optimizer.param_groups[0]["lr"]),
             "critic/grad_norm": float(np.mean(grad_norms)) if grad_norms else 0.0,
         }
+        if do_validation:
+            metrics.update({
+                "offline_critic/val_critic_loss": float(np.mean(val_losses)) if val_losses else 0.0,
+                "offline_critic/overfit_gap": (
+                    float(np.mean(val_losses)) - float(np.mean(train_losses))
+                ) if train_losses and val_losses else 0.0,
+                "offline_critic/val_q1_mean": float(np.mean(val_q1_means)) if val_q1_means else 0.0,
+                "offline_critic/val_q2_mean": float(np.mean(val_q2_means)) if val_q2_means else 0.0,
+                "offline_critic/val_q_logged_mean": float(np.mean(val_q_logged_means)) if val_q_logged_means else 0.0,
+                "offline_critic/val_target_q_mean": float(np.mean(val_target_q_means)) if val_target_q_means else 0.0,
+            })
         metrics = all_reduce_dict(metrics, op=torch.distributed.ReduceOp.AVG)
-        metrics.update(
-            self._offline_critic_collect_buffer_metrics(
-                self.offline_critic_train_success_buffer,
-                self.offline_critic_eval_steps,
-                "offline_critic/train_success",
+        if do_class_eval:
+            metrics.update(
+                self._offline_critic_collect_buffer_metrics(
+                    self.offline_critic_train_success_buffer,
+                    self.offline_critic_eval_steps,
+                    "offline_critic/train_success",
+                )
             )
-        )
-        metrics.update(
-            self._offline_critic_collect_buffer_metrics(
-                self.offline_critic_train_failure_buffer,
-                self.offline_critic_eval_steps,
-                "offline_critic/train_failure",
+            metrics.update(
+                self._offline_critic_collect_buffer_metrics(
+                    self.offline_critic_train_failure_buffer,
+                    self.offline_critic_eval_steps,
+                    "offline_critic/train_failure",
+                )
             )
-        )
-        metrics.update(
-            self._offline_critic_collect_buffer_metrics(
-                self.offline_critic_val_success_buffer,
-                self.offline_critic_eval_steps,
-                "offline_critic/val_success",
+            metrics.update(
+                self._offline_critic_collect_buffer_metrics(
+                    self.offline_critic_val_success_buffer,
+                    self.offline_critic_eval_steps,
+                    "offline_critic/val_success",
+                )
             )
-        )
-        metrics.update(
-            self._offline_critic_collect_buffer_metrics(
-                self.offline_critic_val_failure_buffer,
-                self.offline_critic_eval_steps,
-                "offline_critic/val_failure",
+            metrics.update(
+                self._offline_critic_collect_buffer_metrics(
+                    self.offline_critic_val_failure_buffer,
+                    self.offline_critic_eval_steps,
+                    "offline_critic/val_failure",
+                )
             )
-        )
-        metrics["offline_critic/train_success_failure_q_gap"] = (
-            metrics.get("offline_critic/train_success/q_logged_mean", 0.0)
-            - metrics.get("offline_critic/train_failure/q_logged_mean", 0.0)
-        )
-        metrics["offline_critic/val_success_failure_q_gap"] = (
-            metrics.get("offline_critic/val_success/q_logged_mean", 0.0)
-            - metrics.get("offline_critic/val_failure/q_logged_mean", 0.0)
-        )
+            metrics["offline_critic/train_success_failure_q_gap"] = (
+                metrics.get("offline_critic/train_success/q_logged_mean", 0.0)
+                - metrics.get("offline_critic/train_failure/q_logged_mean", 0.0)
+            )
+            metrics["offline_critic/val_success_failure_q_gap"] = (
+                metrics.get("offline_critic/val_success/q_logged_mean", 0.0)
+                - metrics.get("offline_critic/val_failure/q_logged_mean", 0.0)
+            )
         if self.cfg.actor.get("enable_offload", False):
             self.offload_param_and_grad()
             self.offload_optimizer()
         return metrics
 
     @Worker.timer("run_offline_rl_epoch")
-    def run_offline_rl_epoch(self):
+    def run_offline_rl_epoch(self, do_validation: bool = True, do_class_eval: bool = True):
         if not self.offline_rl_pretrain_enable:
             raise RuntimeError("offline_rl_pretrain is not enabled in config")
         if self.cfg.actor.get("enable_offload", False):
@@ -1288,60 +1295,64 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "offline_rl/train_q_pi_mean": float(np.mean(actor_q_pi_means)) if actor_q_pi_means else 0.0,
             "offline_rl/critic_grad_norm": float(np.mean(critic_grad_norms)) if critic_grad_norms else 0.0,
             "offline_rl/actor_grad_norm": float(np.mean(actor_grad_norms)) if actor_grad_norms else 0.0,
+            "offline_rl/did_validation": float(bool(do_validation)),
+            "offline_rl/did_class_eval": float(bool(do_class_eval)),
             "actor/lr": float(self.lr_scheduler.get_last_lr()[0]),
             "critic/lr": float(self.qf_lr_scheduler.get_last_lr()[0]),
         }
 
-        metrics.update(
-            self._offline_rl_collect_buffer_critic_metrics(
-                self.offline_rl_val_buffer, self.offline_rl_val_steps, "offline_rl/val"
+        if do_validation:
+            metrics.update(
+                self._offline_rl_collect_buffer_critic_metrics(
+                    self.offline_rl_val_buffer, self.offline_rl_val_steps, "offline_rl/val"
+                )
             )
-        )
-        metrics.update(
-            self._offline_rl_collect_buffer_actor_metrics(
-                self.offline_rl_val_buffer, self.offline_rl_val_steps, "offline_rl/val_actor"
+            metrics.update(
+                self._offline_rl_collect_buffer_actor_metrics(
+                    self.offline_rl_val_buffer, self.offline_rl_val_steps, "offline_rl/val_actor"
+                )
             )
-        )
-        metrics.update(
-            self._offline_rl_collect_buffer_critic_metrics(
-                self.offline_rl_train_success_buffer,
-                self.offline_rl_eval_steps,
-                "offline_rl/train_success",
+            metrics["offline_rl/critic_overfit_gap"] = (
+                metrics.get("offline_rl/val/critic_loss", 0.0)
+                - metrics.get("offline_rl/train_critic_loss", 0.0)
             )
-        )
-        metrics.update(
-            self._offline_rl_collect_buffer_critic_metrics(
-                self.offline_rl_train_failure_buffer,
-                self.offline_rl_eval_steps,
-                "offline_rl/train_failure",
+        if do_class_eval:
+            metrics.update(
+                self._offline_rl_collect_buffer_critic_metrics(
+                    self.offline_rl_train_success_buffer,
+                    self.offline_rl_eval_steps,
+                    "offline_rl/train_success",
+                )
             )
-        )
-        metrics.update(
-            self._offline_rl_collect_buffer_critic_metrics(
-                self.offline_rl_val_success_buffer,
-                self.offline_rl_eval_steps,
-                "offline_rl/val_success",
+            metrics.update(
+                self._offline_rl_collect_buffer_critic_metrics(
+                    self.offline_rl_train_failure_buffer,
+                    self.offline_rl_eval_steps,
+                    "offline_rl/train_failure",
+                )
             )
-        )
-        metrics.update(
-            self._offline_rl_collect_buffer_critic_metrics(
-                self.offline_rl_val_failure_buffer,
-                self.offline_rl_eval_steps,
-                "offline_rl/val_failure",
+            metrics.update(
+                self._offline_rl_collect_buffer_critic_metrics(
+                    self.offline_rl_val_success_buffer,
+                    self.offline_rl_eval_steps,
+                    "offline_rl/val_success",
+                )
             )
-        )
-        metrics["offline_rl/critic_overfit_gap"] = (
-            metrics.get("offline_rl/val/critic_loss", 0.0)
-            - metrics.get("offline_rl/train_critic_loss", 0.0)
-        )
-        metrics["offline_rl/train_success_failure_q_gap"] = (
-            metrics.get("offline_rl/train_success/q_logged_mean", 0.0)
-            - metrics.get("offline_rl/train_failure/q_logged_mean", 0.0)
-        )
-        metrics["offline_rl/val_success_failure_q_gap"] = (
-            metrics.get("offline_rl/val_success/q_logged_mean", 0.0)
-            - metrics.get("offline_rl/val_failure/q_logged_mean", 0.0)
-        )
+            metrics.update(
+                self._offline_rl_collect_buffer_critic_metrics(
+                    self.offline_rl_val_failure_buffer,
+                    self.offline_rl_eval_steps,
+                    "offline_rl/val_failure",
+                )
+            )
+            metrics["offline_rl/train_success_failure_q_gap"] = (
+                metrics.get("offline_rl/train_success/q_logged_mean", 0.0)
+                - metrics.get("offline_rl/train_failure/q_logged_mean", 0.0)
+            )
+            metrics["offline_rl/val_success_failure_q_gap"] = (
+                metrics.get("offline_rl/val_success/q_logged_mean", 0.0)
+                - metrics.get("offline_rl/val_failure/q_logged_mean", 0.0)
+            )
         if self.cfg.actor.get("enable_offload", False):
             self.offload_param_and_grad()
             self.offload_optimizer()

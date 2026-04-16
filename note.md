@@ -12,6 +12,7 @@ cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf
 export REPO_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RLinf
 export ROBOTWIN_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-main
 export PYTHONPATH=$ROBOTWIN_PATH:$REPO_PATH:$PYTHONPATH
+
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
 
 conda activate pi-rl-h20
@@ -59,6 +60,11 @@ python train_embodied_agent_gigawa_offline_critic.py\
 python train_embodied_agent_gigawa_offline_rl.py \
   --config-path ./config \
   --config-name offline_rl_pretrain_mergeall_12chunk_fix \
+  ++actor.fsdp_config.use_orig_params=true
+
+python train_embodied_agent_gigawa_offline_rl.py \
+  --config-path ./config \
+  --config-name normalbc_pretrained_actor_offline_eval \
   ++actor.fsdp_config.use_orig_params=true
 
 tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/test413_6_rl \
