@@ -67,6 +67,34 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.offline_bc_steps_per_epoch = 0
         self.offline_bc_val_steps = 0
         self.offline_bc_global_batch_per_rank = 0
+        self.offline_critic_pretrain_enable = False
+        self.offline_critic_train_buffer = None
+        self.offline_critic_val_buffer = None
+        self.offline_critic_train_success_buffer = None
+        self.offline_critic_train_failure_buffer = None
+        self.offline_critic_val_success_buffer = None
+        self.offline_critic_val_failure_buffer = None
+        self.offline_critic_steps_per_epoch = 0
+        self.offline_critic_val_steps = 0
+        self.offline_critic_eval_steps = 0
+        self.offline_critic_global_batch_per_rank = 0
+        self.offline_critic_quality_mode = "reward_max"
+        self.offline_critic_success_threshold = 0.5
+        self.offline_rl_pretrain_enable = False
+        self.offline_rl_train_buffer = None
+        self.offline_rl_val_buffer = None
+        self.offline_rl_train_success_buffer = None
+        self.offline_rl_train_failure_buffer = None
+        self.offline_rl_val_success_buffer = None
+        self.offline_rl_val_failure_buffer = None
+        self.offline_rl_steps_per_epoch = 0
+        self.offline_rl_val_steps = 0
+        self.offline_rl_eval_steps = 0
+        self.offline_rl_global_batch_per_rank = 0
+        self.offline_rl_quality_mode = "reward_max"
+        self.offline_rl_success_threshold = 0.5
+        self.offline_rl_actor_updates_per_step = 1
+        self.offline_rl_critic_updates_per_step = 1
 
     # ---------------------------------------------------------------------
     # Init / setup
@@ -327,6 +355,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         self._setup_offline_collection(seed=seed)
         self._setup_offline_bc_pretrain(seed=seed)
+        self._setup_offline_critic_pretrain(seed=seed)
+        self._setup_offline_rl_pretrain(seed=seed)
 
     def _setup_offline_collection(self, seed: int) -> None:
         collect_cfg = self.cfg.algorithm.get("offline_collection", None)
@@ -538,6 +568,278 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             f"val_steps={self.offline_bc_val_steps}"
         )
 
+    def _setup_offline_critic_pretrain(self, seed: int) -> None:
+        offline_critic_cfg = self.cfg.algorithm.get("offline_critic_pretrain", None)
+        if offline_critic_cfg is None:
+            return
+        self.offline_critic_pretrain_enable = bool(offline_critic_cfg.get("enable", False))
+        if not self.offline_critic_pretrain_enable:
+            return
+        if self.demo_buffer is None:
+            raise RuntimeError(
+                "offline_critic_pretrain requires algorithm.demo_buffer.enable=true and a valid load_path"
+            )
+
+        all_ids = list(self.demo_buffer._trajectory_id_list)
+        if len(all_ids) < 2:
+            raise RuntimeError(
+                f"offline_critic_pretrain needs at least 2 trajectories, got {len(all_ids)}"
+            )
+
+        split_seed = int(offline_critic_cfg.get("split_seed", seed))
+        val_ratio = float(offline_critic_cfg.get("val_ratio", 0.2))
+        val_ratio = min(max(val_ratio, 0.0), 0.9)
+        self.offline_critic_quality_mode = str(
+            offline_critic_cfg.get("quality_mode", self.offline_collection_quality_mode)
+        ).lower()
+        self.offline_critic_success_threshold = float(
+            offline_critic_cfg.get(
+                "success_threshold", self.offline_collection_success_threshold
+            )
+        )
+
+        success_ids = []
+        failure_ids = []
+        for trajectory_id in all_ids:
+            info = self.demo_buffer._trajectory_index[int(trajectory_id)]
+            model_weights_id = str(info.get("model_weights_id", ""))
+            traj = self.demo_buffer._load_trajectory(int(trajectory_id), model_weights_id)
+            quality = self._compute_offline_collection_quality(traj)
+            if quality["is_success"]:
+                success_ids.append(int(trajectory_id))
+            else:
+                failure_ids.append(int(trajectory_id))
+
+        def _split_ids(ids: list[int], rng_seed: int) -> tuple[list[int], list[int]]:
+            if len(ids) == 0:
+                return [], []
+            gen = torch.Generator().manual_seed(rng_seed)
+            perm = torch.randperm(len(ids), generator=gen).tolist()
+            shuffled = [ids[i] for i in perm]
+            val_count = int(round(len(shuffled) * val_ratio))
+            if len(shuffled) >= 2:
+                val_count = min(max(val_count, 1), len(shuffled) - 1)
+            else:
+                val_count = 0
+            if val_count == 0:
+                return shuffled, []
+            return shuffled[:-val_count], shuffled[-val_count:]
+
+        train_success_ids, val_success_ids = _split_ids(success_ids, split_seed + 11 + self._rank)
+        train_failure_ids, val_failure_ids = _split_ids(failure_ids, split_seed + 29 + self._rank)
+        train_ids = train_success_ids + train_failure_ids
+        val_ids = val_success_ids + val_failure_ids
+        if len(train_ids) < 1:
+            raise RuntimeError("offline_critic_pretrain requires at least one training trajectory")
+        if len(val_ids) < 1:
+            raise RuntimeError("offline_critic_pretrain requires at least one validation trajectory")
+
+        self.offline_critic_train_buffer = self._make_subset_buffer(
+            self.demo_buffer, train_ids, seed + 301
+        )
+        self.offline_critic_val_buffer = self._make_subset_buffer(
+            self.demo_buffer, val_ids, seed + 302
+        )
+        self.offline_critic_train_success_buffer = (
+            self._make_subset_buffer(self.demo_buffer, train_success_ids, seed + 303)
+            if len(train_success_ids) > 0
+            else None
+        )
+        self.offline_critic_train_failure_buffer = (
+            self._make_subset_buffer(self.demo_buffer, train_failure_ids, seed + 304)
+            if len(train_failure_ids) > 0
+            else None
+        )
+        self.offline_critic_val_success_buffer = (
+            self._make_subset_buffer(self.demo_buffer, val_success_ids, seed + 305)
+            if len(val_success_ids) > 0
+            else None
+        )
+        self.offline_critic_val_failure_buffer = (
+            self._make_subset_buffer(self.demo_buffer, val_failure_ids, seed + 306)
+            if len(val_failure_ids) > 0
+            else None
+        )
+
+        self.offline_critic_global_batch_per_rank = (
+            self.cfg.actor.global_batch_size // self._world_size
+        )
+        default_steps = max(
+            1,
+            self.offline_critic_train_buffer.total_samples
+            // max(1, self.offline_critic_global_batch_per_rank),
+        )
+        self.offline_critic_steps_per_epoch = int(
+            offline_critic_cfg.get("steps_per_epoch", default_steps)
+        )
+        default_val_steps = max(
+            1,
+            min(
+                50,
+                self.offline_critic_val_buffer.total_samples
+                // max(1, self.offline_critic_global_batch_per_rank),
+            ),
+        )
+        self.offline_critic_val_steps = int(
+            offline_critic_cfg.get("val_steps_per_epoch", default_val_steps)
+        )
+        self.offline_critic_eval_steps = int(
+            offline_critic_cfg.get(
+                "class_eval_steps_per_epoch",
+                min(50, max(1, self.offline_critic_val_steps)),
+            )
+        )
+
+        self.log_on_first_rank(
+            f"[offline_critic_pretrain] enabled | train_traj={self.offline_critic_train_buffer.size} | "
+            f"val_traj={self.offline_critic_val_buffer.size} | train_success={len(train_success_ids)} | "
+            f"train_failure={len(train_failure_ids)} | val_success={len(val_success_ids)} | "
+            f"val_failure={len(val_failure_ids)} | train_samples={self.offline_critic_train_buffer.total_samples} | "
+            f"val_samples={self.offline_critic_val_buffer.total_samples} | steps_per_epoch={self.offline_critic_steps_per_epoch} | "
+            f"val_steps={self.offline_critic_val_steps} | class_eval_steps={self.offline_critic_eval_steps}"
+        )
+
+    def _setup_offline_rl_pretrain(self, seed: int) -> None:
+        offline_rl_cfg = self.cfg.algorithm.get("offline_rl_pretrain", None)
+        if offline_rl_cfg is None:
+            return
+        self.offline_rl_pretrain_enable = bool(offline_rl_cfg.get("enable", False))
+        if not self.offline_rl_pretrain_enable:
+            return
+        if self.demo_buffer is None:
+            raise RuntimeError(
+                "offline_rl_pretrain requires algorithm.demo_buffer.enable=true and a valid load_path"
+            )
+
+        all_ids = list(self.demo_buffer._trajectory_id_list)
+        if len(all_ids) < 2:
+            raise RuntimeError(
+                f"offline_rl_pretrain needs at least 2 trajectories, got {len(all_ids)}"
+            )
+
+        split_seed = int(offline_rl_cfg.get("split_seed", seed))
+        val_ratio = float(offline_rl_cfg.get("val_ratio", 0.2))
+        val_ratio = min(max(val_ratio, 0.0), 0.9)
+        self.offline_rl_quality_mode = str(
+            offline_rl_cfg.get("quality_mode", self.offline_collection_quality_mode)
+        ).lower()
+        self.offline_rl_success_threshold = float(
+            offline_rl_cfg.get(
+                "success_threshold", self.offline_collection_success_threshold
+            )
+        )
+
+        # Reuse quality function by temporarily swapping mode/threshold.
+        orig_mode = self.offline_collection_quality_mode
+        orig_thr = self.offline_collection_success_threshold
+        self.offline_collection_quality_mode = self.offline_rl_quality_mode
+        self.offline_collection_success_threshold = self.offline_rl_success_threshold
+        success_ids = []
+        failure_ids = []
+        for trajectory_id in all_ids:
+            info = self.demo_buffer._trajectory_index[int(trajectory_id)]
+            model_weights_id = str(info.get("model_weights_id", ""))
+            traj = self.demo_buffer._load_trajectory(int(trajectory_id), model_weights_id)
+            quality = self._compute_offline_collection_quality(traj)
+            if quality["is_success"]:
+                success_ids.append(int(trajectory_id))
+            else:
+                failure_ids.append(int(trajectory_id))
+        self.offline_collection_quality_mode = orig_mode
+        self.offline_collection_success_threshold = orig_thr
+
+        def _split_ids(ids: list[int], rng_seed: int) -> tuple[list[int], list[int]]:
+            if len(ids) == 0:
+                return [], []
+            gen = torch.Generator().manual_seed(rng_seed)
+            perm = torch.randperm(len(ids), generator=gen).tolist()
+            shuffled = [ids[i] for i in perm]
+            val_count = int(round(len(shuffled) * val_ratio))
+            if len(shuffled) >= 2:
+                val_count = min(max(val_count, 1), len(shuffled) - 1)
+            else:
+                val_count = 0
+            if val_count == 0:
+                return shuffled, []
+            return shuffled[:-val_count], shuffled[-val_count:]
+
+        train_success_ids, val_success_ids = _split_ids(success_ids, split_seed + 101 + self._rank)
+        train_failure_ids, val_failure_ids = _split_ids(failure_ids, split_seed + 211 + self._rank)
+        train_ids = train_success_ids + train_failure_ids
+        val_ids = val_success_ids + val_failure_ids
+        if len(train_ids) < 1:
+            raise RuntimeError("offline_rl_pretrain requires at least one training trajectory")
+        if len(val_ids) < 1:
+            raise RuntimeError("offline_rl_pretrain requires at least one validation trajectory")
+
+        self.offline_rl_train_buffer = self._make_subset_buffer(self.demo_buffer, train_ids, seed + 401)
+        self.offline_rl_val_buffer = self._make_subset_buffer(self.demo_buffer, val_ids, seed + 402)
+        self.offline_rl_train_success_buffer = (
+            self._make_subset_buffer(self.demo_buffer, train_success_ids, seed + 403)
+            if len(train_success_ids) > 0 else None
+        )
+        self.offline_rl_train_failure_buffer = (
+            self._make_subset_buffer(self.demo_buffer, train_failure_ids, seed + 404)
+            if len(train_failure_ids) > 0 else None
+        )
+        self.offline_rl_val_success_buffer = (
+            self._make_subset_buffer(self.demo_buffer, val_success_ids, seed + 405)
+            if len(val_success_ids) > 0 else None
+        )
+        self.offline_rl_val_failure_buffer = (
+            self._make_subset_buffer(self.demo_buffer, val_failure_ids, seed + 406)
+            if len(val_failure_ids) > 0 else None
+        )
+
+        self.offline_rl_global_batch_per_rank = self.cfg.actor.global_batch_size // self._world_size
+        default_steps = max(1, self.offline_rl_train_buffer.total_samples // max(1, self.offline_rl_global_batch_per_rank))
+        self.offline_rl_steps_per_epoch = int(offline_rl_cfg.get("steps_per_epoch", default_steps))
+        default_val_steps = max(1, min(50, self.offline_rl_val_buffer.total_samples // max(1, self.offline_rl_global_batch_per_rank)))
+        self.offline_rl_val_steps = int(offline_rl_cfg.get("val_steps_per_epoch", default_val_steps))
+        self.offline_rl_eval_steps = int(
+            offline_rl_cfg.get("class_eval_steps_per_epoch", min(50, max(1, self.offline_rl_val_steps)))
+        )
+        self.offline_rl_actor_updates_per_step = int(offline_rl_cfg.get("actor_updates_per_step", 1))
+        self.offline_rl_critic_updates_per_step = int(
+            offline_rl_cfg.get("critic_updates_per_step", max(1, int(self.cfg.algorithm.get("critic_actor_ratio", 1))))
+        )
+
+        self.log_on_first_rank(
+            f"[offline_rl_pretrain] enabled | train_traj={self.offline_rl_train_buffer.size} | "
+            f"val_traj={self.offline_rl_val_buffer.size} | train_success={len(train_success_ids)} | "
+            f"train_failure={len(train_failure_ids)} | val_success={len(val_success_ids)} | "
+            f"val_failure={len(val_failure_ids)} | train_samples={self.offline_rl_train_buffer.total_samples} | "
+            f"val_samples={self.offline_rl_val_buffer.total_samples} | steps_per_epoch={self.offline_rl_steps_per_epoch} | "
+            f"val_steps={self.offline_rl_val_steps} | class_eval_steps={self.offline_rl_eval_steps} | "
+            f"critic_updates_per_step={self.offline_rl_critic_updates_per_step} | actor_updates_per_step={self.offline_rl_actor_updates_per_step}"
+        )
+
+    def init_offline_critic_worker(self):
+        self.setup_model_and_optimizer()
+        self.setup_gigawa_components()
+        policy = self._unwrap_policy(self.model)
+        policy.soft_update_targets(tau=1.0)
+        policy.set_use_rl_head_for_rollout(False)
+        self.rollout_rl_head_enabled = False
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_param_and_grad()
+            self.offload_optimizer()
+        if self.cfg.actor.get("compile_model", False):
+            self.model = torch.compile(self.model, mode="default")
+
+    def init_offline_rl_worker(self):
+        self.setup_model_and_optimizer()
+        self.setup_gigawa_components()
+        policy = self._unwrap_policy(self.model)
+        policy.soft_update_targets(tau=1.0)
+        policy.set_use_rl_head_for_rollout(False)
+        self.rollout_rl_head_enabled = False
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_param_and_grad()
+            self.offload_optimizer()
+        if self.cfg.actor.get("compile_model", False):
+            self.model = torch.compile(self.model, mode="default")
+
     def init_offline_bc_worker(self):
         self.setup_model_and_optimizer()
         self.setup_gigawa_components()
@@ -551,11 +853,499 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         if self.cfg.actor.get("compile_model", False):
             self.model = torch.compile(self.model, mode="default")
 
+    def _offline_sample_batch_from_buffer(
+        self, buffer: TrajectoryReplayBuffer | None, global_batch_per_rank: int
+    ) -> dict[str, torch.Tensor]:
+        assert buffer is not None, "offline pretrain buffers are not initialized"
+        batch = buffer.sample(max(1, global_batch_per_rank))
+        return put_tensor_device(batch, device=self.device)
+
     def _offline_bc_sample_batch(self, train: bool = True) -> dict[str, torch.Tensor]:
         buffer = self.offline_bc_train_buffer if train else self.offline_bc_val_buffer
-        assert buffer is not None, "offline BC buffers are not initialized"
-        batch = buffer.sample(max(1, self.offline_bc_global_batch_per_rank))
-        return put_tensor_device(batch, device=self.device)
+        return self._offline_sample_batch_from_buffer(
+            buffer, self.offline_bc_global_batch_per_rank
+        )
+
+    def _offline_critic_sample_batch(self, train: bool = True) -> dict[str, torch.Tensor]:
+        buffer = self.offline_critic_train_buffer if train else self.offline_critic_val_buffer
+        return self._offline_sample_batch_from_buffer(
+            buffer, self.offline_critic_global_batch_per_rank
+        )
+
+    def _offline_critic_microbatches(self, global_batch: dict[str, torch.Tensor]) -> list[dict[str, torch.Tensor]]:
+        return split_dict_to_chunk(
+            global_batch,
+            max(1, self.offline_critic_global_batch_per_rank // self.cfg.actor.micro_batch_size),
+        )
+
+    def _offline_rl_sample_batch(self, train: bool = True) -> dict[str, torch.Tensor]:
+        buffer = self.offline_rl_train_buffer if train else self.offline_rl_val_buffer
+        return self._offline_sample_batch_from_buffer(
+            buffer, self.offline_rl_global_batch_per_rank
+        )
+
+    def _offline_rl_microbatches(self, global_batch: dict[str, torch.Tensor]) -> list[dict[str, torch.Tensor]]:
+        return split_dict_to_chunk(
+            global_batch,
+            max(1, self.offline_rl_global_batch_per_rank // self.cfg.actor.micro_batch_size),
+        )
+
+    def _offline_critic_collect_buffer_metrics(
+        self,
+        buffer: TrajectoryReplayBuffer | None,
+        num_steps: int,
+        prefix: str,
+    ) -> dict[str, float]:
+        if buffer is None or buffer.size <= 0 or num_steps <= 0:
+            return {
+                f"{prefix}/count": 0.0,
+                f"{prefix}/critic_loss": 0.0,
+                f"{prefix}/q1_mean": 0.0,
+                f"{prefix}/q2_mean": 0.0,
+                f"{prefix}/q_logged_mean": 0.0,
+                f"{prefix}/target_q_mean": 0.0,
+            }
+
+        local = {
+            f"{prefix}/count": 0.0,
+            f"{prefix}/critic_loss_sum": 0.0,
+            f"{prefix}/q1_sum": 0.0,
+            f"{prefix}/q2_sum": 0.0,
+            f"{prefix}/q_logged_sum": 0.0,
+            f"{prefix}/target_q_sum": 0.0,
+        }
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            for _ in range(num_steps):
+                global_batch = self._offline_sample_batch_from_buffer(
+                    buffer, self.offline_critic_global_batch_per_rank
+                )
+                for batch in self._offline_critic_microbatches(global_batch):
+                    critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                    q_logged = torch.minimum(q1, q2)
+                    local[f"{prefix}/count"] += float(q_logged.numel())
+                    local[f"{prefix}/critic_loss_sum"] += float(critic_loss.item()) * float(q_logged.numel())
+                    local[f"{prefix}/q1_sum"] += float(q1.sum().item())
+                    local[f"{prefix}/q2_sum"] += float(q2.sum().item())
+                    local[f"{prefix}/q_logged_sum"] += float(q_logged.sum().item())
+                    local[f"{prefix}/target_q_sum"] += float(target_q_values.sum().item())
+        if was_training:
+            self.model.train()
+
+        reduced = all_reduce_dict(local, op=torch.distributed.ReduceOp.SUM)
+        count = max(reduced[f"{prefix}/count"], 1.0)
+        return {
+            f"{prefix}/count": float(reduced[f"{prefix}/count"]),
+            f"{prefix}/critic_loss": float(reduced[f"{prefix}/critic_loss_sum"] / count),
+            f"{prefix}/q1_mean": float(reduced[f"{prefix}/q1_sum"] / count),
+            f"{prefix}/q2_mean": float(reduced[f"{prefix}/q2_sum"] / count),
+            f"{prefix}/q_logged_mean": float(reduced[f"{prefix}/q_logged_sum"] / count),
+            f"{prefix}/target_q_mean": float(reduced[f"{prefix}/target_q_sum"] / count),
+        }
+
+    def _offline_rl_collect_buffer_critic_metrics(
+        self,
+        buffer: TrajectoryReplayBuffer | None,
+        num_steps: int,
+        prefix: str,
+    ) -> dict[str, float]:
+        if buffer is None or buffer.size <= 0 or num_steps <= 0:
+            return {
+                f"{prefix}/count": 0.0,
+                f"{prefix}/critic_loss": 0.0,
+                f"{prefix}/q1_mean": 0.0,
+                f"{prefix}/q2_mean": 0.0,
+                f"{prefix}/q_logged_mean": 0.0,
+                f"{prefix}/target_q_mean": 0.0,
+            }
+
+        local = {
+            f"{prefix}/count": 0.0,
+            f"{prefix}/critic_loss_sum": 0.0,
+            f"{prefix}/q1_sum": 0.0,
+            f"{prefix}/q2_sum": 0.0,
+            f"{prefix}/q_logged_sum": 0.0,
+            f"{prefix}/target_q_sum": 0.0,
+        }
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            for _ in range(num_steps):
+                global_batch = self._offline_sample_batch_from_buffer(
+                    buffer, self.offline_rl_global_batch_per_rank
+                )
+                for batch in self._offline_rl_microbatches(global_batch):
+                    critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                    q_logged = torch.minimum(q1, q2)
+                    local[f"{prefix}/count"] += float(q_logged.numel())
+                    local[f"{prefix}/critic_loss_sum"] += float(critic_loss.item()) * float(q_logged.numel())
+                    local[f"{prefix}/q1_sum"] += float(q1.sum().item())
+                    local[f"{prefix}/q2_sum"] += float(q2.sum().item())
+                    local[f"{prefix}/q_logged_sum"] += float(q_logged.sum().item())
+                    local[f"{prefix}/target_q_sum"] += float(target_q_values.sum().item())
+        if was_training:
+            self.model.train()
+
+        reduced = all_reduce_dict(local, op=torch.distributed.ReduceOp.SUM)
+        count = max(reduced[f"{prefix}/count"], 1e-12)
+        return {
+            f"{prefix}/count": reduced[f"{prefix}/count"],
+            f"{prefix}/critic_loss": reduced[f"{prefix}/critic_loss_sum"] / count,
+            f"{prefix}/q1_mean": reduced[f"{prefix}/q1_sum"] / count,
+            f"{prefix}/q2_mean": reduced[f"{prefix}/q2_sum"] / count,
+            f"{prefix}/q_logged_mean": reduced[f"{prefix}/q_logged_sum"] / count,
+            f"{prefix}/target_q_mean": reduced[f"{prefix}/target_q_sum"] / count,
+        }
+
+    def _offline_rl_collect_buffer_actor_metrics(
+        self,
+        buffer: TrajectoryReplayBuffer | None,
+        num_steps: int,
+        prefix: str,
+    ) -> dict[str, float]:
+        if buffer is None or buffer.size <= 0 or num_steps <= 0:
+            return {
+                f"{prefix}/count": 0.0,
+                f"{prefix}/actor_loss": 0.0,
+                f"{prefix}/bc_loss": 0.0,
+                f"{prefix}/q_pi_mean": 0.0,
+            }
+
+        local = {
+            f"{prefix}/count": 0.0,
+            f"{prefix}/actor_loss_sum": 0.0,
+            f"{prefix}/bc_loss_sum": 0.0,
+            f"{prefix}/q_pi_sum": 0.0,
+        }
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            for _ in range(num_steps):
+                global_batch = self._offline_sample_batch_from_buffer(
+                    buffer, self.offline_rl_global_batch_per_rank
+                )
+                for batch in self._offline_rl_microbatches(global_batch):
+                    actor_loss, actor_metrics, _ = self.forward_actor(batch, capture_diagnostics=False)
+                    batch_count = float(batch["actions"].shape[0])
+                    local[f"{prefix}/count"] += batch_count
+                    local[f"{prefix}/actor_loss_sum"] += float(actor_loss.item()) * batch_count
+                    local[f"{prefix}/bc_loss_sum"] += float(actor_metrics.get("bc_loss", 0.0)) * batch_count
+                    local[f"{prefix}/q_pi_sum"] += float(actor_metrics.get("q_pi", 0.0)) * batch_count
+        if was_training:
+            self.model.train()
+
+        reduced = all_reduce_dict(local, op=torch.distributed.ReduceOp.SUM)
+        count = max(reduced[f"{prefix}/count"], 1e-12)
+        return {
+            f"{prefix}/count": reduced[f"{prefix}/count"],
+            f"{prefix}/actor_loss": reduced[f"{prefix}/actor_loss_sum"] / count,
+            f"{prefix}/bc_loss": reduced[f"{prefix}/bc_loss_sum"] / count,
+            f"{prefix}/q_pi_mean": reduced[f"{prefix}/q_pi_sum"] / count,
+        }
+
+    @Worker.timer("run_offline_critic_epoch")
+    def run_offline_critic_epoch(self):
+        if not self.offline_critic_pretrain_enable:
+            raise RuntimeError("offline_critic_pretrain is not enabled in config")
+        if self.cfg.actor.get("enable_offload", False):
+            self.load_param_and_grad(self.device)
+            self.load_optimizer(self.device)
+
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        )
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
+        )
+
+        self.model.train()
+        train_losses = []
+        grad_norms = []
+        q1_means = []
+        q2_means = []
+        target_q_means = []
+        q_logged_means = []
+        for _ in range(self.offline_critic_steps_per_epoch):
+            global_batch = self._offline_critic_sample_batch(train=True)
+            train_micro_batch_list = self._offline_critic_microbatches(global_batch)
+            self.qf_optimizer.zero_grad()
+            step_losses = []
+            step_q1 = []
+            step_q2 = []
+            step_target_q = []
+            step_q_logged = []
+            for batch in train_micro_batch_list:
+                critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                (critic_loss / self.gradient_accumulation).backward()
+                q_logged = torch.minimum(q1.detach(), q2.detach())
+                step_losses.append(float(critic_loss.detach().item()))
+                step_q1.append(float(q1.detach().mean().item()))
+                step_q2.append(float(q2.detach().mean().item()))
+                step_target_q.append(float(target_q_values.detach().mean().item()))
+                step_q_logged.append(float(q_logged.mean().item()))
+            critic_grad_norm = self.model.clip_grad_norm_(
+                max_norm=self.cfg.actor.critic_optim.clip_grad
+            )
+            self.qf_optimizer.step()
+            self.qf_lr_scheduler.step()
+            self.update_step += 1
+            train_losses.append(float(np.mean(step_losses)))
+            grad_norms.append(float(critic_grad_norm))
+            q1_means.append(float(np.mean(step_q1)))
+            q2_means.append(float(np.mean(step_q2)))
+            target_q_means.append(float(np.mean(step_target_q)))
+            q_logged_means.append(float(np.mean(step_q_logged)))
+
+        self.model.eval()
+        val_losses = []
+        val_q1_means = []
+        val_q2_means = []
+        val_target_q_means = []
+        val_q_logged_means = []
+        with torch.no_grad():
+            for _ in range(self.offline_critic_val_steps):
+                global_batch = self._offline_critic_sample_batch(train=False)
+                for batch in self._offline_critic_microbatches(global_batch):
+                    critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                    q_logged = torch.minimum(q1, q2)
+                    val_losses.append(float(critic_loss.item()))
+                    val_q1_means.append(float(q1.mean().item()))
+                    val_q2_means.append(float(q2.mean().item()))
+                    val_target_q_means.append(float(target_q_values.mean().item()))
+                    val_q_logged_means.append(float(q_logged.mean().item()))
+
+        metrics = {
+            "offline_critic/train_critic_loss": float(np.mean(train_losses)) if train_losses else 0.0,
+            "offline_critic/val_critic_loss": float(np.mean(val_losses)) if val_losses else 0.0,
+            "offline_critic/overfit_gap": (
+                float(np.mean(val_losses)) - float(np.mean(train_losses))
+            ) if train_losses and val_losses else 0.0,
+            "offline_critic/train_q1_mean": float(np.mean(q1_means)) if q1_means else 0.0,
+            "offline_critic/train_q2_mean": float(np.mean(q2_means)) if q2_means else 0.0,
+            "offline_critic/train_q_logged_mean": float(np.mean(q_logged_means)) if q_logged_means else 0.0,
+            "offline_critic/train_target_q_mean": float(np.mean(target_q_means)) if target_q_means else 0.0,
+            "offline_critic/val_q1_mean": float(np.mean(val_q1_means)) if val_q1_means else 0.0,
+            "offline_critic/val_q2_mean": float(np.mean(val_q2_means)) if val_q2_means else 0.0,
+            "offline_critic/val_q_logged_mean": float(np.mean(val_q_logged_means)) if val_q_logged_means else 0.0,
+            "offline_critic/val_target_q_mean": float(np.mean(val_target_q_means)) if val_target_q_means else 0.0,
+            "offline_critic/train_num_trajectories": float(self.offline_critic_train_buffer.size),
+            "offline_critic/val_num_trajectories": float(self.offline_critic_val_buffer.size),
+            "offline_critic/train_success_num_trajectories": float(self.offline_critic_train_success_buffer.size if self.offline_critic_train_success_buffer is not None else 0),
+            "offline_critic/train_failure_num_trajectories": float(self.offline_critic_train_failure_buffer.size if self.offline_critic_train_failure_buffer is not None else 0),
+            "offline_critic/val_success_num_trajectories": float(self.offline_critic_val_success_buffer.size if self.offline_critic_val_success_buffer is not None else 0),
+            "offline_critic/val_failure_num_trajectories": float(self.offline_critic_val_failure_buffer.size if self.offline_critic_val_failure_buffer is not None else 0),
+            "offline_critic/train_total_samples": float(self.offline_critic_train_buffer.total_samples),
+            "offline_critic/val_total_samples": float(self.offline_critic_val_buffer.total_samples),
+            "offline_critic/steps_per_epoch": float(self.offline_critic_steps_per_epoch),
+            "offline_critic/val_steps": float(self.offline_critic_val_steps),
+            "offline_critic/class_eval_steps": float(self.offline_critic_eval_steps),
+            "critic/lr": float(self.qf_optimizer.param_groups[0]["lr"]),
+            "critic/grad_norm": float(np.mean(grad_norms)) if grad_norms else 0.0,
+        }
+        metrics = all_reduce_dict(metrics, op=torch.distributed.ReduceOp.AVG)
+        metrics.update(
+            self._offline_critic_collect_buffer_metrics(
+                self.offline_critic_train_success_buffer,
+                self.offline_critic_eval_steps,
+                "offline_critic/train_success",
+            )
+        )
+        metrics.update(
+            self._offline_critic_collect_buffer_metrics(
+                self.offline_critic_train_failure_buffer,
+                self.offline_critic_eval_steps,
+                "offline_critic/train_failure",
+            )
+        )
+        metrics.update(
+            self._offline_critic_collect_buffer_metrics(
+                self.offline_critic_val_success_buffer,
+                self.offline_critic_eval_steps,
+                "offline_critic/val_success",
+            )
+        )
+        metrics.update(
+            self._offline_critic_collect_buffer_metrics(
+                self.offline_critic_val_failure_buffer,
+                self.offline_critic_eval_steps,
+                "offline_critic/val_failure",
+            )
+        )
+        metrics["offline_critic/train_success_failure_q_gap"] = (
+            metrics.get("offline_critic/train_success/q_logged_mean", 0.0)
+            - metrics.get("offline_critic/train_failure/q_logged_mean", 0.0)
+        )
+        metrics["offline_critic/val_success_failure_q_gap"] = (
+            metrics.get("offline_critic/val_success/q_logged_mean", 0.0)
+            - metrics.get("offline_critic/val_failure/q_logged_mean", 0.0)
+        )
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_param_and_grad()
+            self.offload_optimizer()
+        return metrics
+
+    @Worker.timer("run_offline_rl_epoch")
+    def run_offline_rl_epoch(self):
+        if not self.offline_rl_pretrain_enable:
+            raise RuntimeError("offline_rl_pretrain is not enabled in config")
+        if self.cfg.actor.get("enable_offload", False):
+            self.load_param_and_grad(self.device)
+            self.load_optimizer(self.device)
+
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        )
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
+        )
+
+        self.model.train()
+        critic_train_losses = []
+        critic_grad_norms = []
+        critic_q1_means = []
+        critic_q2_means = []
+        critic_target_q_means = []
+        critic_q_logged_means = []
+        actor_train_losses = []
+        actor_bc_losses = []
+        actor_q_pi_means = []
+        actor_grad_norms = []
+
+        policy = self._unwrap_policy(self.model)
+        tau = float(self.target_tau)
+
+        for _ in range(self.offline_rl_steps_per_epoch):
+            self.update_step += 1
+            for _ in range(self.offline_rl_critic_updates_per_step):
+                global_batch = self._offline_rl_sample_batch(train=True)
+                train_micro_batch_list = self._offline_rl_microbatches(global_batch)
+                self.qf_optimizer.zero_grad()
+                step_losses = []
+                step_q1 = []
+                step_q2 = []
+                step_target_q = []
+                step_q_logged = []
+                for batch in train_micro_batch_list:
+                    critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                    (critic_loss / self.gradient_accumulation).backward()
+                    q_logged = torch.minimum(q1.detach(), q2.detach())
+                    step_losses.append(float(critic_loss.detach().item()))
+                    step_q1.append(float(q1.detach().mean().item()))
+                    step_q2.append(float(q2.detach().mean().item()))
+                    step_target_q.append(float(target_q_values.detach().mean().item()))
+                    step_q_logged.append(float(q_logged.mean().item()))
+                critic_grad_norm = self.model.clip_grad_norm_(max_norm=self.cfg.actor.critic_optim.clip_grad)
+                self.qf_optimizer.step()
+                self.qf_lr_scheduler.step()
+                policy.soft_update_targets(tau=tau)
+                critic_train_losses.append(float(np.mean(step_losses)))
+                critic_grad_norms.append(float(critic_grad_norm))
+                critic_q1_means.append(float(np.mean(step_q1)))
+                critic_q2_means.append(float(np.mean(step_q2)))
+                critic_target_q_means.append(float(np.mean(step_target_q)))
+                critic_q_logged_means.append(float(np.mean(step_q_logged)))
+
+            for _ in range(self.offline_rl_actor_updates_per_step):
+                global_batch = self._offline_rl_sample_batch(train=True)
+                train_micro_batch_list = self._offline_rl_microbatches(global_batch)
+                self.optimizer.zero_grad()
+                step_actor_losses = []
+                step_bc_losses = []
+                step_q_pi = []
+                for batch in train_micro_batch_list:
+                    actor_loss, actor_metrics, _ = self.forward_actor(batch, capture_diagnostics=False)
+                    (actor_loss / self.gradient_accumulation).backward()
+                    step_actor_losses.append(float(actor_loss.detach().item()))
+                    step_bc_losses.append(float(actor_metrics.get("bc_loss", 0.0)))
+                    step_q_pi.append(float(actor_metrics.get("q_pi", 0.0)))
+                actor_grad_norm = self.model.clip_grad_norm_(max_norm=self.cfg.actor.optim.clip_grad)
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.actor_update_step += 1
+                policy.soft_update_targets(tau=tau)
+                actor_train_losses.append(float(np.mean(step_actor_losses)))
+                actor_bc_losses.append(float(np.mean(step_bc_losses)))
+                actor_q_pi_means.append(float(np.mean(step_q_pi)))
+                actor_grad_norms.append(float(actor_grad_norm))
+
+        metrics = {
+            "offline_rl/train_critic_loss": float(np.mean(critic_train_losses)) if critic_train_losses else 0.0,
+            "offline_rl/train_q1_mean": float(np.mean(critic_q1_means)) if critic_q1_means else 0.0,
+            "offline_rl/train_q2_mean": float(np.mean(critic_q2_means)) if critic_q2_means else 0.0,
+            "offline_rl/train_q_logged_mean": float(np.mean(critic_q_logged_means)) if critic_q_logged_means else 0.0,
+            "offline_rl/train_target_q_mean": float(np.mean(critic_target_q_means)) if critic_target_q_means else 0.0,
+            "offline_rl/train_actor_loss": float(np.mean(actor_train_losses)) if actor_train_losses else 0.0,
+            "offline_rl/train_bc_loss": float(np.mean(actor_bc_losses)) if actor_bc_losses else 0.0,
+            "offline_rl/train_q_pi_mean": float(np.mean(actor_q_pi_means)) if actor_q_pi_means else 0.0,
+            "offline_rl/critic_grad_norm": float(np.mean(critic_grad_norms)) if critic_grad_norms else 0.0,
+            "offline_rl/actor_grad_norm": float(np.mean(actor_grad_norms)) if actor_grad_norms else 0.0,
+            "actor/lr": float(self.lr_scheduler.get_last_lr()[0]),
+            "critic/lr": float(self.qf_lr_scheduler.get_last_lr()[0]),
+        }
+
+        metrics.update(
+            self._offline_rl_collect_buffer_critic_metrics(
+                self.offline_rl_val_buffer, self.offline_rl_val_steps, "offline_rl/val"
+            )
+        )
+        metrics.update(
+            self._offline_rl_collect_buffer_actor_metrics(
+                self.offline_rl_val_buffer, self.offline_rl_val_steps, "offline_rl/val_actor"
+            )
+        )
+        metrics.update(
+            self._offline_rl_collect_buffer_critic_metrics(
+                self.offline_rl_train_success_buffer,
+                self.offline_rl_eval_steps,
+                "offline_rl/train_success",
+            )
+        )
+        metrics.update(
+            self._offline_rl_collect_buffer_critic_metrics(
+                self.offline_rl_train_failure_buffer,
+                self.offline_rl_eval_steps,
+                "offline_rl/train_failure",
+            )
+        )
+        metrics.update(
+            self._offline_rl_collect_buffer_critic_metrics(
+                self.offline_rl_val_success_buffer,
+                self.offline_rl_eval_steps,
+                "offline_rl/val_success",
+            )
+        )
+        metrics.update(
+            self._offline_rl_collect_buffer_critic_metrics(
+                self.offline_rl_val_failure_buffer,
+                self.offline_rl_eval_steps,
+                "offline_rl/val_failure",
+            )
+        )
+        metrics["offline_rl/critic_overfit_gap"] = (
+            metrics.get("offline_rl/val/critic_loss", 0.0)
+            - metrics.get("offline_rl/train_critic_loss", 0.0)
+        )
+        metrics["offline_rl/train_success_failure_q_gap"] = (
+            metrics.get("offline_rl/train_success/q_logged_mean", 0.0)
+            - metrics.get("offline_rl/train_failure/q_logged_mean", 0.0)
+        )
+        metrics["offline_rl/val_success_failure_q_gap"] = (
+            metrics.get("offline_rl/val_success/q_logged_mean", 0.0)
+            - metrics.get("offline_rl/val_failure/q_logged_mean", 0.0)
+        )
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_param_and_grad()
+            self.offload_optimizer()
+        return metrics
 
     @Worker.timer("run_offline_bc_epoch")
     def run_offline_bc_epoch(self):
@@ -1366,14 +2156,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     # ---------------------------------------------------------------------
     # Losses
     # ---------------------------------------------------------------------
-    @Worker.timer("forward_critic")
-    def forward_critic(self, batch):
+    def _compute_critic_outputs(self, batch):
         policy = self._unwrap_policy(self.model)
 
         curr_obs = batch["curr_obs"]
         next_obs = batch["next_obs"]
-        # Replay buffer stores model-space actions; executable env-space actions are
-        # only used to interact with the simulator and compute rewards.
         actions = batch["actions"].to(self.device, dtype=self.torch_dtype)
         rewards = batch["rewards"]
         terminations = batch["terminations"]
@@ -1382,9 +2169,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         done_mask = terminations.any(dim=-1, keepdim=True).to(self.torch_dtype)
 
         with torch.no_grad():
-            curr_visual_feat = self._build_visual_feat_for_actor(
-                curr_obs["visual_latent"]
-            )
+            curr_visual_feat = self._build_visual_feat_for_actor(curr_obs["visual_latent"])
             _, curr_actor_aux = self.model(
                 forward_type=ForwardType.DEFAULT,
                 mode="actor",
@@ -1396,9 +2181,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             )
             curr_rl_state = curr_actor_aux["rl_state"].detach()
 
-            next_visual_feat = self._build_visual_feat_for_actor(
-                next_obs["visual_latent"]
-            )
+            next_visual_feat = self._build_visual_feat_for_actor(next_obs["visual_latent"])
             next_actions, next_actor_aux = policy.target_actor_forward(
                 visual_feat=next_visual_feat.detach(),
                 robot_state=next_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
@@ -1425,6 +2208,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
         target_q_values = target_q_values.to(dtype=q1.dtype)
         critic_loss = F.mse_loss(q1, target_q_values) + F.mse_loss(q2, target_q_values)
+        return critic_loss, q1, q2, target_q_values
+
+    @Worker.timer("forward_critic")
+    def forward_critic(self, batch):
+        critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
         return critic_loss, {
             "q1_data": q1.mean().item(),
             "q2_data": q2.mean().item(),

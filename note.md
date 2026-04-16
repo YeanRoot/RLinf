@@ -12,6 +12,7 @@ cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf
 export REPO_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RLinf
 export ROBOTWIN_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-main
 export PYTHONPATH=$ROBOTWIN_PATH:$REPO_PATH:$PYTHONPATH
+cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
 
 conda activate pi-rl-h20
 
@@ -29,13 +30,13 @@ python train_embodied_agent_gigawa.py   --config-path ./config   --config-name n
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
 python collect_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name collect_cup_data
+  --config-name collect_cup_data_fix
 
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
 python reshard_offline_collection.py \
-  --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect4_12chunk/offline_collection \
-  --bucket success \
-  --output-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect4_12chunk/mergesuccess \
+  --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect4_12chunk_fix/offline_collection \
+  --bucket failure \
+  --output-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect4_12chunk_fix/mergefailure \
   --target-world-size 4 \
   --shuffle \
   --source-cache-size 2048
@@ -47,9 +48,19 @@ cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodime
 
 python train_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name normalbc_pretrained_actor_offline_eval \
+  --config-name normalbc_pretrained_actor_full_rl_fix \
   ++actor.fsdp_config.use_orig_params=true
 
-tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/test413_4_critic \
+python train_embodied_agent_gigawa_offline_critic.py\
+  --config-path ./config \
+  --config-name offline_critic_pretrain_mergeall_12chunk \
+  ++actor.fsdp_config.use_orig_params=true
+
+python train_embodied_agent_gigawa_offline_rl.py \
+  --config-path ./config \
+  --config-name offline_rl_pretrain_mergeall_12chunk_fix \
+  ++actor.fsdp_config.use_orig_params=true
+
+tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/test413_6_rl \
   --host 0.0.0.0 \
   --port 6006
