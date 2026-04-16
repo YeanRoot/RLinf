@@ -62,10 +62,14 @@ python train_embodied_agent_gigawa_offline_rl.py \
   --config-name offline_rl_pretrain_mergeall_12chunk_fix \
   ++actor.fsdp_config.use_orig_params=true
 
-python train_embodied_agent_gigawa_offline_rl.py \
+python train_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name normalbc_pretrained_actor_offline_eval \
+  --config-name normalbc_pretrained_actor_offline_eval_fix \
   ++actor.fsdp_config.use_orig_params=true
+
+python train_embodied_agent_gigawa_offline_critic_fast.py \
+  --config-path ./config \
+  --config-name offline_critic_pretrain_mergeall_12chunk_fast
 
 tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/test413_6_rl \
   --host 0.0.0.0 \

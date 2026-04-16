@@ -132,6 +132,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         if self.torch_dtype is None:
             self.torch_dtype = next(self.model.parameters()).dtype
 
+        policy = self._unwrap_policy(self.model)
+        if self.freeze_visual_layers:
+            policy.set_visual_trainable(False)
+
         param_filters = {"critic": ["critic"]}
         filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
         optimizers = self.build_optimizers(
@@ -148,6 +152,17 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.qf_optimizer, self.cfg.actor.critic_optim
         )
         self.grad_scaler = self.build_grad_scaler(self.cfg.actor.fsdp_config.grad_scaler)
+
+        policy = self._unwrap_policy(self.model)
+        policy.set_visual_trainable(not self.freeze_visual_layers)
+        policy.set_actor_head_trainable(not self.freeze_actor_updates)
+        policy.set_critic_trainable(not self.freeze_critic_updates)
+        self.log_on_first_rank(
+            "Training overrides: "
+            f"freeze_actor_updates={self.freeze_actor_updates}, "
+            f"freeze_critic_updates={self.freeze_critic_updates}, "
+            f"freeze_visual_layers={self.freeze_visual_layers}."
+        )
 
     def setup_gigawa_components(self):
         seed = self.cfg.actor.get("seed", 1234)
@@ -322,6 +337,9 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.stage_freeze_actor = self.training_stage == "critic_warmup"
         self.stage_full_rl = self.training_stage == "full_rl"
         self.allow_rollout_actor_handoff = not self.stage_freeze_actor
+        self.freeze_actor_updates = bool(self.cfg.algorithm.get("freeze_actor_updates", False))
+        self.freeze_critic_updates = bool(self.cfg.algorithm.get("freeze_critic_updates", False))
+        self.freeze_visual_layers = bool(self.cfg.algorithm.get("freeze_visual_layers", False))
 
         sliding_cfg = self.cfg.algorithm.get("gigawa_sliding_window", None)
         self.sliding_window_enable = bool(
@@ -1746,6 +1764,19 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         policy.soft_update_targets(tau=tau)
         self._maybe_enable_rollout_rl_head()
 
+    def _apply_training_param_freeze(self, *, actor_phase: bool, critic_phase: bool) -> None:
+        policy = self._unwrap_policy(self.model)
+        policy.set_visual_trainable(not self.freeze_visual_layers)
+        if actor_phase:
+            policy.set_actor_head_trainable(not self.freeze_actor_updates)
+            policy.set_critic_trainable(False)
+        elif critic_phase:
+            policy.set_actor_head_trainable(not self.freeze_actor_updates)
+            policy.set_critic_trainable(not self.freeze_critic_updates)
+        else:
+            policy.set_actor_head_trainable(not self.freeze_actor_updates)
+            policy.set_critic_trainable(not self.freeze_critic_updates)
+
     def _slice_obs_at_step(self, obs: dict[str, Any], t: int) -> dict[str, Any]:
         step_obs = {}
         for key, value in obs.items():
@@ -2318,10 +2349,15 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "stage/is_bc_actor_pretrain": float(self.stage_actor_bc_only),
             "stage/is_critic_warmup": float(self.stage_freeze_actor),
             "stage/is_full_rl": float(self.stage_full_rl),
+            "stage/freeze_actor_updates": float(self.freeze_actor_updates),
+            "stage/freeze_critic_updates": float(self.freeze_critic_updates),
+            "stage/freeze_visual_layers": float(self.freeze_visual_layers),
         }
 
         critic_updated = False
-        if not self.stage_actor_bc_only:
+        critic_train_enabled = (not self.stage_actor_bc_only) and (not self.freeze_critic_updates)
+        if critic_train_enabled:
+            self._apply_training_param_freeze(actor_phase=False, critic_phase=True)
             self.qf_optimizer.zero_grad()
             gbs_critic_loss = []
             all_critic_metrics = {}
@@ -2350,13 +2386,17 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 }
             )
         else:
-            metrics_data.update({"gigawa/critic_skipped": 1.0})
+            if self.freeze_critic_updates and (not self.stage_actor_bc_only):
+                metrics_data.update({"gigawa/critic_frozen": 1.0})
+            else:
+                metrics_data.update({"gigawa/critic_skipped": 1.0})
 
         actor_updated = False
         actor_update_due = self.stage_actor_bc_only or (self.update_step % self.critic_actor_ratio == 0)
-        actor_train_enabled = train_actor and (not self.stage_freeze_actor)
+        actor_train_enabled = train_actor and (not self.stage_freeze_actor) and (not self.freeze_actor_updates)
 
         if actor_update_due and actor_train_enabled:
+            self._apply_training_param_freeze(actor_phase=True, critic_phase=False)
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             all_actor_metrics = {}
@@ -2391,9 +2431,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     **all_actor_metrics,
                 }
             )
-        elif self.stage_freeze_actor:
+        elif self.stage_freeze_actor or self.freeze_actor_updates:
             metrics_data.update({"gigawa/actor_frozen": 1.0})
 
+        self._apply_training_param_freeze(actor_phase=False, critic_phase=False)
         self._maybe_update_targets(actor_updated=actor_updated, critic_updated=critic_updated)
 
         return metrics_data
@@ -2481,6 +2522,9 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "buffer_mix/demo_ready": float(readiness["start_status"]["demo_ready"]),
             "buffer_mix/replay_required_for_training": float(self.replay_required_for_training),
             "buffer_mix/allow_train_on_demo_only": float(self.allow_train_on_demo_only),
+            "stage/freeze_actor_updates": float(self.freeze_actor_updates),
+            "stage/freeze_critic_updates": float(self.freeze_critic_updates),
+            "stage/freeze_visual_layers": float(self.freeze_visual_layers),
         }
 
         update_epoch = self.utd_ratio

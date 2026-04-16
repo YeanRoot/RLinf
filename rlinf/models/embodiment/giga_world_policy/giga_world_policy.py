@@ -483,6 +483,15 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         for p in module.parameters():
             p.requires_grad = requires_grad
 
+    def set_visual_trainable(self, trainable: bool) -> None:
+        self._set_requires_grad(self.visual_compressor, trainable)
+
+    def set_actor_head_trainable(self, trainable: bool) -> None:
+        self._set_requires_grad(self.actor_head, trainable)
+
+    def set_critic_trainable(self, trainable: bool) -> None:
+        self._set_requires_grad(self.critic, trainable)
+
     def _init_actor_output_small(self):
         last_linear = None
         for m in self.actor_head.modules():
