@@ -96,6 +96,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.offline_rl_actor_updates_per_step = 1
         self.offline_rl_critic_updates_per_step = 1
 
+        # Training override flags must be initialized here because init_worker()
+        # calls setup_model_and_optimizer() before setup_gigawa_components().
+        self.freeze_actor_updates = bool(self.cfg.algorithm.get("freeze_actor_updates", False))
+        self.freeze_critic_updates = bool(self.cfg.algorithm.get("freeze_critic_updates", False))
+        self.freeze_visual_layers = bool(self.cfg.algorithm.get("freeze_visual_layers", False))
+
     # ---------------------------------------------------------------------
     # Init / setup
     # ---------------------------------------------------------------------
@@ -1138,6 +1144,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                         val_target_q_means.append(float(target_q_values.mean().item()))
                         val_q_logged_means.append(float(q_logged.mean().item()))
 
+        self._apply_training_param_freeze(actor_phase=False, critic_phase=False)
+
         metrics = {
             "offline_critic/train_critic_loss": float(np.mean(train_losses)) if train_losses else 0.0,
             "offline_critic/train_q1_mean": float(np.mean(q1_means)) if q1_means else 0.0,
@@ -1251,6 +1259,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         for _ in range(self.offline_rl_steps_per_epoch):
             self.update_step += 1
             for _ in range(self.offline_rl_critic_updates_per_step):
+                self._apply_training_param_freeze(actor_phase=False, critic_phase=True)
                 global_batch = self._offline_rl_sample_batch(train=True)
                 train_micro_batch_list = self._offline_rl_microbatches(global_batch)
                 self.qf_optimizer.zero_grad()
@@ -1280,6 +1289,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 critic_q_logged_means.append(float(np.mean(step_q_logged)))
 
             for _ in range(self.offline_rl_actor_updates_per_step):
+                self._apply_training_param_freeze(actor_phase=True, critic_phase=False)
                 global_batch = self._offline_rl_sample_batch(train=True)
                 train_micro_batch_list = self._offline_rl_microbatches(global_batch)
                 self.optimizer.zero_grad()
@@ -2514,18 +2524,22 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
 
         self.model.train()
-        metrics = {
-            "buffer_mix/use_replay_this_step": float(readiness["start_status"]["use_replay"]),
-            "buffer_mix/use_demo_this_step": float(readiness["start_status"]["use_demo"]),
-            "buffer_mix/train_actor": float(train_actor),
-            "buffer_mix/replay_ready": float(readiness["start_status"]["replay_ready"]),
-            "buffer_mix/demo_ready": float(readiness["start_status"]["demo_ready"]),
-            "buffer_mix/replay_required_for_training": float(self.replay_required_for_training),
-            "buffer_mix/allow_train_on_demo_only": float(self.allow_train_on_demo_only),
-            "stage/freeze_actor_updates": float(self.freeze_actor_updates),
-            "stage/freeze_critic_updates": float(self.freeze_critic_updates),
-            "stage/freeze_visual_layers": float(self.freeze_visual_layers),
-        }
+        metrics = {}
+        append_to_dict(
+            metrics,
+            {
+                "buffer_mix/use_replay_this_step": float(readiness["start_status"]["use_replay"]),
+                "buffer_mix/use_demo_this_step": float(readiness["start_status"]["use_demo"]),
+                "buffer_mix/train_actor": float(train_actor),
+                "buffer_mix/replay_ready": float(readiness["start_status"]["replay_ready"]),
+                "buffer_mix/demo_ready": float(readiness["start_status"]["demo_ready"]),
+                "buffer_mix/replay_required_for_training": float(self.replay_required_for_training),
+                "buffer_mix/allow_train_on_demo_only": float(self.allow_train_on_demo_only),
+                "stage/freeze_actor_updates": float(self.freeze_actor_updates),
+                "stage/freeze_critic_updates": float(self.freeze_critic_updates),
+                "stage/freeze_visual_layers": float(self.freeze_visual_layers),
+            },
+        )
 
         update_epoch = self.utd_ratio
         for _ in range(update_epoch):
