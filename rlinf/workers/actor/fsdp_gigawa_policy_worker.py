@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -101,6 +102,24 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.freeze_actor_updates = bool(self.cfg.algorithm.get("freeze_actor_updates", False))
         self.freeze_critic_updates = bool(self.cfg.algorithm.get("freeze_critic_updates", False))
         self.freeze_visual_layers = bool(self.cfg.algorithm.get("freeze_visual_layers", False))
+        actor_bc_guard_cfg = self.cfg.algorithm.get("actor_bc_guard", None) or {}
+        self.actor_bc_guard_mode = str(actor_bc_guard_cfg.get("mode", "none")).lower()
+        self.actor_bc_guard_threshold = float(actor_bc_guard_cfg.get("threshold", 0.004))
+        self.actor_bc_weighted_coef = float(actor_bc_guard_cfg.get("weighted_bc_coef", 50.0))
+        self.actor_bc_penalty_coef = float(actor_bc_guard_cfg.get("hard_penalty_coef", 5000.0))
+        self.actor_bc_penalty_power = float(actor_bc_guard_cfg.get("hard_penalty_power", 1.0))
+        self.actor_bc_trust_region_abs_threshold = float(
+            actor_bc_guard_cfg.get("trust_region_abs_threshold", self.actor_bc_guard_threshold)
+        )
+        self.actor_bc_trust_region_max_increase = float(
+            actor_bc_guard_cfg.get("trust_region_max_increase", 5e-4)
+        )
+        self.actor_bc_trust_region_max_ratio = float(
+            actor_bc_guard_cfg.get("trust_region_max_ratio", 1.15)
+        )
+        self.actor_bc_trust_region_eval_dropout_p = float(
+            actor_bc_guard_cfg.get("trust_region_eval_dropout_p", 0.0)
+        )
 
     # ---------------------------------------------------------------------
     # Init / setup
@@ -2271,6 +2290,76 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "target_q": target_q_values.mean().item(),
         }
 
+    def _compose_actor_loss(self, q_pi: torch.Tensor | None, bc_loss: torch.Tensor):
+        q_term = bc_loss.new_zeros(())
+        q_weight = 1.0
+        effective_bc_coef = float(self.bc_coef)
+        hard_penalty = bc_loss.new_zeros(())
+        guard_active = 0.0
+
+        if q_pi is not None:
+            q_term = (-q_pi).mean()
+
+        if self.actor_bc_guard_mode == "weighted":
+            effective_bc_coef = float(self.actor_bc_weighted_coef)
+        elif self.actor_bc_guard_mode == "hard_penalty":
+            exceed = torch.clamp(bc_loss - self.actor_bc_guard_threshold, min=0.0)
+            if float(exceed.detach().item()) > 0.0:
+                guard_active = 1.0
+            hard_penalty = self.actor_bc_penalty_coef * (exceed ** self.actor_bc_penalty_power)
+
+        actor_loss = q_weight * q_term + effective_bc_coef * bc_loss + hard_penalty
+        metrics = {
+            "bc_coef_effective": effective_bc_coef,
+            "bc_guard_mode": float(
+                0 if self.actor_bc_guard_mode == "none"
+                else 1 if self.actor_bc_guard_mode == "weighted"
+                else 2 if self.actor_bc_guard_mode == "hard_penalty"
+                else 3 if self.actor_bc_guard_mode == "trust_region"
+                else -1
+            ),
+            "bc_guard_threshold": float(self.actor_bc_guard_threshold),
+            "bc_guard_penalty": float(hard_penalty.detach().item()),
+            "bc_guard_active": guard_active,
+            "q_weight": q_weight,
+        }
+        return actor_loss, metrics
+
+    @torch.no_grad()
+    def _compute_mean_bc_loss_on_batches(self, micro_batch_list: list[dict[str, torch.Tensor]]) -> float:
+        policy = self._unwrap_policy(self.model)
+        was_training = self.model.training
+        self.model.eval()
+        losses = []
+        for batch in micro_batch_list:
+            curr_obs = batch["curr_obs"]
+            robot_state = curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype)
+            ref_action = curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype)
+            visual_feat = self._build_visual_feat_for_actor(curr_obs["visual_latent"])
+            pi, _ = self.model(
+                forward_type=ForwardType.DEFAULT,
+                mode="actor",
+                visual_feat=visual_feat,
+                robot_state=robot_state,
+                ref_action=ref_action,
+                ref_action_dropout_p=self.actor_bc_trust_region_eval_dropout_p,
+                use_target=False,
+            )
+            bc_loss = policy.compute_bc_loss(pi, ref_action)
+            losses.append(float(bc_loss.item()))
+        if was_training:
+            self.model.train()
+        return float(np.mean(losses)) if losses else 0.0
+
+    def _snapshot_trainable_params(self):
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        snapshot = [p.detach().clone() for p in params]
+        return params, snapshot
+
+    def _restore_trainable_params(self, params, snapshot) -> None:
+        for p, saved in zip(params, snapshot):
+            p.data.copy_(saved)
+
     @Worker.timer("forward_actor")
     def forward_actor(self, batch, capture_diagnostics: bool = False):
         policy = self._unwrap_policy(self.model)
@@ -2319,7 +2408,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             }
 
         if self.stage_actor_bc_only:
-            actor_loss = self.bc_coef * bc_loss
+            actor_loss, guard_metrics = self._compose_actor_loss(q_pi=None, bc_loss=bc_loss)
+            metrics.update(guard_metrics)
             metrics["q_pi"] = 0.0
             return actor_loss, metrics, debug_bundle
 
@@ -2333,7 +2423,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
         q_pi = torch.minimum(q1_pi, q2_pi)
 
-        actor_loss = (-q_pi).mean() + self.bc_coef * bc_loss
+        actor_loss, guard_metrics = self._compose_actor_loss(q_pi=q_pi, bc_loss=bc_loss)
+        metrics.update(guard_metrics)
         metrics["q_pi"] = q_pi.mean().item()
         return actor_loss, metrics, debug_bundle
 
@@ -2362,6 +2453,14 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "stage/freeze_actor_updates": float(self.freeze_actor_updates),
             "stage/freeze_critic_updates": float(self.freeze_critic_updates),
             "stage/freeze_visual_layers": float(self.freeze_visual_layers),
+            "stage/actor_bc_guard_mode": float(
+                0 if self.actor_bc_guard_mode == "none"
+                else 1 if self.actor_bc_guard_mode == "weighted"
+                else 2 if self.actor_bc_guard_mode == "hard_penalty"
+                else 3 if self.actor_bc_guard_mode == "trust_region"
+                else -1
+            ),
+            "stage/actor_bc_guard_threshold": float(self.actor_bc_guard_threshold),
         }
 
         critic_updated = False
@@ -2412,6 +2511,16 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             all_actor_metrics = {}
             capture_debug_this_update = self._should_capture_action_diagnostics()
             debug_bundle_to_save = None
+            trust_region_mode = self.actor_bc_guard_mode == "trust_region"
+            pre_step_bc_loss = None
+            actor_param_snapshot = None
+            optimizer_snapshot = None
+            if trust_region_mode:
+                pre_step_bc_loss = self._compute_mean_bc_loss_on_batches(train_micro_batch_list)
+                actor_params, actor_param_snapshot = self._snapshot_trainable_params()
+                optimizer_snapshot = copy.deepcopy(self.optimizer.state_dict())
+            else:
+                actor_params = None
             for batch_idx, batch in enumerate(train_micro_batch_list):
                 actor_loss, actor_metrics, debug_bundle = self.forward_actor(
                     batch,
@@ -2428,10 +2537,28 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 max_norm=self.cfg.actor.optim.clip_grad
             )
             self.optimizer.step()
-            self.lr_scheduler.step()
-            actor_updated = True
-            self.actor_update_step += 1
-            if debug_bundle_to_save is not None:
+
+            trust_region_rejected = False
+            post_step_bc_loss = None
+            if trust_region_mode:
+                post_step_bc_loss = self._compute_mean_bc_loss_on_batches(train_micro_batch_list)
+                bc_abs_ok = post_step_bc_loss <= self.actor_bc_trust_region_abs_threshold
+                bc_delta_ok = post_step_bc_loss <= (pre_step_bc_loss + self.actor_bc_trust_region_max_increase)
+                trust_region_rejected = not (bc_abs_ok and bc_delta_ok)
+                if trust_region_rejected:
+                    self._restore_trainable_params(actor_params, actor_param_snapshot)
+                    self.optimizer.load_state_dict(optimizer_snapshot)
+                    self.optimizer.zero_grad()
+                else:
+                    self.lr_scheduler.step()
+                    actor_updated = True
+                    self.actor_update_step += 1
+            else:
+                self.lr_scheduler.step()
+                actor_updated = True
+                self.actor_update_step += 1
+
+            if debug_bundle_to_save is not None and actor_updated:
                 metrics_data.update(self._save_action_diagnostics(debug_bundle_to_save))
             metrics_data.update(
                 {
@@ -2441,6 +2568,17 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     **all_actor_metrics,
                 }
             )
+            if trust_region_mode:
+                metrics_data.update(
+                    {
+                        "actor/trust_region_bc_before": float(pre_step_bc_loss),
+                        "actor/trust_region_bc_after": float(post_step_bc_loss),
+                        "actor/trust_region_abs_threshold": float(self.actor_bc_trust_region_abs_threshold),
+                        "actor/trust_region_max_increase": float(self.actor_bc_trust_region_max_increase),
+                        "actor/trust_region_max_ratio": float(self.actor_bc_trust_region_max_ratio),
+                        "actor/trust_region_rejected": float(trust_region_rejected),
+                    }
+                )
         elif self.stage_freeze_actor or self.freeze_actor_updates:
             metrics_data.update({"gigawa/actor_frozen": 1.0})
 
