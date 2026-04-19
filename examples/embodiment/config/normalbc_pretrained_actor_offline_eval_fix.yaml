@@ -13,12 +13,12 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor, env, rollout: 4-7
+    actor, env, rollout: 0-3
 
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_rl_pretrain_mergeall_12chunk_fix/eval"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall_12chunk_fix_ealystop_0.5drop/robotwin_train_giga_world_policy/checkpoints/global_step_860"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -30,7 +30,7 @@ runner:
   val_check_interval: 200
   save_interval: 200
 
-  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_rl_pretrain_mergeall_12chunk_fix/robotwin_train_giga_world_policy/checkpoints/global_step_1760
+  resume_dir: ${runner.logger.log_path}
   ckpt_path: null
   resume_load_optimizer_and_scheduler_state: false
 

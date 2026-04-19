@@ -273,16 +273,22 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             if demo_cfg.get("load_path", None) is not None:
                 demo_load_path = demo_cfg.load_path
                 rank_shard_path = os.path.join(demo_load_path, f"rank_{self._rank}")
-                if os.path.exists(os.path.join(demo_load_path, "metadata.json")):
+
+                root_metadata_path = os.path.join(demo_load_path, "metadata.json")
+                root_index_path = os.path.join(demo_load_path, "trajectory_index.json")
+                rank_metadata_path = os.path.join(rank_shard_path, "metadata.json")
+                rank_index_path = os.path.join(rank_shard_path, "trajectory_index.json")
+
+                if os.path.exists(rank_metadata_path) and os.path.exists(rank_index_path):
+                    # Preferred: repaired / sharded buffer layout.
+                    self.demo_buffer.load_checkpoint(
+                        rank_shard_path,
+                        is_distributed=False,
+                    )
+                elif os.path.exists(root_metadata_path) and os.path.exists(root_index_path):
                     # Single-shard checkpoint root.
                     self.demo_buffer.load_checkpoint(
                         demo_load_path,
-                        is_distributed=False,
-                    )
-                elif os.path.exists(os.path.join(rank_shard_path, "metadata.json")):
-                    # Resharded distributed layout: root/rank_i/metadata.json
-                    self.demo_buffer.load_checkpoint(
-                        rank_shard_path,
                         is_distributed=False,
                     )
                 else:
