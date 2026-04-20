@@ -73,9 +73,9 @@ python train_embodied_agent_gigawa_offline_critic_fast.py \
 
 python train_embodied_agent_gigawa_offline_rl_fast.py \
   --config-path ./config \
-  --config-name offline_critic_pretrain_mergeall_12chunk_fast
+  --config-name offline_rl_pretrain_mergeall_12chunk_fix_fast
 
-tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/bc_guard_weighted \
+tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall_12chunk_fast_420 \
   --host 0.0.0.0 \
   --port 6006
 

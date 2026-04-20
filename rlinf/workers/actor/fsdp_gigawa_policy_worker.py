@@ -1906,6 +1906,173 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             )
         return effective_len
 
+    def _infer_traj_batch_size(self, traj: Trajectory) -> int:
+        for tensor in [traj.actions, traj.rewards, traj.terminations, traj.truncations, traj.dones, traj.prev_logprobs, traj.prev_values, traj.versions]:
+            if isinstance(tensor, torch.Tensor) and tensor.ndim >= 2:
+                return int(tensor.shape[1])
+        if isinstance(traj.curr_obs, dict):
+            for value in traj.curr_obs.values():
+                if isinstance(value, torch.Tensor) and value.ndim >= 2:
+                    return int(value.shape[1])
+        if isinstance(traj.next_obs, dict):
+            for value in traj.next_obs.values():
+                if isinstance(value, torch.Tensor) and value.ndim >= 2:
+                    return int(value.shape[1])
+        return 1
+
+    def _select_batch_sample(self, x: Any, batch_idx: int, batch_size: int) -> Any:
+        if isinstance(x, torch.Tensor):
+            if x.ndim >= 2 and x.shape[1] == batch_size:
+                return x[:, batch_idx : batch_idx + 1].clone()
+            return x.clone()
+        if isinstance(x, dict):
+            return {k: self._select_batch_sample(v, batch_idx, batch_size) for k, v in x.items()}
+        return copy.deepcopy(x)
+
+    def _narrow_time_dim(self, x: Any, end_t: int) -> Any:
+        if isinstance(x, torch.Tensor):
+            if x.ndim >= 1:
+                return x[:end_t].clone()
+            return x.clone()
+        if isinstance(x, dict):
+            return {k: self._narrow_time_dim(v, end_t) for k, v in x.items()}
+        return copy.deepcopy(x)
+
+    def _pad_terminal_chunk_action_tensor(
+        self,
+        x: torch.Tensor,
+        chunk_idx: int,
+        step_idx: int,
+    ) -> torch.Tensor:
+        y = x.clone()
+        if y.ndim < 2 or y.shape[0] <= chunk_idx or y.shape[1] != 1:
+            return y
+
+        chunk = y[chunk_idx, 0]
+        action_chunk = int(self.cfg.actor.model.get("num_action_chunks", 1))
+        if chunk.ndim == 1:
+            if chunk.numel() % action_chunk != 0:
+                return y
+            per_step = chunk.numel() // action_chunk
+            view = chunk.view(action_chunk, per_step).clone()
+            if step_idx + 1 < action_chunk:
+                view[step_idx + 1 :] = view[step_idx].unsqueeze(0).expand(
+                    action_chunk - step_idx - 1, per_step
+                )
+            y[chunk_idx, 0] = view.reshape_as(chunk)
+            return y
+
+        if chunk.ndim >= 2 and chunk.shape[0] == action_chunk:
+            if step_idx + 1 < action_chunk:
+                view = chunk.clone()
+                view[step_idx + 1 :] = view[step_idx].unsqueeze(0).expand_as(
+                    view[step_idx + 1 :]
+                )
+                y[chunk_idx, 0] = view
+        return y
+
+    def _find_first_terminal_position(
+        self,
+        traj: Trajectory,
+    ) -> tuple[int | None, int | None, str]:
+        term = traj.terminations[:, 0] if traj.terminations is not None else None
+        done = traj.dones[:, 0] if traj.dones is not None else None
+        rew = traj.rewards[:, 0] if traj.rewards is not None else None
+
+        if term is not None:
+            pos = torch.nonzero(term.to(torch.bool), as_tuple=False)
+            if pos.numel() > 0:
+                return int(pos[0, 0].item()), int(pos[0, 1].item()), "termination"
+        if done is not None:
+            pos = torch.nonzero(done.to(torch.bool), as_tuple=False)
+            if pos.numel() > 0:
+                return int(pos[0, 0].item()), int(pos[0, 1].item()), "done"
+        if rew is not None:
+            pos = torch.nonzero(rew != 0, as_tuple=False)
+            if pos.numel() > 0:
+                return int(pos[0, 0].item()), int(pos[0, 1].item()), "reward"
+        return None, None, "none"
+
+    def _sanitize_single_sample_trajectory(self, traj: Trajectory) -> Trajectory:
+        tc, ts, _ = self._find_first_terminal_position(traj)
+        if tc is None or ts is None:
+            return traj
+
+        end_t = tc + 1
+        repaired = Trajectory(
+            max_episode_length=traj.max_episode_length,
+            model_weights_id=traj.model_weights_id,
+            actions=self._narrow_time_dim(traj.actions, end_t) if traj.actions is not None else None,
+            intervene_flags=self._narrow_time_dim(traj.intervene_flags, end_t) if traj.intervene_flags is not None else None,
+            rewards=self._narrow_time_dim(traj.rewards, end_t) if traj.rewards is not None else None,
+            terminations=self._narrow_time_dim(traj.terminations, end_t) if traj.terminations is not None else None,
+            truncations=self._narrow_time_dim(traj.truncations, end_t) if traj.truncations is not None else None,
+            dones=self._narrow_time_dim(traj.dones, end_t) if traj.dones is not None else None,
+            prev_logprobs=self._narrow_time_dim(traj.prev_logprobs, end_t) if traj.prev_logprobs is not None else None,
+            prev_values=self._narrow_time_dim(traj.prev_values, end_t) if traj.prev_values is not None else None,
+            versions=self._narrow_time_dim(traj.versions, end_t) if traj.versions is not None else None,
+            forward_inputs=self._narrow_time_dim(traj.forward_inputs, end_t) if traj.forward_inputs else {},
+            curr_obs=self._narrow_time_dim(traj.curr_obs, end_t) if traj.curr_obs else {},
+            next_obs=self._narrow_time_dim(traj.next_obs, end_t) if traj.next_obs else {},
+        )
+
+        if repaired.actions is not None:
+            repaired.actions = self._pad_terminal_chunk_action_tensor(repaired.actions, tc, ts)
+        if repaired.forward_inputs:
+            for key in list(repaired.forward_inputs.keys()):
+                if key in {"action", "model_action", "ref_action"} and isinstance(repaired.forward_inputs[key], torch.Tensor):
+                    repaired.forward_inputs[key] = self._pad_terminal_chunk_action_tensor(
+                        repaired.forward_inputs[key], tc, ts
+                    )
+        if repaired.curr_obs and "ref_action" in repaired.curr_obs and isinstance(repaired.curr_obs["ref_action"], torch.Tensor):
+            repaired.curr_obs["ref_action"] = self._pad_terminal_chunk_action_tensor(
+                repaired.curr_obs["ref_action"], tc, ts
+            )
+        if repaired.next_obs and "ref_action" in repaired.next_obs and isinstance(repaired.next_obs["ref_action"], torch.Tensor):
+            repaired.next_obs["ref_action"] = self._pad_terminal_chunk_action_tensor(
+                repaired.next_obs["ref_action"], tc, ts
+            )
+
+        action_chunk = int(self.cfg.actor.model.get("num_action_chunks", 1))
+        if repaired.rewards is not None:
+            repaired.rewards = repaired.rewards.clone()
+            if ts + 1 < action_chunk:
+                repaired.rewards[tc, 0, ts + 1 :] = 0
+        if repaired.dones is not None:
+            repaired.dones = repaired.dones.to(torch.bool).clone()
+            repaired.dones[tc, 0, ts:] = True
+        if repaired.terminations is not None:
+            repaired.terminations = repaired.terminations.to(torch.bool).clone()
+            repaired.terminations[tc, 0, ts:] = True
+        if repaired.truncations is not None:
+            repaired.truncations = repaired.truncations.to(torch.bool).clone()
+            repaired.truncations[tc, 0, ts:] = False
+
+        return repaired
+
+    def _split_and_sanitize_trajectory(self, traj: Trajectory) -> list[Trajectory]:
+        batch_size = self._infer_traj_batch_size(traj)
+        sanitized = []
+        for batch_idx in range(batch_size):
+            sample = Trajectory(
+                max_episode_length=traj.max_episode_length,
+                model_weights_id=traj.model_weights_id,
+                actions=self._select_batch_sample(traj.actions, batch_idx, batch_size) if traj.actions is not None else None,
+                intervene_flags=self._select_batch_sample(traj.intervene_flags, batch_idx, batch_size) if traj.intervene_flags is not None else None,
+                rewards=self._select_batch_sample(traj.rewards, batch_idx, batch_size) if traj.rewards is not None else None,
+                terminations=self._select_batch_sample(traj.terminations, batch_idx, batch_size) if traj.terminations is not None else None,
+                truncations=self._select_batch_sample(traj.truncations, batch_idx, batch_size) if traj.truncations is not None else None,
+                dones=self._select_batch_sample(traj.dones, batch_idx, batch_size) if traj.dones is not None else None,
+                prev_logprobs=self._select_batch_sample(traj.prev_logprobs, batch_idx, batch_size) if traj.prev_logprobs is not None else None,
+                prev_values=self._select_batch_sample(traj.prev_values, batch_idx, batch_size) if traj.prev_values is not None else None,
+                versions=self._select_batch_sample(traj.versions, batch_idx, batch_size) if traj.versions is not None else None,
+                forward_inputs=self._select_batch_sample(traj.forward_inputs, batch_idx, batch_size) if traj.forward_inputs else {},
+                curr_obs=self._select_batch_sample(traj.curr_obs, batch_idx, batch_size) if traj.curr_obs else {},
+                next_obs=self._select_batch_sample(traj.next_obs, batch_idx, batch_size) if traj.next_obs else {},
+            )
+            sanitized.append(self._sanitize_single_sample_trajectory(sample))
+        return sanitized
+
     def _slice_obs_dict(self, obs: dict[str, Any], traj_len: int) -> dict[str, Any]:
         out = {}
         for k, v in obs.items():
@@ -2194,9 +2361,13 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
     @torch.no_grad()
     def _convert_trajectory_for_gigawa(self, traj: Trajectory) -> list[Trajectory]:
-        if self.sliding_window_enable and self._has_chunk_step_obs_seq(traj):
-            return self._convert_sliding_window_trajectories_for_gigawa(traj)
-        return [self._convert_standard_trajectory_for_gigawa(traj)]
+        converted = []
+        for sample_traj in self._split_and_sanitize_trajectory(traj):
+            if self.sliding_window_enable and self._has_chunk_step_obs_seq(sample_traj):
+                converted.extend(self._convert_sliding_window_trajectories_for_gigawa(sample_traj))
+            else:
+                converted.append(self._convert_standard_trajectory_for_gigawa(sample_traj))
+        return converted
 
     # ---------------------------------------------------------------------
     # Replay ingestion
