@@ -507,6 +507,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             row = {
                 "collection_index": int(self.offline_collection_num_received),
                 "rank": int(self._rank),
+                "trajectory_name": str(getattr(traj, "trajectory_name", "")),
+                "source_rank": int(getattr(traj, "source_rank", -1)),
+                "source_episode_index": int(getattr(traj, "source_episode_index", -1)),
+                "source_env_local_index": int(getattr(traj, "source_env_local_index", -1)),
+                "sliding_offset": int(getattr(traj, "sliding_offset", 0)),
                 "model_weights_id": str(traj.model_weights_id),
                 **quality,
             }
@@ -2002,6 +2007,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         repaired = Trajectory(
             max_episode_length=traj.max_episode_length,
             model_weights_id=traj.model_weights_id,
+            trajectory_name=traj.trajectory_name,
+            source_rank=traj.source_rank,
+            source_episode_index=traj.source_episode_index,
+            source_env_local_index=traj.source_env_local_index,
+            sliding_offset=traj.sliding_offset,
             actions=self._narrow_time_dim(traj.actions, end_t) if traj.actions is not None else None,
             intervene_flags=self._narrow_time_dim(traj.intervene_flags, end_t) if traj.intervene_flags is not None else None,
             rewards=self._narrow_time_dim(traj.rewards, end_t) if traj.rewards is not None else None,
@@ -2050,6 +2060,49 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         return repaired
 
+    def _extract_scalar_metadata_from_obs(self, obs: dict[str, Any], key: str, default: int = -1) -> int:
+        if not isinstance(obs, dict) or key not in obs:
+            return default
+        value = obs[key]
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return default
+            return int(value.reshape(-1)[0].item())
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return default
+            return int(value.reshape(-1)[0].item())
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                return default
+            return int(value[0])
+        if value is None:
+            return default
+        return int(value)
+
+    def _build_base_trajectory_name(self, traj: Trajectory) -> str:
+        source_rank = getattr(traj, "source_rank", -1)
+        source_episode_index = getattr(traj, "source_episode_index", -1)
+        if source_rank >= 0 and source_episode_index >= 0:
+            return f"rank{source_rank}_{source_episode_index}"
+        return ""
+
+    def _attach_source_metadata(self, traj: Trajectory) -> Trajectory:
+        if getattr(traj, "source_rank", -1) >= 0 and getattr(traj, "source_episode_index", -1) >= 0:
+            if not getattr(traj, "trajectory_name", ""):
+                traj.trajectory_name = self._build_base_trajectory_name(traj)
+            return traj
+
+        source_rank = self._extract_scalar_metadata_from_obs(traj.curr_obs, "_meta_source_rank", default=self._rank)
+        source_episode_index = self._extract_scalar_metadata_from_obs(traj.curr_obs, "_meta_episode_index", default=-1)
+        source_env_local_index = self._extract_scalar_metadata_from_obs(traj.curr_obs, "_meta_env_local_index", default=-1)
+        traj.source_rank = source_rank
+        traj.source_episode_index = source_episode_index
+        traj.source_env_local_index = source_env_local_index
+        if not getattr(traj, "trajectory_name", ""):
+            traj.trajectory_name = self._build_base_trajectory_name(traj)
+        return traj
+
     def _split_and_sanitize_trajectory(self, traj: Trajectory) -> list[Trajectory]:
         batch_size = self._infer_traj_batch_size(traj)
         sanitized = []
@@ -2057,6 +2110,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             sample = Trajectory(
                 max_episode_length=traj.max_episode_length,
                 model_weights_id=traj.model_weights_id,
+                trajectory_name=traj.trajectory_name,
+                source_rank=traj.source_rank,
+                source_episode_index=traj.source_episode_index,
+                source_env_local_index=traj.source_env_local_index,
+                sliding_offset=traj.sliding_offset,
                 actions=self._select_batch_sample(traj.actions, batch_idx, batch_size) if traj.actions is not None else None,
                 intervene_flags=self._select_batch_sample(traj.intervene_flags, batch_idx, batch_size) if traj.intervene_flags is not None else None,
                 rewards=self._select_batch_sample(traj.rewards, batch_idx, batch_size) if traj.rewards is not None else None,
@@ -2070,7 +2128,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 curr_obs=self._select_batch_sample(traj.curr_obs, batch_idx, batch_size) if traj.curr_obs else {},
                 next_obs=self._select_batch_sample(traj.next_obs, batch_idx, batch_size) if traj.next_obs else {},
             )
-            sanitized.append(self._sanitize_single_sample_trajectory(sample))
+            sanitized.append(self._sanitize_single_sample_trajectory(self._attach_source_metadata(sample)))
         return sanitized
 
     def _slice_obs_dict(self, obs: dict[str, Any], traj_len: int) -> dict[str, Any]:
@@ -2115,6 +2173,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         return Trajectory(
             max_episode_length=traj.max_episode_length,
             model_weights_id=traj.model_weights_id,
+            trajectory_name=traj.trajectory_name or self._build_base_trajectory_name(traj),
+            source_rank=traj.source_rank,
+            source_episode_index=traj.source_episode_index,
+            source_env_local_index=traj.source_env_local_index,
+            sliding_offset=0,
             actions=source_actions.cpu().contiguous(),
             intervene_flags=traj.intervene_flags[:traj_len].cpu().contiguous() if traj.intervene_flags is not None else None,
             rewards=traj.rewards[:traj_len].cpu().contiguous() if traj.rewards is not None else None,
@@ -2330,10 +2393,19 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             version_source = versions[source_chunk_index_tensor].cpu().contiguous() if versions is not None else None
             value_source = prev_values[source_chunk_index_tensor].cpu().contiguous() if prev_values is not None else None
 
+            slide_name = traj.trajectory_name or self._build_base_trajectory_name(traj)
+            if offset > 0 and slide_name:
+                slide_name = f"{slide_name}_slide{offset}"
+
             converted_trajectories.append(
                 Trajectory(
                     max_episode_length=traj.max_episode_length,
                     model_weights_id=traj.model_weights_id,
+                    trajectory_name=slide_name,
+                    source_rank=traj.source_rank,
+                    source_episode_index=traj.source_episode_index,
+                    source_env_local_index=traj.source_env_local_index,
+                    sliding_offset=int(offset),
                     actions=torch.stack(window_actions, dim=0),
                     intervene_flags=torch.stack(window_intervene, dim=0) if window_intervene is not None else None,
                     rewards=torch.stack(window_rewards, dim=0) if primitive_rewards is not None else None,

@@ -383,6 +383,11 @@ class Trajectory:
 
     max_episode_length: int = 0  # max episode length
     model_weights_id: str = ""  # str(uuid(versions))
+    trajectory_name: str = ""
+    source_rank: int = -1
+    source_episode_index: int = -1
+    source_env_local_index: int = -1
+    sliding_offset: int = 0
     actions: torch.Tensor = None
     intervene_flags: torch.Tensor = None
     rewards: torch.Tensor = None
@@ -492,6 +497,11 @@ class Trajectory:
                 Trajectory(
                     max_episode_length=self.max_episode_length,
                     model_weights_id=self.model_weights_id,
+                    trajectory_name=self.trajectory_name,
+                    source_rank=self.source_rank,
+                    source_episode_index=self.source_episode_index,
+                    source_env_local_index=self.source_env_local_index,
+                    sliding_offset=self.sliding_offset,
                     actions=actions,
                     intervene_flags=intervene_flags,
                     rewards=rewards,

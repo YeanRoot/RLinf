@@ -17,23 +17,22 @@ cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodime
 
 conda activate pi-rl-h20
 
-eval_test.py
-cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
-CUDA_VISIBLE_DEVICES=0,1,2,3 python eval_embodied_agent.py   --config-path ./config   --config-name robotwin_place_empty_cup_eval_giga_world_policy_eval   env.eval.total_num_envs=4   algorithm.eval_rollout_epoch=5
+
+python collect_embodied_agent_gigawa.py \
+  --config-path ./config \
+  --config-name collect_cup_data_fix
 
 train
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
 python train_embodied_agent_gigawa.py   --config-path ./config   --config-name online_exp_bc_guard_weighted  ++actor.fsdp_config.use_orig_params=true
 
-cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
-python train_embodied_agent_gigawa.py   --config-path ./config   --config-name normalbc_pretrained_actor_full_rl  ++actor.fsdp_config.use_orig_params=true
-
-cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
-python collect_embodied_agent_gigawa.py \
+eval:
+python train_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name collect_cup_data_fix
+  --config-name normalbc_pretrained_actor_offline_eval_fix \
+  ++actor.fsdp_config.use_orig_params=true
 
-cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
+
 python reshard_offline_collection.py \
   --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect4_12chunk_fix/offline_collection \
   --bucket failure \
@@ -42,30 +41,11 @@ python reshard_offline_collection.py \
   --shuffle \
   --source-cache-size 2048
 
-cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
-  python train_embodied_agent_gigawa_offline_bc.py \
+
+python train_embodied_agent_gigawa_offline_bc.py \
   --config-path ./config \
   --config-name offline_bc_pretrain_mergeall
 
-python train_embodied_agent_gigawa.py \
-  --config-path ./config \
-  --config-name normalbc_pretrained_actor_full_rl_fix \
-  ++actor.fsdp_config.use_orig_params=true
-
-python train_embodied_agent_gigawa_offline_critic.py\
-  --config-path ./config \
-  --config-name offline_critic_pretrain_mergeall_12chunk \
-  ++actor.fsdp_config.use_orig_params=true
-
-python train_embodied_agent_gigawa_offline_rl.py \
-  --config-path ./config \
-  --config-name offline_rl_pretrain_mergeall_12chunk_fix \
-  ++actor.fsdp_config.use_orig_params=true
-
-python train_embodied_agent_gigawa.py \
-  --config-path ./config \
-  --config-name normalbc_pretrained_actor_offline_eval_fix \
-  ++actor.fsdp_config.use_orig_params=true
 
 python train_embodied_agent_gigawa_offline_critic_fast.py \
   --config-path ./config \

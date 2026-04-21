@@ -336,10 +336,13 @@ class TrajectoryReplayBuffer:
         trajectory_id: int,
         model_weights_id: str,
         base_dir: Optional[str] = None,
+        storage_name: Optional[str] = None,
     ) -> str:
         """Get file path for a trajectory."""
         ext = ".pt" if self.trajectory_format == "pt" else ".pkl"
         base_dir = base_dir or self.auto_save_path
+        if storage_name:
+            return os.path.join(base_dir, f"{storage_name}{ext}")
         return os.path.join(
             base_dir, f"trajectory_{trajectory_id}_{model_weights_id}{ext}"
         )
@@ -384,10 +387,11 @@ class TrajectoryReplayBuffer:
         trajectory_id: int,
         model_weights_id: str,
         save_dir: Optional[str] = None,
+        storage_name: Optional[str] = None,
     ):
         """Save a single episode to disk as a dictionary."""
         trajectory_path = self._get_trajectory_path(
-            trajectory_id, model_weights_id, base_dir=save_dir
+            trajectory_id, model_weights_id, base_dir=save_dir, storage_name=storage_name
         )
 
         # Convert Trajectory to dictionary for more stable storage
@@ -416,6 +420,7 @@ class TrajectoryReplayBuffer:
             trajectory_id,
             model_weights_id,
             base_dir=self._trajectory_file_path[trajectory_id],
+            storage_name=trajectory_info.get("storage_name"),
         )
 
         if not os.path.exists(trajectory_path):
@@ -453,6 +458,7 @@ class TrajectoryReplayBuffer:
         for trajectory in trajectories:
             model_weights_id = trajectory.model_weights_id
             trajectory_id = self._trajectory_counter
+            storage_name = str(getattr(trajectory, "trajectory_name", "") or "")
 
             # Calculate total samples: T * B
             if trajectory.prev_logprobs is not None:
@@ -475,6 +481,8 @@ class TrajectoryReplayBuffer:
                         trajectory,
                         trajectory_id,
                         model_weights_id,
+                        None,
+                        storage_name if storage_name else None,
                     )
                 )
                 self._trajectory_file_path[trajectory_id] = self.auto_save_path
@@ -487,6 +495,12 @@ class TrajectoryReplayBuffer:
                     "max_episode_length": trajectory.max_episode_length,
                     "shape": tuple(trajectory_shape),
                     "model_weights_id": model_weights_id,
+                    "storage_name": storage_name,
+                    "trajectory_name": str(getattr(trajectory, "trajectory_name", "")),
+                    "source_rank": int(getattr(trajectory, "source_rank", -1)),
+                    "source_episode_index": int(getattr(trajectory, "source_episode_index", -1)),
+                    "source_env_local_index": int(getattr(trajectory, "source_env_local_index", -1)),
+                    "sliding_offset": int(getattr(trajectory, "sliding_offset", 0)),
                 }
                 self._trajectory_index[trajectory_id] = trajectory_info
                 self._trajectory_id_list.append(trajectory_id)

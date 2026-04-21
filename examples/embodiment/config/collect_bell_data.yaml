@@ -1,6 +1,6 @@
 defaults:
-  - env/robotwin_place_empty_cup@env.train
-  - env/robotwin_place_empty_cup@env.eval
+  - env/robotwin_click_bell@env.train
+  - env/robotwin_click_bell@env.eval
   - model/giga_world_policy@actor.model
   - override hydra/job_logging: stdout
   - _self_
@@ -18,7 +18,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_cup"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell2"
     project_name: rlinf
     experiment_name: "robotwin_collect_gigawa_offline"
     logger_backends: ["tensorboard"]

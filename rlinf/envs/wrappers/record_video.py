@@ -84,6 +84,101 @@ class RecordVideo(gym.Wrapper):
         else:
             self._fps = self._get_fps_from_env(env)
 
+        self._source_rank = int(getattr(env, "seed_offset", 0))
+        self._next_episode_index = 0
+        self._episode_indices = np.full(self._num_envs, -1, dtype=np.int64)
+        self._episode_chunk_indices = np.zeros(self._num_envs, dtype=np.int64)
+        self._episode_reward_chunk_indices = np.full(self._num_envs, -1, dtype=np.int64)
+        self._episode_done_chunk_indices = np.full(self._num_envs, -1, dtype=np.int64)
+        self._ensure_episode_state_initialized()
+
+
+    def _ensure_episode_state_initialized(self) -> None:
+        for env_id in range(self._num_envs):
+            if int(self._episode_indices[env_id]) < 0:
+                self._start_new_episode(env_id)
+
+    def _start_new_episode(self, env_id: int) -> None:
+        episode_index = int(self._next_episode_index)
+        self._next_episode_index += 1
+        self._episode_indices[env_id] = episode_index
+        self._episode_chunk_indices[env_id] = 0
+        self._episode_reward_chunk_indices[env_id] = -1
+        self._episode_done_chunk_indices[env_id] = -1
+
+    def _current_trajectory_names(self) -> list[str]:
+        return [
+            f"rank{self._source_rank}_{int(ep_idx)}"
+            for ep_idx in self._episode_indices.tolist()
+        ]
+
+    def _make_meta_tensor(self, values: np.ndarray | list[int]) -> Any:
+        arr = np.asarray(values, dtype=np.int64)
+        if torch is not None:
+            return torch.as_tensor(arr, dtype=torch.long)
+        return arr
+
+    def _augment_obs_with_metadata(self, obs: Any) -> Any:
+        if not isinstance(obs, dict):
+            return obs
+        augmented = dict(obs)
+        augmented["_meta_source_rank"] = self._make_meta_tensor(
+            np.full(self._num_envs, self._source_rank, dtype=np.int64)
+        )
+        augmented["_meta_episode_index"] = self._make_meta_tensor(self._episode_indices)
+        augmented["_meta_env_local_index"] = self._make_meta_tensor(np.arange(self._num_envs, dtype=np.int64))
+        return augmented
+
+    def _build_overlay_arrays(self) -> dict[str, Any]:
+        return {
+            "trajectory_name": self._current_trajectory_names(),
+            "current_chunk": self._episode_chunk_indices.tolist(),
+            "reward_chunk": self._episode_reward_chunk_indices.tolist(),
+            "done_chunk": self._episode_done_chunk_indices.tolist(),
+        }
+
+    def _merge_overlay_info(self, info: Any) -> Any:
+        overlay = self._build_overlay_arrays()
+        if isinstance(info, dict):
+            merged = dict(info)
+            merged.update(overlay)
+            return merged
+        return overlay
+
+    def _maybe_mark_reward_done_chunks(self, rewards: Any, terminations: Any) -> None:
+        for env_id in range(self._num_envs):
+            current_chunk = int(self._episode_chunk_indices[env_id])
+            reward_value = self._value_for_env(rewards, env_id)
+            reward_hit = False
+            if reward_value is not None:
+                reward_arr = np.asarray(reward_value)
+                if reward_arr.size > 0:
+                    reward_hit = bool(np.any(reward_arr != 0))
+            if reward_hit and int(self._episode_reward_chunk_indices[env_id]) < 0:
+                self._episode_reward_chunk_indices[env_id] = current_chunk
+
+            term_value = self._value_for_env(terminations, env_id)
+            done_hit = False
+            if term_value is not None:
+                term_arr = np.asarray(term_value).astype(bool)
+                if term_arr.size > 0:
+                    done_hit = bool(np.any(term_arr))
+            if done_hit and int(self._episode_done_chunk_indices[env_id]) < 0:
+                self._episode_done_chunk_indices[env_id] = current_chunk
+
+    def _advance_episode_counters(self, terminations: Any) -> None:
+        for env_id in range(self._num_envs):
+            term_value = self._value_for_env(terminations, env_id)
+            done_hit = False
+            if term_value is not None:
+                term_arr = np.asarray(term_value).astype(bool)
+                if term_arr.size > 0:
+                    done_hit = bool(np.any(term_arr))
+            if done_hit:
+                self._start_new_episode(env_id)
+            else:
+                self._episode_chunk_indices[env_id] += 1
+
     @property
     def is_start(self):
         return getattr(self.env, "is_start")
@@ -267,6 +362,19 @@ class RecordVideo(gym.Wrapper):
         """Build a per-env info dict for overlay."""
         info_item: dict[str, Any] = {}
 
+        if infos is not None:
+            for key in ("trajectory_name", "current_chunk", "reward_chunk", "done_chunk"):
+                value = self._lookup_info_value(infos, key)
+                if value is None:
+                    continue
+                value = self._value_for_env(value, env_id)
+                if isinstance(value, np.ndarray):
+                    if value.shape == ():
+                        value = value.item()
+                    elif value.size == 1:
+                        value = value.reshape(-1)[0].item()
+                info_item[key] = value
+
         if rewards is not None:
             value = self._value_for_env(rewards, env_id)
             if time_idx is not None and isinstance(value, (np.ndarray, list, tuple)):
@@ -292,7 +400,7 @@ class RecordVideo(gym.Wrapper):
                         value = value.item()
                     elif value.size == 1:
                         value = value.reshape(-1)[0].item()
-                elif isinstance(value, numbers.Number):
+                elif isinstance(value, (numbers.Number, str, bool)):
                     pass
                 else:
                     warnings.warn(f"Unsupported value type {type(value)} for key {key}")
@@ -357,6 +465,9 @@ class RecordVideo(gym.Wrapper):
     def reset(self, *args, **kwargs):
         """Reset env and record the initial frame."""
         obs, info = self.env.reset(*args, **kwargs)
+        self._ensure_episode_state_initialized()
+        obs = self._augment_obs_with_metadata(obs)
+        info = self._merge_overlay_info(info)
         self.add_new_frames(obs, info)
         return obs, info
 
@@ -368,7 +479,11 @@ class RecordVideo(gym.Wrapper):
             if isinstance(info, dict)
             else terminated
         )
+        self._maybe_mark_reward_done_chunks(reward, terminations)
+        info = self._merge_overlay_info(info)
+        obs = self._augment_obs_with_metadata(obs)
         self.add_new_frames(obs, info, reward, terminations)
+        self._advance_episode_counters(terminations)
         return obs, reward, terminated, truncated, info
 
     def chunk_step(self, *args, **kwargs):
@@ -376,6 +491,11 @@ class RecordVideo(gym.Wrapper):
         result = self.env.chunk_step(*args, **kwargs)
         if isinstance(result, tuple) and len(result) >= 5:
             obs_list, rewards, terminations, _truncations, infos_list = result[:5]
+            if isinstance(obs_list, list):
+                obs_list = [self._augment_obs_with_metadata(obs) for obs in obs_list]
+            elif isinstance(obs_list, tuple):
+                obs_list = [self._augment_obs_with_metadata(obs) for obs in obs_list]
+            self._maybe_mark_reward_done_chunks(rewards, terminations)
             final_obs = None
             last_info = None
             if isinstance(infos_list, (list, tuple)) and len(infos_list) > 0:
@@ -386,6 +506,11 @@ class RecordVideo(gym.Wrapper):
                     elif last_info.get("final_observation") is not None:
                         final_obs = last_info["final_observation"]
 
+            if isinstance(infos_list, (list, tuple)):
+                infos_list = [self._merge_overlay_info(info) for info in infos_list]
+            elif infos_list is not None:
+                infos_list = self._merge_overlay_info(infos_list)
+
             if (
                 final_obs is not None
                 and isinstance(obs_list, (list, tuple))
@@ -393,16 +518,30 @@ class RecordVideo(gym.Wrapper):
             ):
                 reset_obs = obs_list[-1]
                 obs_main = list(obs_list)
-                obs_main[-1] = final_obs
+                obs_main[-1] = self._augment_obs_with_metadata(final_obs)
                 infos_main = (
                     list(infos_list)
                     if isinstance(infos_list, (list, tuple))
                     else infos_list
                 )
                 self.add_new_frames(obs_main, infos_main, rewards, terminations)
-                self.add_new_frames(reset_obs, None)
+                self._advance_episode_counters(terminations)
+                reset_obs = self._augment_obs_with_metadata(reset_obs)
+                obs_list[-1] = reset_obs
+                self.add_new_frames(reset_obs, self._merge_overlay_info(None))
+                if isinstance(infos_list, list) and len(infos_list) > 0 and isinstance(infos_list[-1], dict):
+                    infos_list[-1]["final_observation"] = obs_main[-1]
+                    if "final_obs" in infos_list[-1]:
+                        infos_list[-1]["final_obs"] = obs_main[-1]
             else:
-                self.add_new_frames(obs_list, infos_list, rewards, terminations)
+                obs_for_video = obs_list
+                if isinstance(obs_list, dict):
+                    obs_for_video = self._augment_obs_with_metadata(obs_list)
+                    obs_list = obs_for_video
+                self.add_new_frames(obs_for_video, infos_list, rewards, terminations)
+                self._advance_episode_counters(terminations)
+            tail = tuple(result[5:])
+            result = (obs_list, rewards, terminations, _truncations, infos_list, *tail)
         return result
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
