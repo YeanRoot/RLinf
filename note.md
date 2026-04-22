@@ -34,9 +34,9 @@ python train_embodied_agent_gigawa.py \
 
 
 python reshard_offline_collection.py \
-  --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell6/offline_collection \
-  --bucket all \
-  --output-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell6/mergeall \
+  --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_422/offline_collection \
+  --bucket failure \
+  --output-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_422/mergefailure \
   --target-world-size 4 \
   --shuffle \
   --source-cache-size 2048
@@ -53,7 +53,7 @@ python train_embodied_agent_gigawa_offline_critic_fast.py \
 
 python train_embodied_agent_gigawa_offline_rl_fast.py \
   --config-path ./config \
-  --config-name offline_rl_pretrain_mergeall_12chunk_fix_fast
+  --config-name offline_rl_pretrain.yaml
 
 tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall_12chunk_fast_420 \
   --host 0.0.0.0 \
@@ -63,9 +63,12 @@ python repair_pre_earlystop_buffer.py   --input-root /shared_disk/users/angen.ye
 
 
 
-python analyze_gigawa_pt_qsa.py \
-  --config /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment/config/offline_bc_pretrain_analysis.yaml \
-  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell5/offline_collection/rank_1/all/rank1_0.pt \
-  --checkpoint /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall/robotwin_train_giga_world_policy/checkpoints/global_step_80\
-  --output-dir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/qsa_debug2 \
+CUDA_VISIBLE_DEVICES=5 python analyze_gigawa_pt_qsa.py \
+  --config /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment/config/analysis.yaml \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_422/mergeall/rank_1/rank0_9_slide6_rerank1.pt \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_422/mergeall/rank_1/rank0_12_rerank1.pt \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_422/offline_collection/rank_0/success/rank0_30.pt \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_422/offline_collection/rank_0/failure/rank0_30.pt\
+  --checkpoint /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall_422/robotwin_train_giga_world_policy/checkpoints/global_step_100 \
+  --output-dir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/qsa_debug6 \
   --device cuda

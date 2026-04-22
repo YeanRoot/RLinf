@@ -18,7 +18,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall_422"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_rl_pretrain_mergeall_422"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -29,7 +29,7 @@ runner:
   val_check_interval: 1
   save_interval: 20
 
-  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall/robotwin_train_giga_world_policy/checkpoints/global_step_40
+  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall_422/robotwin_train_giga_world_policy/checkpoints/global_step_100
   ckpt_path: null
   resume_load_optimizer_and_scheduler_state: false
   per_worker_log_path: null
@@ -52,7 +52,7 @@ algorithm:
     enable: true
     enable_cache: True
     cache_size: 2000
-    sample_window_size: 7000
+    sample_window_size: 6000
     min_buffer_size: 32
     train_actor_steps: 32
     auto_save: False
@@ -65,7 +65,7 @@ algorithm:
     allow_replay_only_fallback: false
     store_online_interventions: false
 
-  offline_critic_pretrain:
+  offline_rl_pretrain:
     enable: true
     val_ratio: 0.2
     split_seed: 1234
@@ -77,6 +77,8 @@ algorithm:
     val_interval: 5
     class_eval_interval: 10
     tb_flush_interval: 5
+    critic_updates_per_step: 2
+    actor_updates_per_step: 1
 
   normalize_advantages: False
   kl_penalty: kl
@@ -108,7 +110,7 @@ algorithm:
   rewards_lower_bound: 0.0
   rewards_upper_bound: 5.0
 
-  training_stage: critic_warmup
+  training_stage: full_rl
 
   update_epoch: 1
   utd_ratio: 1
@@ -117,8 +119,8 @@ algorithm:
   target_update_freq: 1
   target_policy_noise: 0.0
   target_noise_clip: 0.0
-  bc_coef: 1.0
-  ref_action_dropout_p: 0
+  bc_coef: 0
+  ref_action_dropout_p: 0.5
   warmup_steps: 0
   train_actor_steps: 0
   rollout_actor_after_warmup: false
@@ -150,12 +152,21 @@ env:
     auto_reset: False
     ignore_terminations: False
     assets_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-main"
-    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/train_seeds.json
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/fixed_collect_seed.json
     center_crop: False
     task_config:
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
+      use_seed: true
+      domain_randomization:
+        random_background: false
+        cluttered_table: false
+        clean_background_rate: 1.0
+        random_head_camera_dis: 0.0
+        random_table_height: 0.0
+        random_light: false
+        crazy_random_light_rate: 0.0
 
   eval:
     total_num_envs: 4
@@ -168,7 +179,7 @@ env:
     use_fixed_reset_state_ids: True
     is_eval: True
     assets_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-main"
-    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/fixed_collect_seed.json
     center_crop: False
     video_cfg:
       save_video: False
@@ -177,6 +188,15 @@ env:
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
+      use_seed: true
+      domain_randomization:
+        random_background: false
+        cluttered_table: false
+        clean_background_rate: 1.0
+        random_head_camera_dis: 0.0
+        random_table_height: 0.0
+        random_light: false
+        crazy_random_light_rate: 0.0        
 
 rollout:
   group_name: "RolloutGroup"

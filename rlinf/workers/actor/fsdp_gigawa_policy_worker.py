@@ -384,6 +384,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             if sliding_cfg is not None and sliding_cfg.get("max_offsets", None) is not None
             else None
         )
+        self.sliding_window_augment_mode = str(
+            sliding_cfg.get("augment_mode", "reextract_features")
+            if sliding_cfg is not None
+            else "reextract_features"
+        )
 
         diag_cfg = self.cfg.algorithm.get("action_diagnostics", None)
         if diag_cfg is None:
@@ -448,6 +453,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             save_dir.mkdir(parents=True, exist_ok=True)
             buffer = TrajectoryReplayBuffer(
                 auto_save_path=str(save_dir),
+                storage_rank=self._rank,
                 **buffer_common,
             )
             metadata_path = save_dir / "metadata.json"
@@ -510,6 +516,19 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 "model_weights_id": str(traj.model_weights_id),
                 **quality,
             }
+            if getattr(traj, "metadata", None):
+                for key in [
+                    "source_episode_name",
+                    "source_rank",
+                    "source_episode_index",
+                    "source_env_local_index",
+                    "source_video_path",
+                    "source_video_env_local_index",
+                    "sliding_offset",
+                    "is_sliding_window_augmented",
+                ]:
+                    if key in traj.metadata:
+                        row[key] = traj.metadata[key]
             summary_rows.append(row)
             if "all" in self.offline_collection_buffers:
                 grouped["all"].append(traj)
@@ -2014,6 +2033,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             forward_inputs=self._narrow_time_dim(traj.forward_inputs, end_t) if traj.forward_inputs else {},
             curr_obs=self._narrow_time_dim(traj.curr_obs, end_t) if traj.curr_obs else {},
             next_obs=self._narrow_time_dim(traj.next_obs, end_t) if traj.next_obs else {},
+            sample_infos=[dict(info) for info in getattr(traj, "sample_infos", [])],
+            metadata=dict(getattr(traj, "metadata", {})),
         )
 
         if repaired.actions is not None:
@@ -2069,6 +2090,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 forward_inputs=self._select_batch_sample(traj.forward_inputs, batch_idx, batch_size) if traj.forward_inputs else {},
                 curr_obs=self._select_batch_sample(traj.curr_obs, batch_idx, batch_size) if traj.curr_obs else {},
                 next_obs=self._select_batch_sample(traj.next_obs, batch_idx, batch_size) if traj.next_obs else {},
+                sample_infos=[dict(traj.sample_infos[batch_idx])] if getattr(traj, "sample_infos", None) and batch_idx < len(traj.sample_infos) else [],
+                metadata=dict(traj.metadata) if getattr(traj, "metadata", None) else {},
             )
             sanitized.append(self._sanitize_single_sample_trajectory(sample))
         return sanitized
@@ -2112,6 +2135,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             next_robot_states.append(next_feat["robot_state"])
             next_ref_actions.append(next_feat["ref_action"])
 
+        sample_info = dict(traj.sample_infos[0]) if getattr(traj, "sample_infos", None) else {}
+        metadata = dict(getattr(traj, "metadata", {}))
+        metadata.update(sample_info)
+        metadata.setdefault("sliding_offset", 0)
+        metadata.setdefault("is_sliding_window_augmented", False)
         return Trajectory(
             max_episode_length=traj.max_episode_length,
             model_weights_id=traj.model_weights_id,
@@ -2135,6 +2163,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 "robot_state": torch.stack(next_robot_states, dim=0),
                 "ref_action": torch.stack(next_ref_actions, dim=0),
             },
+            sample_infos=[sample_info] if sample_info else [],
+            metadata=metadata,
         )
 
     def _pad_primitive_action_chunk(
@@ -2172,6 +2202,25 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             )
             valid_values = torch.cat([valid_values, pad_values], dim=0)
         return valid_values.permute(1, 0).cpu().contiguous()
+
+    def _pad_primitive_ref_action_chunk(
+        self,
+        primitive_actions: torch.Tensor,
+        start_idx: int,
+        action_chunk: int,
+    ) -> torch.Tensor:
+        total_primitive_steps = int(primitive_actions.shape[0])
+        if start_idx >= total_primitive_steps:
+            last_action = primitive_actions[-1:].expand(action_chunk, -1, -1)
+            return last_action.permute(1, 0, 2).reshape(last_action.shape[1], -1).cpu().contiguous()
+
+        valid_len = min(action_chunk, total_primitive_steps - start_idx)
+        return self._pad_primitive_action_chunk(
+            primitive_actions=primitive_actions,
+            start_idx=start_idx,
+            valid_len=valid_len,
+            action_chunk=action_chunk,
+        )
 
     @torch.no_grad()
     def _convert_sliding_window_trajectories_for_gigawa(self, traj: Trajectory) -> list[Trajectory]:
@@ -2256,6 +2305,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             window_logprobs = [] if primitive_logprobs is not None else None
             source_chunk_indices = []
 
+            use_shift_ref_action = self.sliding_window_augment_mode in {
+                "shift_ref_action",
+                "preserve_ref_action",
+            }
+
             for start_idx in start_indices:
                 valid_len = min(action_chunk, total_primitive_steps - start_idx)
                 if valid_len <= 0:
@@ -2268,10 +2322,27 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 next_feat = self._extract_step_features(next_step_obs)
                 curr_visual_latents.append(curr_feat["visual_latent"])
                 curr_robot_states.append(curr_feat["robot_state"])
-                curr_ref_actions.append(curr_feat["ref_action"])
                 next_visual_latents.append(next_feat["visual_latent"])
                 next_robot_states.append(next_feat["robot_state"])
-                next_ref_actions.append(next_feat["ref_action"])
+
+                if use_shift_ref_action:
+                    curr_ref_actions.append(
+                        self._pad_primitive_ref_action_chunk(
+                            primitive_actions=primitive_actions,
+                            start_idx=start_idx,
+                            action_chunk=action_chunk,
+                        )
+                    )
+                    next_ref_actions.append(
+                        self._pad_primitive_ref_action_chunk(
+                            primitive_actions=primitive_actions,
+                            start_idx=next_idx,
+                            action_chunk=action_chunk,
+                        )
+                    )
+                else:
+                    curr_ref_actions.append(curr_feat["ref_action"])
+                    next_ref_actions.append(next_feat["ref_action"])
 
                 window_actions.append(
                     self._pad_primitive_action_chunk(
@@ -2287,7 +2358,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 if primitive_terminations is not None:
                     window_terminations.append(
                         self._pad_primitive_scalar_chunk(
-                            primitive_terminations, start_idx, valid_len, action_chunk, fill_value=False
+                            primitive_terminations,
+                            start_idx,
+                            valid_len,
+                            action_chunk,
+                            fill_value=True if use_shift_ref_action else False,
                         )
                     )
                 if primitive_truncations is not None:
@@ -2299,7 +2374,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 if primitive_dones is not None:
                     window_dones.append(
                         self._pad_primitive_scalar_chunk(
-                            primitive_dones, start_idx, valid_len, action_chunk, fill_value=False
+                            primitive_dones,
+                            start_idx,
+                            valid_len,
+                            action_chunk,
+                            fill_value=True if use_shift_ref_action else False,
                         )
                     )
                 if primitive_intervene is not None:
@@ -2330,6 +2409,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             version_source = versions[source_chunk_index_tensor].cpu().contiguous() if versions is not None else None
             value_source = prev_values[source_chunk_index_tensor].cpu().contiguous() if prev_values is not None else None
 
+            sample_info = dict(traj.sample_infos[0]) if getattr(traj, "sample_infos", None) else {}
+            metadata = dict(getattr(traj, "metadata", {}))
+            metadata.update(sample_info)
+            metadata["sliding_offset"] = int(offset)
+            metadata["is_sliding_window_augmented"] = bool(offset != 0)
             converted_trajectories.append(
                 Trajectory(
                     max_episode_length=traj.max_episode_length,
@@ -2354,6 +2438,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                         "robot_state": torch.stack(next_robot_states, dim=0),
                         "ref_action": torch.stack(next_ref_actions, dim=0),
                     },
+                    sample_infos=[sample_info] if sample_info else [],
+                    metadata=metadata,
                 )
             )
 
