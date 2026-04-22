@@ -3,10 +3,15 @@ import argparse
 import json
 import math
 import random
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+
+
+SLIDE_PATTERN = re.compile(r"(?:^|_)slide\d+(?:_|$)", re.IGNORECASE)
+RERANK_SUFFIX_PATTERN = re.compile(r"_rerank\d+$", re.IGNORECASE)
 
 
 def make_buffer_for_load(
@@ -73,6 +78,36 @@ def default_source_storage_name(trajectory_id: int, model_weights_id: str) -> st
     return f"trajectory_{trajectory_id}_{model_weights_id}"
 
 
+def normalize_for_mode_classification(name: Optional[str]) -> str:
+    normalized = normalize_storage_name(name) or ""
+    normalized = RERANK_SUFFIX_PATTERN.sub("", normalized)
+    return normalized
+
+
+def infer_data_mode_from_name(source_storage_name: Optional[str]) -> str:
+    name = normalize_for_mode_classification(source_storage_name)
+    if SLIDE_PATTERN.search(name):
+        return "sliding"
+    return "original"
+
+
+def filter_handles_by_data_mode(handles: List[Dict], data_mode: str) -> List[Dict]:
+    if data_mode == "all":
+        return handles
+
+    expected = "original" if data_mode == "original" else "sliding"
+    filtered = [h for h in handles if infer_data_mode_from_name(h.get("source_storage_name")) == expected]
+    return filtered
+
+
+def summarize_handle_modes(handles: List[Dict]) -> Dict[str, int]:
+    summary = {"original": 0, "sliding": 0}
+    for h in handles:
+        mode = infer_data_mode_from_name(h.get("source_storage_name"))
+        summary[mode] = summary.get(mode, 0) + 1
+    return summary
+
+
 def collect_trajectory_handles(
     source_buffers: Dict[str, TrajectoryReplayBuffer],
     shuffle: bool,
@@ -95,6 +130,7 @@ def collect_trajectory_handles(
                     "trajectory_id": int(tid),
                     "model_weights_id": info["model_weights_id"],
                     "source_storage_name": source_storage_name,
+                    "data_mode": infer_data_mode_from_name(source_storage_name),
                 }
             )
     if shuffle:
@@ -190,6 +226,7 @@ def rename_output_files(
             entry["storage_name"] = desired_base
             entry["source_storage_name"] = source_storage_name
             entry["rerank_target"] = rank
+            entry["data_mode"] = rec.get("data_mode", infer_data_mode_from_name(source_storage_name))
 
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(index_data, f, indent=2, ensure_ascii=False)
@@ -205,6 +242,16 @@ def main():
         required=True,
         choices=["all", "success", "failure"],
         help="Which bucket under rank_i to reshard",
+    )
+    parser.add_argument(
+        "--data-mode",
+        default="all",
+        choices=["all", "original", "sliding"],
+        help=(
+            "Filter trajectories by source name pattern before re-sharding: "
+            "'original' keeps non-slide files only, 'sliding' keeps *_slide* files only, "
+            "'all' keeps everything."
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -256,17 +303,27 @@ def main():
 
     source_shards = discover_source_shards(input_root, args.bucket)
     source_buffers = open_source_buffers(source_shards, seed=args.seed, cache_size=args.source_cache_size)
-    handles = collect_trajectory_handles(source_buffers, shuffle=args.shuffle, seed=args.seed)
+    all_handles = collect_trajectory_handles(source_buffers, shuffle=args.shuffle, seed=args.seed)
+    all_mode_summary = summarize_handle_modes(all_handles)
+    handles = filter_handles_by_data_mode(all_handles, data_mode=args.data_mode)
+    filtered_mode_summary = summarize_handle_modes(handles)
     total = len(handles)
     if total == 0:
         close_buffers(source_buffers)
-        raise RuntimeError("No trajectories found to reshard")
+        raise RuntimeError(
+            f"No trajectories found to reshard after applying --data-mode={args.data_mode}. "
+            f"Available summary: {all_mode_summary}"
+        )
 
     per_target = math.ceil(total / target_world_size)
     print(f"[reshard] input_root={input_root}")
     print(f"[reshard] bucket={args.bucket}")
+    print(f"[reshard] data_mode={args.data_mode}")
     print(f"[reshard] source_shards={len(source_shards)}")
+    print(f"[reshard] total_before_filter={len(all_handles)}")
+    print(f"[reshard] mode_summary_before_filter={all_mode_summary}")
     print(f"[reshard] total_trajectories={total}")
+    print(f"[reshard] mode_summary_after_filter={filtered_mode_summary}")
     print(f"[reshard] target_world_size={target_world_size}")
     print(f"[reshard] approx_trajectories_per_target={per_target}")
     print(f"[reshard] output_root={output_root}")
@@ -276,13 +333,21 @@ def main():
     manifest = {
         "input_root": str(input_root),
         "bucket": args.bucket,
+        "data_mode": args.data_mode,
         "source_shards": [str(x) for x in source_shards],
         "target_world_size": target_world_size,
+        "total_before_filter": len(all_handles),
         "total_trajectories": total,
+        "mode_summary_before_filter": all_mode_summary,
+        "mode_summary_after_filter": filtered_mode_summary,
         "shuffle": bool(args.shuffle),
         "seed": int(args.seed),
         "source_cache_size": int(args.source_cache_size),
         "output_naming": "{original_name}_rerank{target_rank}.pt",
+        "data_mode_rule": {
+            "original": "source_storage_name without *_slide* pattern",
+            "sliding": "source_storage_name containing *_slide* pattern",
+        },
     }
 
     if args.dry_run:
@@ -324,6 +389,7 @@ def main():
                     "trajectory_id": target_local_trajectory_id,
                     "model_weights_id": h["model_weights_id"],
                     "source_storage_name": h["source_storage_name"],
+                    "data_mode": h["data_mode"],
                 }
             )
             target_counts[target_rank] += 1

@@ -18,7 +18,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_422"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_reextract_422"
     project_name: rlinf
     experiment_name: "robotwin_collect_gigawa_offline"
     logger_backends: ["tensorboard"]
@@ -102,7 +102,7 @@ algorithm:
     enable: true
     offset_stride: 2
     max_offsets: 12
-    augment_mode: shift_ref_action   #reextract_features 重新提 visual_latent / robot_state / ref_action ｜ shift_ref_action 不再重新经过backbone
+    augment_mode: reextract_features   #reextract_features 重新提 visual_latent / robot_state / ref_action ｜ shift_ref_action 不再重新经过backbone
 
   offline_collection:
     enable: true

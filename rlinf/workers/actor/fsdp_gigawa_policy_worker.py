@@ -2490,12 +2490,66 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     # ---------------------------------------------------------------------
     # Losses
     # ---------------------------------------------------------------------
+    def _reshape_runtime_action_tensor(self, x: torch.Tensor, tensor_name: str = "tensor") -> torch.Tensor:
+        """Normalize action tensors to [B, runtime_chunk, action_dim].
+
+        Accepts [B, C, A], [B, 1, C*A], [B, C*A], and legacy flattened tensors.
+        If the inferred chunk count differs from the runtime chunk count, crop or
+        pad by repeating the last step so downstream actor/critic code always sees
+        a consistent shape.
+        """
+        if not isinstance(x, torch.Tensor) or x.ndim == 0:
+            return x
+
+        expected_chunk = int(self.cfg.actor.model.get("num_action_chunks", 1))
+        action_dim = int(self.cfg.actor.model.get("action_dim", 14))
+
+        y = x
+        if y.ndim == 2:
+            flat = y.shape[-1]
+            if flat % action_dim != 0:
+                raise RuntimeError(
+                    f"{tensor_name} has shape {tuple(y.shape)}; last dim {flat} is not divisible by action_dim={action_dim}."
+                )
+            y = y.view(y.shape[0], flat // action_dim, action_dim)
+        elif y.ndim >= 3 and y.shape[-1] != action_dim:
+            flat = y.shape[-1]
+            if flat % action_dim != 0:
+                raise RuntimeError(
+                    f"{tensor_name} has shape {tuple(y.shape)}; last dim {flat} is not divisible by action_dim={action_dim}."
+                )
+            y = y.view(*y.shape[:-1], flat // action_dim, action_dim)
+
+        if y.ndim > 3:
+            if y.shape[-3] != 1:
+                raise RuntimeError(
+                    f"{tensor_name} reshaped to {tuple(y.shape)} but has unsupported extra dimension."
+                )
+            y = y.squeeze(-3)
+
+        if y.ndim != 3 or y.shape[-1] != action_dim:
+            raise RuntimeError(
+                f"{tensor_name} normalized to unexpected shape {tuple(y.shape)}; expected [B, C, {action_dim}]."
+            )
+
+        inferred_chunk = int(y.shape[-2])
+        if inferred_chunk > expected_chunk:
+            y = y[:, :expected_chunk, :]
+        elif inferred_chunk < expected_chunk:
+            pad = y[:, -1:, :].expand(y.shape[0], expected_chunk - inferred_chunk, action_dim)
+            y = torch.cat([y, pad], dim=1)
+
+        return y.contiguous()
+
     def _compute_critic_outputs(self, batch):
         policy = self._unwrap_policy(self.model)
 
         curr_obs = batch["curr_obs"]
         next_obs = batch["next_obs"]
-        actions = batch["actions"].to(self.device, dtype=self.torch_dtype)
+        actions = self._reshape_runtime_action_tensor(
+            batch["actions"].to(self.device, dtype=self.torch_dtype),
+            tensor_name="batch.actions",
+        )
         rewards = batch["rewards"]
         terminations = batch["terminations"]
 
@@ -2509,7 +2563,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 mode="actor",
                 visual_feat=curr_visual_feat.detach(),
                 robot_state=curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
-                ref_action=curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
+                ref_action=self._reshape_runtime_action_tensor(
+                    curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
+                    tensor_name="curr_obs.ref_action",
+                ),
                 ref_action_dropout_p=0.0,
                 use_target=False,
             )
@@ -2519,7 +2576,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             next_actions, next_actor_aux = policy.target_actor_forward(
                 visual_feat=next_visual_feat.detach(),
                 robot_state=next_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
-                ref_action=next_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
+                ref_action=self._reshape_runtime_action_tensor(
+                    next_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
+                    tensor_name="next_obs.ref_action",
+                )
             )
             if self.target_policy_noise > 0.0:
                 noise = torch.randn_like(next_actions) * self.target_policy_noise
@@ -2597,7 +2657,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         for batch in micro_batch_list:
             curr_obs = batch["curr_obs"]
             robot_state = curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype)
-            ref_action = curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype)
+            ref_action = self._reshape_runtime_action_tensor(
+                curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
+                tensor_name="curr_obs.ref_action",
+            )
             visual_feat = self._build_visual_feat_for_actor(curr_obs["visual_latent"])
             pi, _ = self.model(
                 forward_type=ForwardType.DEFAULT,
@@ -2628,7 +2691,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         policy = self._unwrap_policy(self.model)
         curr_obs = batch["curr_obs"]
         robot_state = curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype)
-        ref_action = curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype)
+        ref_action = self._reshape_runtime_action_tensor(
+            curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
+            tensor_name="curr_obs.ref_action",
+        )
 
         visual_feat = self._build_visual_feat_for_actor(
             curr_obs["visual_latent"]

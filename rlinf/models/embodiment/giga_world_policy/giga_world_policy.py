@@ -410,6 +410,26 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             persistent=False,
         )
         self.register_buffer(
+            "action_q01",
+            self._load_stat("action", "q01", -1.0),
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_q99",
+            self._load_stat("action", "q99", 1.0),
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_bound_center",
+            0.5 * (self.action_q01 + self.action_q99),
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_bound_half_range",
+            0.5 * (self.action_q99 - self.action_q01),
+            persistent=False,
+        )
+        self.register_buffer(
             "delta_mask",
             self._build_delta_mask(self.robotype, self.model_action_dim),
             persistent=False,
@@ -1163,6 +1183,26 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         dropped = ref_action * keep
         return dropped, keep
 
+    def _bound_absolute_action_model(
+        self,
+        raw_action: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Bound absolute model-space actions to the empirical q01/q99 range stored
+        in the norm statistics.
+
+        This keeps the actor output in the same support as the offline action
+        dataset while preserving the "absolute action" parameterization.
+        """
+        center = self.action_bound_center.to(device=raw_action.device, dtype=raw_action.dtype)
+        half_range = self.action_bound_half_range.to(device=raw_action.device, dtype=raw_action.dtype)
+        low = self.action_q01.to(device=raw_action.device, dtype=raw_action.dtype)
+        high = self.action_q99.to(device=raw_action.device, dtype=raw_action.dtype)
+
+        bounded = center + half_range * torch.tanh(raw_action)
+        bounded = torch.maximum(torch.minimum(bounded, high), low)
+        return bounded
+
     def actor_forward(
         self,
         visual_feat: torch.Tensor,
@@ -1202,9 +1242,10 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         if self.actor_output_mode == "hard_copy_ref_action":
             action = ref_action.to(dtype=rl_state.dtype) + 0.0 * learned_action
         else:
-            action = learned_action
+            action = self._bound_absolute_action_model(learned_action)
 
         aux = {
+            "raw_action": learned_action,
             "rl_state": rl_state,
             "cond_ref_action": cond_ref_action,
         }
@@ -1225,7 +1266,8 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         critic_dtype = critic_param.dtype
 
         rl_state = rl_state.to(device=critic_device, dtype=critic_dtype)
-        action_flat = action.reshape(action.shape[0], -1).to(
+        bounded_action = self._bound_absolute_action_model(action)
+        action_flat = bounded_action.reshape(bounded_action.shape[0], -1).to(
             device=critic_device, dtype=critic_dtype
         )
         return critic(rl_state, action_flat)

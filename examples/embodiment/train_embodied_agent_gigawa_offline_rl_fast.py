@@ -36,6 +36,8 @@ def _save_actor_checkpoint(actor_group, cfg, global_step: int):
 
 
 
+import math
+
 def _fmt_metric(value):
     if value is None:
         return "NA"
@@ -43,6 +45,88 @@ def _fmt_metric(value):
         return f"{float(value):.8f}"
     except Exception:
         return str(value)
+
+def _safe_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _add_scalar_if_valid(writer, tag: str, value, step: int):
+    value = _safe_float(value)
+    if value is None:
+        return
+    if value != value:  # nan
+        return
+    if value == float("inf") or value == float("-inf"):
+        return
+    writer.add_scalar(tag, value, step)
+
+
+def _log_key_offline_rl_metrics(writer, metrics: dict, epoch: int, global_step: int):
+    train_critic_loss = _safe_float(metrics.get("offline_rl/train_critic_loss"))
+    val_critic_loss = _safe_float(metrics.get("offline_rl/val/critic_loss"))
+    critic_gap = _safe_float(metrics.get("offline_rl/critic_overfit_gap"))
+    train_q = _safe_float(metrics.get("offline_rl/train_q_logged_mean"))
+    val_q = _safe_float(metrics.get("offline_rl/val/q_logged_mean"))
+    train_sf_gap = _safe_float(metrics.get("offline_rl/train_success_failure_q_gap"))
+    val_sf_gap = _safe_float(metrics.get("offline_rl/val_success_failure_q_gap"))
+    actor_loss = _safe_float(metrics.get("offline_rl/train_actor_loss"))
+    bc_loss = _safe_float(metrics.get("offline_rl/train_bc_loss"))
+    q_pi = _safe_float(metrics.get("offline_rl/train_q_pi_mean"))
+    critic_grad_norm = _safe_float(metrics.get("offline_rl/critic_grad_norm"))
+    actor_grad_norm = _safe_float(metrics.get("offline_rl/actor_grad_norm"))
+    critic_lr = _safe_float(metrics.get("critic/lr"))
+    actor_lr = _safe_float(metrics.get("actor/lr"))
+
+    core_pairs = {
+        "tb_core/critic_train_loss": train_critic_loss,
+        "tb_core/critic_val_loss": val_critic_loss,
+        "tb_core/critic_overfit_gap": critic_gap,
+        "tb_core/actor_loss": actor_loss,
+        "tb_core/bc_loss": bc_loss,
+        "tb_core/q_pi": q_pi,
+        "tb_core/train_q": train_q,
+        "tb_core/val_q": val_q,
+        "tb_core/train_success_failure_gap": train_sf_gap,
+        "tb_core/val_success_failure_gap": val_sf_gap,
+        "tb_core/critic_grad_norm": critic_grad_norm,
+        "tb_core/actor_grad_norm": actor_grad_norm,
+        "tb_core/critic_lr": critic_lr,
+        "tb_core/actor_lr": actor_lr,
+        "tb_core/epoch": float(epoch),
+    }
+    for tag, value in core_pairs.items():
+        _add_scalar_if_valid(writer, tag, value, global_step)
+
+    # 额外给你几组更好判断“崩没崩”的派生指标
+    if critic_grad_norm is not None and critic_grad_norm > 0:
+        _add_scalar_if_valid(writer, "tb_stability/log10_critic_grad_norm", math.log10(critic_grad_norm + 1e-12), global_step)
+    if actor_grad_norm is not None and actor_grad_norm > 0:
+        _add_scalar_if_valid(writer, "tb_stability/log10_actor_grad_norm", math.log10(actor_grad_norm + 1e-12), global_step)
+    if bc_loss is not None and bc_loss > 0:
+        _add_scalar_if_valid(writer, "tb_stability/log10_bc_loss", math.log10(bc_loss + 1e-12), global_step)
+    if train_critic_loss is not None and train_critic_loss > 0:
+        _add_scalar_if_valid(writer, "tb_stability/log10_critic_train_loss", math.log10(train_critic_loss + 1e-12), global_step)
+
+    if q_pi is not None and bc_loss is not None:
+        _add_scalar_if_valid(writer, "tb_ratio/abs_q_pi_over_bc", abs(q_pi) / max(abs(bc_loss), 1e-12), global_step)
+    if actor_grad_norm is not None and critic_grad_norm is not None:
+        _add_scalar_if_valid(writer, "tb_ratio/actor_grad_over_critic_grad", actor_grad_norm / max(critic_grad_norm, 1e-12), global_step)
+
+    # 保留关键 success/failure Q 方便看判别能力是否还在
+    sf_pairs = {
+        "tb_sf/train_success_q": metrics.get("offline_rl/train_success/q_logged_mean"),
+        "tb_sf/train_failure_q": metrics.get("offline_rl/train_failure/q_logged_mean"),
+        "tb_sf/val_success_q": metrics.get("offline_rl/val_success/q_logged_mean"),
+        "tb_sf/val_failure_q": metrics.get("offline_rl/val_failure/q_logged_mean"),
+    }
+    for tag, value in sf_pairs.items():
+        _add_scalar_if_valid(writer, tag, value, global_step)
+
 @hydra.main(
     version_base="1.1",
     config_path="config",
@@ -146,10 +230,7 @@ def main(cfg) -> None:
                 f"val_failure_q={_fmt_metric(metrics.get('offline_rl/val_failure/q_logged_mean', None))}"
             )
 
-        for key, value in metrics.items():
-            if isinstance(value, (int, float)):
-                writer.add_scalar(key, value, global_step)
-        writer.add_scalar("offline_rl/epoch", epoch, global_step)
+        _log_key_offline_rl_metrics(writer, metrics, epoch, global_step)
         if (epoch % tb_flush_interval == 0) or do_validation or do_class_eval or (epoch % save_interval == 0) or (epoch == max_epochs):
             writer.flush()
 
