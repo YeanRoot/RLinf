@@ -240,6 +240,7 @@ class TrajectoryReplayBuffer:
         auto_save: bool = False,
         auto_save_path: str = "",
         trajectory_format: str = "pt",
+        storage_rank: Optional[int] = None,
     ):
         """
         Initialize trajectory-based replay buffer.
@@ -275,6 +276,7 @@ class TrajectoryReplayBuffer:
                 f"Created replay buffer with auto_save_path: {auto_save_path}"
             )
         self.auto_save_path = auto_save_path if self.auto_save else None
+        self.storage_rank = storage_rank
         if self.auto_save_path is not None:
             os.makedirs(self.auto_save_path, exist_ok=True)
 
@@ -346,6 +348,16 @@ class TrajectoryReplayBuffer:
         return os.path.join(
             base_dir, f"trajectory_{trajectory_id}_{model_weights_id}{ext}"
         )
+
+    def _build_storage_name(self, trajectory_id: int, trajectory: Trajectory) -> Optional[str]:
+        if self.storage_rank is None:
+            return None
+        suffix = ""
+        metadata = trajectory.metadata if isinstance(trajectory.metadata, dict) else {}
+        sliding_offset = metadata.get("sliding_offset", None)
+        if sliding_offset not in (None, 0, "0"):
+            suffix = f"_slide{int(sliding_offset)}"
+        return f"rank{self.storage_rank}_{trajectory_id}{suffix}"
 
     def _get_metadata_path(self, base_dir: Optional[str] = None) -> str:
         """Get path to metadata file."""
@@ -458,7 +470,7 @@ class TrajectoryReplayBuffer:
         for trajectory in trajectories:
             model_weights_id = trajectory.model_weights_id
             trajectory_id = self._trajectory_counter
-            storage_name = str(getattr(trajectory, "trajectory_name", "") or "")
+            storage_name = self._build_storage_name(trajectory_id, trajectory)
 
             # Calculate total samples: T * B
             if trajectory.prev_logprobs is not None:
@@ -481,8 +493,7 @@ class TrajectoryReplayBuffer:
                         trajectory,
                         trajectory_id,
                         model_weights_id,
-                        None,
-                        storage_name if storage_name else None,
+                        storage_name=storage_name,
                     )
                 )
                 self._trajectory_file_path[trajectory_id] = self.auto_save_path
@@ -496,12 +507,9 @@ class TrajectoryReplayBuffer:
                     "shape": tuple(trajectory_shape),
                     "model_weights_id": model_weights_id,
                     "storage_name": storage_name,
-                    "trajectory_name": str(getattr(trajectory, "trajectory_name", "")),
-                    "source_rank": int(getattr(trajectory, "source_rank", -1)),
-                    "source_episode_index": int(getattr(trajectory, "source_episode_index", -1)),
-                    "source_env_local_index": int(getattr(trajectory, "source_env_local_index", -1)),
-                    "sliding_offset": int(getattr(trajectory, "sliding_offset", 0)),
                 }
+                if getattr(trajectory, "metadata", None):
+                    trajectory_info.update(copy.deepcopy(trajectory.metadata))
                 self._trajectory_index[trajectory_id] = trajectory_info
                 self._trajectory_id_list.append(trajectory_id)
 
@@ -980,6 +988,7 @@ class TrajectoryReplayBuffer:
                         trajectory_id,
                         model_weights_id,
                         save_dir=save_path,
+                        storage_name=info.get("storage_name"),
                     )
                 )
         else:
@@ -988,7 +997,9 @@ class TrajectoryReplayBuffer:
                     "model_weights_id"
                 ]
                 trajectory_path = self._get_trajectory_path(
-                    trajectory_id, model_weights_id
+                    trajectory_id,
+                    model_weights_id,
+                    storage_name=self._trajectory_index[trajectory_id].get("storage_name"),
                 )
                 if not os.path.isfile(trajectory_path):
                     continue

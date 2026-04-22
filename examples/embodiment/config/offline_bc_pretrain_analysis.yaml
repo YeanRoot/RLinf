@@ -1,0 +1,39 @@
+algorithm:
+  gamma: 0.82
+actor:
+  model:
+    model_type: giga_world_policy
+    model_path: /shared_disk/users/angen.ye/code/world_module_rollout/checkpoints/checkpoint_epoch_2_step_100000/transformer
+    precision: bf16
+    num_action_chunks: 12
+    action_dim: 14
+    is_lora: false
+    lora_rank: 32
+    use_proprio: true
+    num_steps: 1
+    add_value_head: false
+    giga_world_policy:
+      wa_root: /shared_disk/users/angen.ye/code/world_module_rollout/wan-casual-cj
+      base_model_dir: /shared_disk/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
+      norm_json: /shared_disk/users/angen.ye/code/world_module_rollout/norm_stats_delta.json
+      diffusers_src: null
+      robotype: aloha
+      num_inference_steps: 10
+      guidance_scale: 0.0
+      num_frames: 5
+      single_view_width: 256
+      single_view_height: 192
+      prompt: null
+      use_safetensors: false
+      wa_num_action_chunks: 48
+      use_rl_head_for_rollout: false
+      visual_feature_dim: 2048
+      bc_coef: 1
+      ref_action_dropout_p: 0
+      target_tau: 0.005
+      actor_output_mode: learned
+      visual_input_mode: normal
+      robot_state_input_mode: normal
+      ref_action_input_mode: normal
+      enable_latent_debug: false
+      latent_debug_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall/latent_debug

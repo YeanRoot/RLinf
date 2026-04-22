@@ -383,11 +383,6 @@ class Trajectory:
 
     max_episode_length: int = 0  # max episode length
     model_weights_id: str = ""  # str(uuid(versions))
-    trajectory_name: str = ""
-    source_rank: int = -1
-    source_episode_index: int = -1
-    source_env_local_index: int = -1
-    sliding_offset: int = 0
     actions: torch.Tensor = None
     intervene_flags: torch.Tensor = None
     rewards: torch.Tensor = None
@@ -401,6 +396,8 @@ class Trajectory:
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
+    sample_infos: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def _generate_field_mask(
@@ -497,11 +494,6 @@ class Trajectory:
                 Trajectory(
                     max_episode_length=self.max_episode_length,
                     model_weights_id=self.model_weights_id,
-                    trajectory_name=self.trajectory_name,
-                    source_rank=self.source_rank,
-                    source_episode_index=self.source_episode_index,
-                    source_env_local_index=self.source_env_local_index,
-                    sliding_offset=self.sliding_offset,
                     actions=actions,
                     intervene_flags=intervene_flags,
                     rewards=rewards,
@@ -513,6 +505,7 @@ class Trajectory:
                     forward_inputs=forward_inputs,
                     curr_obs=curr_obs,
                     next_obs=next_obs,
+                    metadata=dict(self.metadata) if self.metadata else {},
                 )
             )
 
@@ -553,6 +546,10 @@ class EmbodiedRolloutResult:
 
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
+    sample_infos: list[dict[str, Any]] = field(default_factory=list)
+
+    def set_sample_infos(self, sample_infos: list[dict[str, Any]] | None):
+        self.sample_infos = [dict(info) for info in (sample_infos or [])]
 
     def append_step_result(self, result: ChunkStepResult):
         if result.actions is not None:
@@ -648,6 +645,7 @@ class EmbodiedRolloutResult:
         # return [trajectory_length, B, ...]
         trajectory = Trajectory(
             max_episode_length=self.max_episode_length,
+            sample_infos=[dict(info) for info in self.sample_infos],
         )
         if len(self.actions) > 0:
             trajectory.actions = torch.stack(self.actions, dim=0).cpu().contiguous()
@@ -703,9 +701,30 @@ class EmbodiedRolloutResult:
 
     def to_splited_trajectories(self, split_size: int) -> list[Trajectory]:
         all_trajectory: Trajectory = self.to_trajectory()
-        splited_trajectories: list[Trajectory] = [
-            Trajectory() for _ in range(split_size)
-        ]
+        splited_trajectories: list[Trajectory] = [Trajectory() for _ in range(split_size)]
+
+        batch_size = 0
+        for candidate in (
+            getattr(all_trajectory, "actions", None),
+            getattr(all_trajectory, "rewards", None),
+            getattr(all_trajectory, "prev_logprobs", None),
+        ):
+            if isinstance(candidate, torch.Tensor) and candidate.ndim >= 2:
+                batch_size = int(candidate.shape[1])
+                break
+        if batch_size == 0 and all_trajectory.sample_infos:
+            batch_size = len(all_trajectory.sample_infos)
+
+        if batch_size > 0:
+            index_chunks = torch.chunk(torch.arange(batch_size), split_size, dim=0)
+            split_ranges = [
+                (int(chunk[0].item()), int(chunk[-1].item()) + 1)
+                if chunk.numel() > 0
+                else (0, 0)
+                for chunk in index_chunks
+            ]
+        else:
+            split_ranges = [(0, 0) for _ in range(split_size)]
 
         if len(all_trajectory.curr_obs) > 0:
             splited_obs = split_dict_to_chunk(
@@ -730,10 +749,20 @@ class EmbodiedRolloutResult:
             for i in range(split_size):
                 splited_trajectories[i].forward_inputs = splited_forward_inputs[i]
 
+        for i, (start_idx, end_idx) in enumerate(split_ranges):
+            if all_trajectory.sample_infos:
+                splited_trajectories[i].sample_infos = [
+                    dict(info) for info in all_trajectory.sample_infos[start_idx:end_idx]
+                ]
+            if all_trajectory.metadata:
+                splited_trajectories[i].metadata = dict(all_trajectory.metadata)
+
         for field_name in all_trajectory.__dataclass_fields__.keys():
             value = getattr(all_trajectory, field_name)
 
-            if value is None or isinstance(value, dict):
+            if field_name in {"curr_obs", "next_obs", "forward_inputs", "sample_infos", "metadata"}:
+                continue
+            if value is None:
                 continue
 
             if isinstance(value, int) or isinstance(value, str):

@@ -1287,13 +1287,26 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         """
         Reserve BC loss exactly for later worker-side actor objective:
             ||a - a_ref||^2
+
+        When valid_mask is provided, entries outside the valid range are excluded
+        from the reduction instead of contributing zeros to the denominator.
         """
         diff = (pred_action.float() - ref_action.float()) ** 2  # [B, C, A]
         if valid_mask is not None:
             # valid_mask can be [B,C] or [B,C,1]
             if valid_mask.ndim == 2:
                 valid_mask = valid_mask.unsqueeze(-1)
-            diff = diff * valid_mask.float()
+            valid_mask = valid_mask.to(device=diff.device, dtype=diff.dtype)
+            diff = diff * valid_mask
+
+            if reduction == "mean":
+                denom = valid_mask.sum() * diff.shape[-1]
+                return diff.sum() / denom.clamp_min(1.0)
+            if reduction == "sum":
+                return diff.sum()
+            if reduction == "none":
+                return diff
+            raise ValueError(f"Unknown reduction: {reduction}")
 
         if reduction == "mean":
             return diff.mean()

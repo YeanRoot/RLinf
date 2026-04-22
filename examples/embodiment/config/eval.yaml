@@ -1,6 +1,6 @@
 defaults:
-  - env/robotwin_click_bell@env.train
-  - env/robotwin_click_bell@env.eval
+  - env/robotwin_place_empty_cup@env.train
+  - env/robotwin_place_empty_cup@env.eval
   - model/giga_world_policy@actor.model
   - override hydra/job_logging: stdout
   - _self_
@@ -18,55 +18,62 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell2"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall_12chunk_fix_ealystop_0.5drop/robotwin_train_giga_world_policy/checkpoints/global_step_860"
     project_name: rlinf
-    experiment_name: "robotwin_collect_gigawa_offline"
+    experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 1
+  max_epochs: 20000 #test
   max_steps: -1
-  only_eval: False
-  val_check_interval: -1
-  save_interval: -1
-  weight_sync_interval: 1
 
-  resume_dir: null
+  only_eval: True
+  val_check_interval: 200
+  save_interval: 200
+
+  resume_dir: ${runner.logger.log_path}
   ckpt_path: null
-  per_worker_log_path: null
+  resume_load_optimizer_and_scheduler_state: false
 
 algorithm:
   replay_buffer:
     enable_cache: True
-    cache_size: 256
-    sample_window_size: 256
+    cache_size: 2000
+    sample_window_size: 5000
     min_buffer_size: 0
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
     enable_preload: False
-    prefetch_size: 4
-    store_online_data: False
-    require_for_training: False
+    prefetch_size: 10
 
   demo_buffer:
-    enable: False
+    enable: True
     enable_cache: True
-    cache_size: 256
-    sample_window_size: 256
-    min_buffer_size: 0
+    cache_size: 2000
+    sample_window_size: 5000
+    min_buffer_size: 32
+    train_actor_steps: 32
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
-    load_path: null
+    load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect/mergeall
+    sample_ratio: 1
+    allow_train_on_demo_only: true
+    allow_demo_only_fallback: true
+    allow_replay_only_fallback: false
+    store_online_interventions: false
 
   normalize_advantages: False
   kl_penalty: kl
   group_size: 1
+
   rollout_epoch: 1
-  eval_rollout_epoch: 0
+  eval_rollout_epoch: 1
+
   reward_type: action_level
   logprob_type: token_level
   entropy_type: token_level
+
   adv_type: gae
   loss_type: embodied_gigawa
   loss_agg_func: "token-mean"
@@ -77,51 +84,30 @@ algorithm:
   clip_ratio_c: 3.0
   value_clip: 0.2
   huber_delta: 10.0
+
   gamma: 0.99
   gae_lambda: 0.95
-  reward_coef: 1
+
+  reward_coef: 1 #test
   filter_rewards: False
   rewards_lower_bound: 0.0
   rewards_upper_bound: 5.0
-  training_stage: bc_actor_pretrain
+
+  training_stage: bc_actor_pretrain # bc_actor_pretrain / critic_warmup / full_rl
+
   update_epoch: 1
-  utd_ratio: 1
+  utd_ratio: 1 #test
   critic_actor_ratio: 2
   tau: 0.005
   target_update_freq: 1
   target_policy_noise: 0.0
   target_noise_clip: 0.0
   bc_coef: 1.0
-  ref_action_dropout_p: 0.0
+  ref_action_dropout_p: 0
   warmup_steps: 0
   train_actor_steps: 0
-  rollout_actor_after_warmup: false
-  rollout_actor_min_actor_updates: 100000000
-
-  gigawa_sliding_window:
-    enable: true
-    offset_stride: 2
-    max_offsets: 12
-    augment_mode: reextract_features   #reextract_features 重新提 visual_latent / robot_state / ref_action ｜ shift_ref_action 不再重新经过backbone
-
-  offline_collection:
-    enable: true
-    output_dir: ${runner.logger.log_path}/offline_collection
-    target_num_trajectories: 200000
-    target_total_samples: 0
-    max_collection_steps: 100000000
-    log_interval: 10
-    resume_existing: true
-    save_all: true
-    save_success: true
-    save_failure: true
-    quality_mode: reward_max
-    success_threshold: 0.5
-    trajectory_format: pt
-    enable_cache: false
-    cache_size: 64
-    sample_window_size: 1024
-    summary_flush_every: 100
+  rollout_actor_after_warmup: true
+  rollout_actor_min_actor_updates: 0
 
   sampling_params:
     do_sample: False
@@ -149,16 +135,24 @@ env:
     auto_reset: False
     ignore_terminations: False
     assets_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-main"
-    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/train_seeds.json
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/fixed_collect_seed.json
     center_crop: False
-    chunk_step_mode: sequential
     task_config:
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
+      use_seed: true
+      domain_randomization:
+        random_background: false
+        cluttered_table: false
+        clean_background_rate: 1.0
+        random_head_camera_dis: 0.0
+        random_table_height: 0.0
+        random_light: false
+        crazy_random_light_rate: 0.0
 
   eval:
-    total_num_envs: 1
+    total_num_envs: 4
     auto_reset: True
     ignore_terminations: False
     max_episode_steps: 192
@@ -168,15 +162,25 @@ env:
     use_fixed_reset_state_ids: True
     is_eval: True
     assets_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-main"
-    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/fixed_collect_seed.json
     center_crop: False
     video_cfg:
-      save_video: False
+      save_video: True
       video_base_dir: ${runner.logger.log_path}/video/eval
     task_config:
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
+      use_seed: true
+      render_freq: 1
+      domain_randomization:
+        random_background: false
+        cluttered_table: false
+        clean_background_rate: 1.0
+        random_head_camera_dis: 0.0
+        random_table_height: 0.0
+        random_light: false
+        crazy_random_light_rate: 0.0     
 
 rollout:
   group_name: "RolloutGroup"
@@ -228,8 +232,7 @@ actor:
       single_view_height: 192
       prompt: null
       use_safetensors: False
-      wa_num_action_chunks: 48
-      use_rl_head_for_rollout: False
+      use_rl_head_for_rollout: true
       visual_feature_dim: 2048
       bc_coef: 1
       ref_action_dropout_p: 0
@@ -241,8 +244,22 @@ actor:
       robot_state_input_mode: "normal"
       ref_action_input_mode: "normal"
 
+      enable_action_compare_debug: true
+      action_compare_debug_dir: "${runner.logger.log_path}/action_compare_debug"
+      action_compare_debug_max_batches: 1
+      action_compare_debug_max_items: 1
+      action_compare_debug_print_full_tensors: false
+      action_compare_debug_save_full_tensors: true
+
+      enable_eval_render_all_steps: true
+      force_eval_chunk_step_mode_sequential: true
+      force_eval_render_freq_one: true
+
+      eval_execute_action_horizon: 12
+      wa_num_action_chunks: 48
+
   optim:
-    lr: 2.5e-5
+    lr: 5e-7
     value_lr: 1.55e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
@@ -256,7 +273,6 @@ actor:
     min_lr: 2.5e-6
 
   fsdp_config:
-    use_orig_params: true
     strategy: "fsdp"
     sharding_strategy: "no_shard"
     gradient_checkpointing: False

@@ -253,6 +253,20 @@ class EnvWorker(Worker):
             env_list.append(env)
         return env_list
 
+    def _get_record_video_wrapper(self, env: Any):
+        current = env
+        while current is not None:
+            if isinstance(current, RecordVideo):
+                return current
+            current = getattr(current, "env", None)
+        return None
+
+    def _get_current_episode_infos(self, env: Any, mode: str = "train") -> list[dict[str, Any]]:
+        wrapper = self._get_record_video_wrapper(env)
+        if wrapper is None or not hasattr(wrapper, "get_current_episode_infos"):
+            return []
+        return wrapper.get_current_episode_infos(video_sub_dir=None)
+
     def _setup_dst_ranks(self, batch_size: int) -> list[tuple[int, int]]:
         """Compute rollout peer ranks for this env worker.
 
@@ -812,6 +826,10 @@ class EnvWorker(Worker):
             pending_curr_obs: list[dict[str, Any] | None] = [None] * self.stage_num
             for stage_id in range(self.stage_num):
                 env_output: EnvOutput = env_outputs[stage_id]
+                if epoch == 0 and not self.rollout_results[stage_id].sample_infos:
+                    self.rollout_results[stage_id].set_sample_infos(
+                        self._get_current_episode_infos(self.env_list[stage_id], mode="train")
+                    )
                 env_batch = env_output.to_dict()
                 self.send_env_batch(
                     output_channel,

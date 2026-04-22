@@ -4,7 +4,7 @@ import json
 import math
 import random
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 
@@ -60,6 +60,19 @@ def open_source_buffers(shards: List[Path], seed: int, cache_size: int) -> Dict[
     return buffers
 
 
+def normalize_storage_name(name: Optional[Any]) -> Optional[str]:
+    if name is None:
+        return None
+    name = str(name)
+    if name.endswith(".pt"):
+        return name[:-3]
+    return name
+
+
+def default_source_storage_name(trajectory_id: int, model_weights_id: str) -> str:
+    return f"trajectory_{trajectory_id}_{model_weights_id}"
+
+
 def collect_trajectory_handles(
     source_buffers: Dict[str, TrajectoryReplayBuffer],
     shuffle: bool,
@@ -71,11 +84,17 @@ def collect_trajectory_handles(
         traj_ids.sort()
         for tid in traj_ids:
             info = buf._trajectory_index[tid]
+            source_storage_name = normalize_storage_name(info.get("storage_name"))
+            if not source_storage_name:
+                source_storage_name = normalize_storage_name(info.get("source_storage_name"))
+            if not source_storage_name:
+                source_storage_name = default_source_storage_name(int(tid), info["model_weights_id"])
             handles.append(
                 {
                     "shard_path": shard_path,
                     "trajectory_id": int(tid),
                     "model_weights_id": info["model_weights_id"],
+                    "source_storage_name": source_storage_name,
                 }
             )
     if shuffle:
@@ -105,6 +124,75 @@ def close_buffers(buffers: Dict[str, TrajectoryReplayBuffer]) -> None:
 def write_manifest(output_root: Path, manifest: Dict) -> None:
     with open(output_root / "reshard_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+
+def find_saved_file(rank_dir: Path, trajectory_id: int, model_weights_id: str, entry: Dict, ext: str) -> Path:
+    candidates = []
+    storage_name = entry.get("storage_name")
+    if storage_name:
+        candidates.append(rank_dir / f"{storage_name}{ext}")
+    candidates.append(rank_dir / f"trajectory_{trajectory_id}_{model_weights_id}{ext}")
+
+    for p in candidates:
+        if p.exists():
+            return p
+
+    raise FileNotFoundError(
+        f"Could not find saved file for trajectory_id={trajectory_id}, model_weights_id={model_weights_id} under {rank_dir}"
+    )
+
+
+def make_unique_name(rank_dir: Path, base_name: str, ext: str) -> str:
+    candidate = base_name
+    counter = 1
+    while (rank_dir / f"{candidate}{ext}").exists():
+        candidate = f"{base_name}_dup{counter}"
+        counter += 1
+    return candidate
+
+
+def rename_output_files(
+    output_root: Path,
+    target_records: List[List[Dict]],
+    target_world_size: int,
+    trajectory_format: str = "pt",
+) -> None:
+    ext = ".pt" if trajectory_format == "pt" else ".pkl"
+
+    for rank in range(target_world_size):
+        rank_dir = output_root / f"rank_{rank}"
+        index_path = rank_dir / "trajectory_index.json"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Missing trajectory_index.json under {rank_dir}")
+
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+
+        trajectory_index = index_data.get("trajectory_index", {})
+        for rec in target_records[rank]:
+            tid_key = str(rec["trajectory_id"])
+            if tid_key not in trajectory_index:
+                raise KeyError(f"trajectory_id={tid_key} not found in {index_path}")
+
+            entry = trajectory_index[tid_key]
+            old_path = find_saved_file(rank_dir, rec["trajectory_id"], rec["model_weights_id"], entry, ext)
+
+            source_storage_name = normalize_storage_name(rec.get("source_storage_name"))
+            if not source_storage_name:
+                source_storage_name = default_source_storage_name(rec["trajectory_id"], rec["model_weights_id"])
+            desired_base = f"{source_storage_name}_rerank{rank}"
+            desired_base = make_unique_name(rank_dir, desired_base, ext) if old_path.name != f"{desired_base}{ext}" else desired_base
+            new_path = rank_dir / f"{desired_base}{ext}"
+
+            if old_path != new_path:
+                old_path.rename(new_path)
+
+            entry["storage_name"] = desired_base
+            entry["source_storage_name"] = source_storage_name
+            entry["rerank_target"] = rank
+
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(index_data, f, indent=2, ensure_ascii=False)
 
 
 def main():
@@ -182,6 +270,8 @@ def main():
     print(f"[reshard] target_world_size={target_world_size}")
     print(f"[reshard] approx_trajectories_per_target={per_target}")
     print(f"[reshard] output_root={output_root}")
+    if handles:
+        print(f"[reshard] example source name -> target pattern: {handles[0]['source_storage_name']}_rerank0.pt")
 
     manifest = {
         "input_root": str(input_root),
@@ -192,6 +282,7 @@ def main():
         "shuffle": bool(args.shuffle),
         "seed": int(args.seed),
         "source_cache_size": int(args.source_cache_size),
+        "output_naming": "{original_name}_rerank{target_rank}.pt",
     }
 
     if args.dry_run:
@@ -203,6 +294,7 @@ def main():
     target_buffers: List[TrajectoryReplayBuffer] = []
     pending = [[] for _ in range(target_world_size)]
     target_counts = [0 for _ in range(target_world_size)]
+    target_records: List[List[Dict]] = [[] for _ in range(target_world_size)]
 
     for rank in range(target_world_size):
         rank_dir = output_root / f"rank_{rank}"
@@ -218,6 +310,8 @@ def main():
     try:
         for idx, h in enumerate(handles):
             target_rank = idx % target_world_size
+            target_local_trajectory_id = target_counts[target_rank]
+
             traj = load_one_trajectory(
                 source_buffers=source_buffers,
                 shard_path=h["shard_path"],
@@ -225,6 +319,13 @@ def main():
                 model_weights_id=h["model_weights_id"],
             )
             pending[target_rank].append(traj)
+            target_records[target_rank].append(
+                {
+                    "trajectory_id": target_local_trajectory_id,
+                    "model_weights_id": h["model_weights_id"],
+                    "source_storage_name": h["source_storage_name"],
+                }
+            )
             target_counts[target_rank] += 1
 
             if len(pending[target_rank]) >= args.chunk_size:
@@ -241,6 +342,13 @@ def main():
             target_buffers[rank].close(wait=True)
     finally:
         close_buffers(source_buffers)
+
+    rename_output_files(
+        output_root=output_root,
+        target_records=target_records,
+        target_world_size=target_world_size,
+        trajectory_format=args.trajectory_format,
+    )
 
     manifest["target_counts"] = target_counts
     write_manifest(output_root, manifest)
