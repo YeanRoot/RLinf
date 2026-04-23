@@ -50,7 +50,7 @@ python train_embodied_agent_gigawa_offline_bc.py \
 
 python train_embodied_agent_gigawa_offline_critic_fast.py \
   --config-path ./config \
-  --config-name offline_critic_pretrain
+  --config-name offline_critic_pretrain2
 
 python train_embodied_agent_gigawa_offline_rl_fast.py \
   --config-path ./config \

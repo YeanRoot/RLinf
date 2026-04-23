@@ -13,12 +13,12 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor, env, rollout: 4-7
+    actor, env, rollout: 0-3
 
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall_422_4"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall_422_3"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -58,7 +58,7 @@ algorithm:
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
-    load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_fix_422/mergeall_original
+    load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_fix_reextract_422/mergeall_original
     sample_ratio: 1.0
     allow_train_on_demo_only: true
     allow_demo_only_fallback: true

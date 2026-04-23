@@ -322,6 +322,9 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self.bc_coef = float(policy_cfg.get("bc_coef", 1.0))
         self.ref_action_dropout_p = float(policy_cfg.get("ref_action_dropout_p", 0.5))
         self.target_tau = float(policy_cfg.get("target_tau", 0.005))
+        self.enable_absolute_action_bound = bool(
+            policy_cfg.get("enable_absolute_action_bound", True)
+        )
 
         self.actor_output_mode = str(
             policy_cfg.get("actor_output_mode", "learned")
@@ -409,14 +412,33 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             self._load_stat("action", "std", 1.0),
             persistent=False,
         )
+        # q01/q99 in the stats file live in the same *raw* action space as
+        # action mean/std. The actor, however, predicts in normalized model space.
+        # So we must first normalize q01/q99 before using them as model-space
+        # output bounds.
         self.register_buffer(
-            "action_q01",
+            "action_q01_raw",
             self._load_stat("action", "q01", -1.0),
             persistent=False,
         )
         self.register_buffer(
-            "action_q99",
+            "action_q99_raw",
             self._load_stat("action", "q99", 1.0),
+            persistent=False,
+        )
+        action_std_safe = torch.where(
+            self.delta_std.abs() < 1e-8,
+            torch.ones_like(self.delta_std),
+            self.delta_std,
+        )
+        self.register_buffer(
+            "action_q01",
+            (self.action_q01_raw - self.delta_mean) / action_std_safe,
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_q99",
+            (self.action_q99_raw - self.delta_mean) / action_std_safe,
             persistent=False,
         )
         self.register_buffer(
@@ -1188,11 +1210,12 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         raw_action: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Bound absolute model-space actions to the empirical q01/q99 range stored
-        in the norm statistics.
+        Bound absolute model-space actions to the empirical q01/q99 range.
 
-        This keeps the actor output in the same support as the offline action
-        dataset while preserving the "absolute action" parameterization.
+        Important: q01/q99 are first converted from raw action space into the
+        normalized model space used by the actor, then applied here. This keeps
+        the actor output in the same support as the offline action dataset while
+        preserving the "absolute action" parameterization.
         """
         center = self.action_bound_center.to(device=raw_action.device, dtype=raw_action.dtype)
         half_range = self.action_bound_half_range.to(device=raw_action.device, dtype=raw_action.dtype)
@@ -1242,7 +1265,11 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         if self.actor_output_mode == "hard_copy_ref_action":
             action = ref_action.to(dtype=rl_state.dtype) + 0.0 * learned_action
         else:
-            action = self._bound_absolute_action_model(learned_action)
+            action = (
+                self._bound_absolute_action_model(learned_action)
+                if self.enable_absolute_action_bound
+                else learned_action
+            )
 
         aux = {
             "raw_action": learned_action,
@@ -1266,8 +1293,12 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         critic_dtype = critic_param.dtype
 
         rl_state = rl_state.to(device=critic_device, dtype=critic_dtype)
-        bounded_action = self._bound_absolute_action_model(action)
-        action_flat = bounded_action.reshape(bounded_action.shape[0], -1).to(
+        action_for_critic = (
+            self._bound_absolute_action_model(action)
+            if self.enable_absolute_action_bound
+            else action
+        )
+        action_flat = action_for_critic.reshape(action_for_critic.shape[0], -1).to(
             device=critic_device, dtype=critic_dtype
         )
         return critic(rl_state, action_flat)
