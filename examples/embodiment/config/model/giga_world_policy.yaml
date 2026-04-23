@@ -37,6 +37,16 @@ giga_world_policy:
   ref_action_dropout_p: 0.5
   target_tau: 0.005
 
+  # default path: use spatial visual tokens + actor/critic cross-attention fusion.
+  # set to False to fall back to the original late-fusion MLP path.
+  use_cross_attention_fusion: True
+  cross_attention_dim: 512
+  cross_attention_num_heads: 8
+  cross_attention_num_layers: 2
+  cross_attention_mlp_hidden_dim: 1024
+  cross_attention_dropout: 0.0
+  critic_include_ref_action: True
+
   # Debug / ablation knobs for BC-copy diagnosis:
   #   actor_output_mode:
   #     - learned: use the MLP actor head (default)

@@ -1518,23 +1518,26 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         policy = self._unwrap_policy(self.model)
         return str(getattr(policy, "visual_input_mode", "normal")).lower()
 
-    def _build_visual_feat_for_actor(self, visual_latent: torch.Tensor) -> torch.Tensor:
-        policy = self._unwrap_policy(self.model)
-        mode = self._visual_mode()
-        if mode == "normal":
-            return self.model(
-                forward_type=ForwardType.DEFAULT,
-                mode="encode_visual",
-                visual_latent=visual_latent.to(self.device, dtype=self.torch_dtype),
-            )
-
-        batch_size = int(visual_latent.shape[0])
-        return torch.zeros(
-            batch_size,
-            int(policy.visual_feature_dim),
-            device=self.device,
-            dtype=self.torch_dtype,
+    def _build_visual_feat_for_actor(self, visual_latent: torch.Tensor) -> Any:
+        return self.model(
+            forward_type=ForwardType.DEFAULT,
+            mode="encode_visual",
+            visual_latent=visual_latent.to(self.device, dtype=self.torch_dtype),
         )
+
+    @staticmethod
+    def _detach_rl_state(rl_state: Any) -> Any:
+        if torch.is_tensor(rl_state):
+            return rl_state.detach()
+        if isinstance(rl_state, dict):
+            return {
+                k: EmbodiedGigaWAFSDPPolicy._detach_rl_state(v)
+                for k, v in rl_state.items()
+            }
+        if isinstance(rl_state, (list, tuple)):
+            values = [EmbodiedGigaWAFSDPPolicy._detach_rl_state(v) for v in rl_state]
+            return type(rl_state)(values)
+        return rl_state
 
     def _should_capture_action_diagnostics(self) -> bool:
         if not self.action_diag_enable:
@@ -2570,7 +2573,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 ref_action_dropout_p=0.0,
                 use_target=False,
             )
-            curr_rl_state = curr_actor_aux["rl_state"].detach()
+            curr_rl_state = self._detach_rl_state(curr_actor_aux["rl_state"])
 
             next_visual_feat = self._build_visual_feat_for_actor(next_obs["visual_latent"])
             next_actions, next_actor_aux = policy.target_actor_forward(
@@ -2728,8 +2731,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 "ref_action": ref_action.detach(),
                 "pred_action": pi.detach(),
                 "robot_state": robot_state.detach(),
-                "visual_feat": visual_feat.detach(),
-                "visual_feat_for_state": actor_aux.get("visual_feat_for_state", visual_feat).detach(),
+                "visual_feat": (visual_feat["visual_feat"] if isinstance(visual_feat, dict) else visual_feat).detach(),
+                "visual_feat_for_state": actor_aux.get(
+                    "visual_feat_for_state",
+                    visual_feat["visual_feat"] if isinstance(visual_feat, dict) else visual_feat,
+                ).detach(),
                 "robot_state_for_state": actor_aux.get("robot_state_for_state", robot_state).detach(),
                 "ref_action_flat_for_state": actor_aux.get(
                     "ref_action_flat_for_state", ref_action.reshape(ref_action.shape[0], -1)

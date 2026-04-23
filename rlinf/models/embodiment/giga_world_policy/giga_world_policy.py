@@ -218,6 +218,283 @@ class TwinCritic(nn.Module):
         return self.q1(qa_input), self.q2(qa_input)
 
 
+class CrossAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        mlp_hidden_dim: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(d_model)
+        self.context_norm = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, d_model),
+        )
+
+    def forward(
+        self,
+        query_tokens: torch.Tensor,
+        context_tokens: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        x = query_tokens
+        if context_tokens is not None and context_tokens.shape[1] > 0:
+            attn_out, _ = self.cross_attn(
+                self.query_norm(x),
+                self.context_norm(context_tokens),
+                self.context_norm(context_tokens),
+                need_weights=False,
+            )
+            x = x + attn_out
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+
+class CrossAttentionActor(nn.Module):
+    def __init__(
+        self,
+        visual_token_dim: int,
+        robot_state_dim: int,
+        action_dim: int,
+        action_chunk: int,
+        output_dim: int,
+        d_model: int = 512,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        mlp_hidden_dim: int = 1024,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.action_chunk = int(action_chunk)
+        self.visual_proj = nn.Linear(visual_token_dim, d_model)
+        self.state_proj = nn.Linear(robot_state_dim, d_model)
+        self.ref_action_proj = nn.Linear(action_dim, d_model)
+        self.step_embed = nn.Embedding(self.action_chunk, d_model)
+        self.blocks = nn.ModuleList(
+            [
+                CrossAttentionBlock(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    mlp_hidden_dim=mlp_hidden_dim,
+                    dropout=dropout,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(d_model)
+        self.output_head = MLP(
+            input_dim=d_model,
+            hidden_dims=[mlp_hidden_dim, max(d_model, mlp_hidden_dim // 2)],
+            output_dim=output_dim,
+            activate_final=False,
+            layer_norm=False,
+        )
+
+    def _build_visual_context(
+        self,
+        visual_tokens: torch.Tensor,
+        visual_mode: str,
+    ) -> Optional[torch.Tensor]:
+        if visual_mode == "remove":
+            return None
+        visual_context = self.visual_proj(visual_tokens)
+        if visual_mode == "zero":
+            visual_context = torch.zeros_like(visual_context)
+        return visual_context
+
+    def _build_query_tokens(
+        self,
+        robot_state: torch.Tensor,
+        ref_action: torch.Tensor,
+        robot_state_mode: str,
+        ref_action_mode: str,
+    ) -> torch.Tensor:
+        parts = []
+        if robot_state_mode != "remove":
+            state_in = torch.zeros_like(robot_state) if robot_state_mode == "zero" else robot_state
+            parts.append(self.state_proj(state_in).unsqueeze(1))
+        if ref_action_mode != "remove":
+            ref_in = torch.zeros_like(ref_action) if ref_action_mode == "zero" else ref_action
+            step_ids = torch.arange(self.action_chunk, device=ref_action.device)
+            step_emb = self.step_embed(step_ids).unsqueeze(0)
+            ref_tokens = self.ref_action_proj(ref_in) + step_emb
+            parts.append(ref_tokens)
+        if not parts:
+            raise RuntimeError(
+                "CrossAttentionActor received no conditioning tokens. "
+                "At least one of robot_state/ref_action must remain enabled."
+            )
+        return torch.cat(parts, dim=1)
+
+    def forward(
+        self,
+        visual_tokens: torch.Tensor,
+        robot_state: torch.Tensor,
+        ref_action: torch.Tensor,
+        visual_mode: str,
+        robot_state_mode: str,
+        ref_action_mode: str,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        context_tokens = self._build_visual_context(visual_tokens, visual_mode)
+        query_tokens = self._build_query_tokens(
+            robot_state=robot_state,
+            ref_action=ref_action,
+            robot_state_mode=robot_state_mode,
+            ref_action_mode=ref_action_mode,
+        )
+        hidden = query_tokens
+        for block in self.blocks:
+            hidden = block(hidden, context_tokens)
+        pooled = self.final_norm(hidden).mean(dim=1)
+        action_flat = self.output_head(pooled)
+        aux = {"pooled_state": pooled, "query_tokens": hidden}
+        if context_tokens is not None:
+            aux["visual_context_tokens"] = context_tokens
+        return action_flat, aux
+
+
+class CrossAttentionTwinCritic(nn.Module):
+    def __init__(
+        self,
+        visual_token_dim: int,
+        robot_state_dim: int,
+        action_dim: int,
+        action_chunk: int,
+        d_model: int = 512,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        mlp_hidden_dim: int = 1024,
+        dropout: float = 0.0,
+        include_ref_action: bool = True,
+    ):
+        super().__init__()
+        self.action_chunk = int(action_chunk)
+        self.include_ref_action = bool(include_ref_action)
+        self.visual_proj = nn.Linear(visual_token_dim, d_model)
+        self.state_proj = nn.Linear(robot_state_dim, d_model)
+        self.ref_action_proj = nn.Linear(action_dim, d_model) if self.include_ref_action else None
+        self.action_proj = nn.Linear(action_dim, d_model)
+        self.step_embed = nn.Embedding(self.action_chunk, d_model)
+
+        def _make_blocks():
+            return nn.ModuleList(
+                [
+                    CrossAttentionBlock(
+                        d_model=d_model,
+                        num_heads=num_heads,
+                        mlp_hidden_dim=mlp_hidden_dim,
+                        dropout=dropout,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+
+        self.q1_blocks = _make_blocks()
+        self.q2_blocks = _make_blocks()
+        self.q1_norm = nn.LayerNorm(d_model)
+        self.q2_norm = nn.LayerNorm(d_model)
+        self.q1_head = MLP(
+            input_dim=d_model,
+            hidden_dims=[mlp_hidden_dim, max(d_model, mlp_hidden_dim // 2)],
+            output_dim=1,
+            activate_final=False,
+            layer_norm=False,
+        )
+        self.q2_head = MLP(
+            input_dim=d_model,
+            hidden_dims=[mlp_hidden_dim, max(d_model, mlp_hidden_dim // 2)],
+            output_dim=1,
+            activate_final=False,
+            layer_norm=False,
+        )
+
+    def _build_visual_context(
+        self,
+        visual_tokens: torch.Tensor,
+        visual_mode: str,
+    ) -> Optional[torch.Tensor]:
+        if visual_mode == "remove":
+            return None
+        visual_context = self.visual_proj(visual_tokens)
+        if visual_mode == "zero":
+            visual_context = torch.zeros_like(visual_context)
+        return visual_context
+
+    def _build_query_tokens(
+        self,
+        robot_state: torch.Tensor,
+        ref_action: torch.Tensor,
+        action: torch.Tensor,
+        robot_state_mode: str,
+        ref_action_mode: str,
+    ) -> torch.Tensor:
+        parts = []
+        step_ids = torch.arange(self.action_chunk, device=action.device)
+        step_emb = self.step_embed(step_ids).unsqueeze(0)
+
+        if robot_state_mode != "remove":
+            state_in = torch.zeros_like(robot_state) if robot_state_mode == "zero" else robot_state
+            parts.append(self.state_proj(state_in).unsqueeze(1))
+
+        if self.include_ref_action and ref_action_mode != "remove":
+            ref_in = torch.zeros_like(ref_action) if ref_action_mode == "zero" else ref_action
+            ref_tokens = self.ref_action_proj(ref_in) + step_emb
+            parts.append(ref_tokens)
+
+        action_tokens = self.action_proj(action) + step_emb
+        parts.append(action_tokens)
+
+        if not parts:
+            raise RuntimeError("CrossAttentionTwinCritic received no query tokens.")
+        return torch.cat(parts, dim=1)
+
+    def _forward_one(
+        self,
+        blocks: nn.ModuleList,
+        norm: nn.LayerNorm,
+        head: nn.Module,
+        query_tokens: torch.Tensor,
+        context_tokens: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        hidden = query_tokens
+        for block in blocks:
+            hidden = block(hidden, context_tokens)
+        pooled = norm(hidden).mean(dim=1)
+        return head(pooled)
+
+    def forward(
+        self,
+        visual_tokens: torch.Tensor,
+        robot_state: torch.Tensor,
+        ref_action: torch.Tensor,
+        action: torch.Tensor,
+        visual_mode: str,
+        robot_state_mode: str,
+        ref_action_mode: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context_tokens = self._build_visual_context(visual_tokens, visual_mode)
+        query_tokens = self._build_query_tokens(
+            robot_state=robot_state,
+            ref_action=ref_action,
+            action=action,
+            robot_state_mode=robot_state_mode,
+            ref_action_mode=ref_action_mode,
+        )
+        q1 = self._forward_one(self.q1_blocks, self.q1_norm, self.q1_head, query_tokens, context_tokens)
+        q2 = self._forward_one(self.q2_blocks, self.q2_norm, self.q2_head, query_tokens, context_tokens)
+        return q1, q2
+
+
 class GigaWorldPolicy(BasePolicy, nn.Module):
     """
     RLinf Giga World Action policy wrapper.
@@ -324,6 +601,21 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self.target_tau = float(policy_cfg.get("target_tau", 0.005))
         self.enable_absolute_action_bound = bool(
             policy_cfg.get("enable_absolute_action_bound", True)
+        )
+        self.use_cross_attention_fusion = bool(
+            policy_cfg.get("use_cross_attention_fusion", True)
+        )
+        self.cross_attention_dim = int(policy_cfg.get("cross_attention_dim", 512))
+        self.cross_attention_num_heads = int(policy_cfg.get("cross_attention_num_heads", 8))
+        self.cross_attention_num_layers = int(policy_cfg.get("cross_attention_num_layers", 2))
+        self.cross_attention_mlp_hidden_dim = int(
+            policy_cfg.get("cross_attention_mlp_hidden_dim", 1024)
+        )
+        self.cross_attention_dropout = float(
+            policy_cfg.get("cross_attention_dropout", 0.0)
+        )
+        self.critic_include_ref_action = bool(
+            policy_cfg.get("critic_include_ref_action", True)
         )
 
         self.actor_output_mode = str(
@@ -472,21 +764,46 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self.rl_state_dim = (
             self.visual_cond_dim + self.robot_state_cond_dim + self.ref_action_cond_dim
         )
+        self.visual_token_dim = self.vae_z_dim + 2
 
         # actor outputs MODEL-SPACE action chunk directly. During rollout, the
         # model-space action is post-processed with the same WA logic used by the
         # base policy before being sent to the environment.
-        self.actor_head = MLP(
-            input_dim=self.rl_state_dim,
-            hidden_dims=[2048, 1024],
-            output_dim=self.ref_action_flat_dim,
-            activate_final=False,
-            layer_norm=False,
-        )
-
-        # twin critics
-        critic_input_dim = self.rl_state_dim + self.ref_action_flat_dim
-        self.critic = TwinCritic(input_dim=critic_input_dim)
+        if self.use_cross_attention_fusion:
+            self.actor_head = CrossAttentionActor(
+                visual_token_dim=self.visual_token_dim,
+                robot_state_dim=self.robot_state_dim,
+                action_dim=self.model_action_dim,
+                action_chunk=self.action_chunk,
+                output_dim=self.ref_action_flat_dim,
+                d_model=self.cross_attention_dim,
+                num_heads=self.cross_attention_num_heads,
+                num_layers=self.cross_attention_num_layers,
+                mlp_hidden_dim=self.cross_attention_mlp_hidden_dim,
+                dropout=self.cross_attention_dropout,
+            )
+            self.critic = CrossAttentionTwinCritic(
+                visual_token_dim=self.visual_token_dim,
+                robot_state_dim=self.robot_state_dim,
+                action_dim=self.model_action_dim,
+                action_chunk=self.action_chunk,
+                d_model=self.cross_attention_dim,
+                num_heads=self.cross_attention_num_heads,
+                num_layers=self.cross_attention_num_layers,
+                mlp_hidden_dim=self.cross_attention_mlp_hidden_dim,
+                dropout=self.cross_attention_dropout,
+                include_ref_action=self.critic_include_ref_action,
+            )
+        else:
+            self.actor_head = MLP(
+                input_dim=self.rl_state_dim,
+                hidden_dims=[2048, 1024],
+                output_dim=self.ref_action_flat_dim,
+                activate_final=False,
+                layer_norm=False,
+            )
+            critic_input_dim = self.rl_state_dim + self.ref_action_flat_dim
+            self.critic = TwinCritic(input_dim=critic_input_dim)
 
         # target networks
         self.actor_target = copy.deepcopy(self.actor_head)
@@ -527,6 +844,12 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
     def set_visual_trainable(self, trainable: bool) -> None:
         self._set_requires_grad(self.visual_compressor, trainable)
+        if self.use_cross_attention_fusion:
+            for module_name in ["visual_proj"]:
+                if hasattr(self.actor_head, module_name):
+                    self._set_requires_grad(getattr(self.actor_head, module_name), trainable)
+                if hasattr(self.critic, module_name):
+                    self._set_requires_grad(getattr(self.critic, module_name), trainable)
 
     def set_actor_head_trainable(self, trainable: bool) -> None:
         self._set_requires_grad(self.actor_head, trainable)
@@ -536,7 +859,11 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
     def _init_actor_output_small(self):
         last_linear = None
-        for m in self.actor_head.modules():
+        if self.use_cross_attention_fusion and hasattr(self.actor_head, "output_head"):
+            modules = self.actor_head.output_head.modules()
+        else:
+            modules = self.actor_head.modules()
+        for m in modules:
             if isinstance(m, nn.Linear):
                 last_linear = m
         if last_linear is not None:
@@ -1111,11 +1438,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             "ref_action_exec": ref_action_exec,
         }
 
-    def encode_visual(self, visual_latent: torch.Tensor) -> torch.Tensor:
-        """
-        visual_latent: [B, Z, T, H, W]
-        compress to    [B, 2048]
-        """
+    def _collapse_visual_latent(self, visual_latent: torch.Tensor) -> torch.Tensor:
         if visual_latent.ndim != 5:
             raise ValueError(f"Expected visual_latent [B,Z,T,H,W], got {tuple(visual_latent.shape)}")
 
@@ -1125,10 +1448,34 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
         x = visual_latent.to(device=comp_device, dtype=comp_dtype)
         if x.shape[2] == 1:
-            x = x[:, :, 0]        # [B, Z, H, W]
-        else:
-            x = x.mean(dim=2)     # [B, Z, H, W]
-        return self.visual_compressor(x)
+            return x[:, :, 0]
+        return x.mean(dim=2)
+
+    def _build_visual_tokens(self, spatial_latent: torch.Tensor) -> torch.Tensor:
+        bsz, _, h, w = spatial_latent.shape
+        content_tokens = spatial_latent.flatten(2).transpose(1, 2)
+        ys = torch.linspace(-1.0, 1.0, h, device=spatial_latent.device, dtype=spatial_latent.dtype)
+        xs = torch.linspace(-1.0, 1.0, w, device=spatial_latent.device, dtype=spatial_latent.dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        coord_tokens = torch.stack([grid_y, grid_x], dim=-1).reshape(1, h * w, 2)
+        coord_tokens = coord_tokens.expand(bsz, -1, -1)
+        return torch.cat([content_tokens, coord_tokens], dim=-1)
+
+    def encode_visual(self, visual_latent: torch.Tensor) -> Any:
+        """
+        visual_latent: [B, Z, T, H, W]
+        old path:  compress to [B, 2048]
+        new path:  keep both pooled global feature and spatial tokens
+        """
+        spatial_latent = self._collapse_visual_latent(visual_latent)
+        visual_feat = self.visual_compressor(spatial_latent)
+        if not self.use_cross_attention_fusion:
+            return visual_feat
+        visual_tokens = self._build_visual_tokens(spatial_latent)
+        return {
+            "visual_feat": visual_feat,
+            "visual_tokens": visual_tokens,
+        }
 
     def build_rl_state(
         self,
@@ -1228,17 +1575,19 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
     def actor_forward(
         self,
-        visual_feat: torch.Tensor,
+        visual_feat: Any,
         robot_state: torch.Tensor,
         ref_action: torch.Tensor,
         ref_action_dropout_p: Optional[float] = None,
         use_target: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         """
         Actor outputs FINAL action chunk directly.
 
         Inputs:
-            visual_feat: [B, 2048]
+            visual_feat:
+                old path -> [B, 2048]
+                new path -> {"visual_feat": [B,2048], "visual_tokens": [B,N,Z+2]}
             robot_state: [B, state_dim]
             ref_action:  [B, C, A]
         Returns:
@@ -1252,18 +1601,79 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             ref_action, p=ref_action_dropout_p
         )
 
-        rl_state, rl_state_aux = self.build_rl_state(
-            visual_feat=visual_feat,
-            robot_state=robot_state,
-            ref_action=cond_ref_action,
-        )
-
         head = self.actor_target if use_target else self.actor_head
-        action_flat = head(rl_state)
-        learned_action = action_flat.view(-1, self.action_chunk, self.model_action_dim)
 
+        if self.use_cross_attention_fusion:
+            if not isinstance(visual_feat, dict):
+                raise TypeError(
+                    "Expected encode_visual() to return a dict when use_cross_attention_fusion=True."
+                )
+            actor_param = next(head.parameters())
+            actor_device = actor_param.device
+            actor_dtype = actor_param.dtype
+
+            visual_global = visual_feat["visual_feat"].to(device=actor_device, dtype=actor_dtype)
+            visual_tokens = visual_feat["visual_tokens"].to(device=actor_device, dtype=actor_dtype)
+            robot_state_in = robot_state.to(device=actor_device, dtype=actor_dtype)
+            cond_ref_action_in = cond_ref_action.to(device=actor_device, dtype=actor_dtype)
+
+            action_flat, cross_aux = head(
+                visual_tokens=visual_tokens,
+                robot_state=robot_state_in,
+                ref_action=cond_ref_action_in,
+                visual_mode=self.visual_input_mode,
+                robot_state_mode=self.robot_state_input_mode,
+                ref_action_mode=self.ref_action_input_mode,
+            )
+            learned_action = action_flat.view(-1, self.action_chunk, self.model_action_dim)
+            rl_state = {
+                "fusion_type": "cross_attention",
+                "visual_tokens": visual_tokens,
+                "robot_state": robot_state_in,
+                "cond_ref_action": cond_ref_action_in,
+                "visual_mode": self.visual_input_mode,
+                "robot_state_mode": self.robot_state_input_mode,
+                "ref_action_mode": self.ref_action_input_mode,
+                "actor_pooled_state": cross_aux["pooled_state"],
+            }
+            visual_feat_for_state = (
+                torch.zeros_like(visual_global) if self.visual_input_mode == "zero" else visual_global
+            )
+            robot_state_for_state = (
+                torch.zeros_like(robot_state_in)
+                if self.robot_state_input_mode == "zero"
+                else robot_state_in
+            )
+            ref_action_flat_for_state = cond_ref_action_in.reshape(cond_ref_action_in.shape[0], -1)
+            if self.ref_action_input_mode == "zero":
+                ref_action_flat_for_state = torch.zeros_like(ref_action_flat_for_state)
+            aux = {
+                "raw_action": learned_action,
+                "rl_state": rl_state,
+                "cond_ref_action": cond_ref_action_in,
+                "visual_feat_for_state": visual_feat_for_state,
+                "robot_state_for_state": robot_state_for_state,
+                "ref_action_flat_for_state": ref_action_flat_for_state,
+            }
+            aux.update(cross_aux)
+        else:
+            rl_state, rl_state_aux = self.build_rl_state(
+                visual_feat=visual_feat,
+                robot_state=robot_state,
+                ref_action=cond_ref_action,
+            )
+            action_flat = head(rl_state)
+            learned_action = action_flat.view(-1, self.action_chunk, self.model_action_dim)
+            aux = {
+                "raw_action": learned_action,
+                "rl_state": rl_state,
+                "cond_ref_action": cond_ref_action,
+            }
+            aux.update(rl_state_aux)
+
+        base_dtype = learned_action.dtype
         if self.actor_output_mode == "hard_copy_ref_action":
-            action = ref_action.to(dtype=rl_state.dtype) + 0.0 * learned_action
+            action = ref_action.to(dtype=base_dtype) + 0.0 * learned_action
         else:
             action = (
                 self._bound_absolute_action_model(learned_action)
@@ -1271,19 +1681,13 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 else learned_action
             )
 
-        aux = {
-            "raw_action": learned_action,
-            "rl_state": rl_state,
-            "cond_ref_action": cond_ref_action,
-        }
-        aux.update(rl_state_aux)
         if dropout_mask is not None:
             aux["ref_dropout_mask"] = dropout_mask
         return action, aux
 
     def critic_forward(
         self,
-        rl_state: torch.Tensor,
+        rl_state: Any,
         action: torch.Tensor,
         use_target: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1292,12 +1696,32 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         critic_device = critic_param.device
         critic_dtype = critic_param.dtype
 
-        rl_state = rl_state.to(device=critic_device, dtype=critic_dtype)
         action_for_critic = (
             self._bound_absolute_action_model(action)
             if self.enable_absolute_action_bound
             else action
         )
+
+        if self.use_cross_attention_fusion:
+            if not isinstance(rl_state, dict):
+                raise TypeError(
+                    "Expected rl_state to be a dict when use_cross_attention_fusion=True."
+                )
+            visual_tokens = rl_state["visual_tokens"].to(device=critic_device, dtype=critic_dtype)
+            robot_state = rl_state["robot_state"].to(device=critic_device, dtype=critic_dtype)
+            cond_ref_action = rl_state["cond_ref_action"].to(device=critic_device, dtype=critic_dtype)
+            action_for_critic = action_for_critic.to(device=critic_device, dtype=critic_dtype)
+            return critic(
+                visual_tokens=visual_tokens,
+                robot_state=robot_state,
+                ref_action=cond_ref_action,
+                action=action_for_critic,
+                visual_mode=str(rl_state.get("visual_mode", self.visual_input_mode)),
+                robot_state_mode=str(rl_state.get("robot_state_mode", self.robot_state_input_mode)),
+                ref_action_mode=str(rl_state.get("ref_action_mode", self.ref_action_input_mode)),
+            )
+
+        rl_state = rl_state.to(device=critic_device, dtype=critic_dtype)
         action_flat = action_for_critic.reshape(action_for_critic.shape[0], -1).to(
             device=critic_device, dtype=critic_dtype
         )
