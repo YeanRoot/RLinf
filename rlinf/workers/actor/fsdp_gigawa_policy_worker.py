@@ -342,6 +342,33 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.ref_action_dropout_p = float(self.cfg.algorithm.get("ref_action_dropout_p", 0.5))
         self.target_policy_noise = float(self.cfg.algorithm.get("target_policy_noise", 0.2))
         self.target_noise_clip = float(self.cfg.algorithm.get("target_noise_clip", 0.5))
+
+        policy_head_cfg = self.cfg.actor.model.giga_world_policy
+        self.enable_critic_q_upper_bound = bool(
+            policy_head_cfg.get("enable_critic_q_upper_bound", True)
+        )
+        self.critic_q_upper_bound = float(
+            policy_head_cfg.get("critic_q_upper_bound", 1.0)
+        )
+        self.actor_q_loss_clamp_to_upper_bound = bool(
+            policy_head_cfg.get(
+                "actor_q_loss_clamp_to_upper_bound",
+                self.enable_critic_q_upper_bound,
+            )
+        )
+        self.critic_target_clamp_to_upper_bound = bool(
+            policy_head_cfg.get(
+                "critic_target_clamp_to_upper_bound",
+                self.enable_critic_q_upper_bound,
+            )
+        )
+        self.critic_overshoot_penalty_coef = float(
+            policy_head_cfg.get("critic_overshoot_penalty_coef", 1.0)
+        )
+        if self.critic_q_upper_bound <= 0.0:
+            raise ValueError(
+                f"critic_q_upper_bound must be positive, got {self.critic_q_upper_bound}."
+            )
         self.warmup_steps = int(self.cfg.algorithm.get("warmup_steps", 0))
         self.rollout_actor_after_warmup = bool(
             self.cfg.algorithm.get("rollout_actor_after_warmup", True)
@@ -990,7 +1017,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     buffer, self.offline_critic_global_batch_per_rank
                 )
                 for batch in self._offline_critic_microbatches(global_batch):
-                    critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                    critic_loss, q1, q2, target_q_values, _ = self._compute_critic_outputs(batch)
                     q_logged = torch.minimum(q1, q2)
                     local[f"{prefix}/count"] += float(q_logged.numel())
                     local[f"{prefix}/critic_loss_sum"] += float(critic_loss.item()) * float(q_logged.numel())
@@ -1044,7 +1071,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     buffer, self.offline_rl_global_batch_per_rank
                 )
                 for batch in self._offline_rl_microbatches(global_batch):
-                    critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                    critic_loss, q1, q2, target_q_values, _ = self._compute_critic_outputs(batch)
                     q_logged = torch.minimum(q1, q2)
                     local[f"{prefix}/count"] += float(q_logged.numel())
                     local[f"{prefix}/critic_loss_sum"] += float(critic_loss.item()) * float(q_logged.numel())
@@ -1148,7 +1175,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             step_target_q = []
             step_q_logged = []
             for batch in train_micro_batch_list:
-                critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                critic_loss, q1, q2, target_q_values, _ = self._compute_critic_outputs(batch)
                 (critic_loss / self.gradient_accumulation).backward()
                 q_logged = torch.minimum(q1.detach(), q2.detach())
                 step_losses.append(float(critic_loss.detach().item()))
@@ -1180,7 +1207,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 for _ in range(self.offline_critic_val_steps):
                     global_batch = self._offline_critic_sample_batch(train=False)
                     for batch in self._offline_critic_microbatches(global_batch):
-                        critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                        critic_loss, q1, q2, target_q_values, _ = self._compute_critic_outputs(batch)
                         q_logged = torch.minimum(q1, q2)
                         val_losses.append(float(critic_loss.item()))
                         val_q1_means.append(float(q1.mean().item()))
@@ -1313,7 +1340,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 step_target_q = []
                 step_q_logged = []
                 for batch in train_micro_batch_list:
-                    critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+                    critic_loss, q1, q2, target_q_values, _ = self._compute_critic_outputs(batch)
                     (critic_loss / self.gradient_accumulation).backward()
                     q_logged = torch.minimum(q1.detach(), q2.detach())
                     step_losses.append(float(critic_loss.detach().item()))
@@ -1518,26 +1545,21 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         policy = self._unwrap_policy(self.model)
         return str(getattr(policy, "visual_input_mode", "normal")).lower()
 
-    def _build_visual_feat_for_actor(self, visual_latent: torch.Tensor) -> Any:
-        return self.model(
-            forward_type=ForwardType.DEFAULT,
-            mode="encode_visual",
-            visual_latent=visual_latent.to(self.device, dtype=self.torch_dtype),
-        )
+    def _build_visual_feat_for_actor(self, visual_latent: torch.Tensor) -> torch.Tensor:
+        policy = self._unwrap_policy(self.model)
+        mode = self._visual_mode()
+        if mode == "normal":
+            return self.model(
+                forward_type=ForwardType.DEFAULT,
+                mode="encode_visual",
+                visual_latent=visual_latent.to(self.device, dtype=self.torch_dtype),
+            )
 
-    @staticmethod
-    def _detach_rl_state(rl_state: Any) -> Any:
-        if torch.is_tensor(rl_state):
-            return rl_state.detach()
-        if isinstance(rl_state, dict):
-            return {
-                k: EmbodiedGigaWAFSDPPolicy._detach_rl_state(v)
-                for k, v in rl_state.items()
-            }
-        if isinstance(rl_state, (list, tuple)):
-            values = [EmbodiedGigaWAFSDPPolicy._detach_rl_state(v) for v in rl_state]
-            return type(rl_state)(values)
-        return rl_state
+        return policy.build_zero_visual_feat_from_latent(
+            visual_latent=visual_latent,
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
 
     def _should_capture_action_diagnostics(self) -> bool:
         if not self.action_diag_enable:
@@ -2573,7 +2595,16 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 ref_action_dropout_p=0.0,
                 use_target=False,
             )
-            curr_rl_state = self._detach_rl_state(curr_actor_aux["rl_state"])
+            curr_rl_state = curr_actor_aux["rl_state"].detach()
+            curr_critic_visual_tokens = curr_actor_aux.get("critic_visual_tokens", None)
+            if curr_critic_visual_tokens is not None:
+                curr_critic_visual_tokens = curr_critic_visual_tokens.detach()
+            curr_critic_robot_state = curr_actor_aux.get("critic_robot_state", None)
+            if curr_critic_robot_state is not None:
+                curr_critic_robot_state = curr_critic_robot_state.detach()
+            curr_critic_ref_action = curr_actor_aux.get("critic_ref_action", None)
+            if curr_critic_ref_action is not None:
+                curr_critic_ref_action = curr_critic_ref_action.detach()
 
             next_visual_feat = self._build_visual_feat_for_actor(next_obs["visual_latent"])
             next_actions, next_actor_aux = policy.target_actor_forward(
@@ -2592,9 +2623,16 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             target_q1, target_q2 = policy.target_critic_forward(
                 rl_state=next_rl_state,
                 action=next_actions,
+                critic_visual_tokens=next_actor_aux.get("critic_visual_tokens", None),
+                critic_robot_state=next_actor_aux.get("critic_robot_state", None),
+                critic_ref_action=next_actor_aux.get("critic_ref_action", None),
             )
             target_q = torch.minimum(target_q1, target_q2)
+            if self.enable_critic_q_upper_bound and self.critic_target_clamp_to_upper_bound:
+                target_q = torch.clamp(target_q, max=self.critic_q_upper_bound)
             target_q_values = rewards_for_bootstrap + (1.0 - done_mask) * self.discount * target_q
+            if self.enable_critic_q_upper_bound and self.critic_target_clamp_to_upper_bound:
+                target_q_values = torch.clamp(target_q_values, max=self.critic_q_upper_bound)
 
         q1, q2 = self.model(
             forward_type=ForwardType.DEFAULT,
@@ -2602,18 +2640,39 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             rl_state=curr_rl_state,
             action=actions,
             use_target=False,
+            critic_visual_tokens=curr_critic_visual_tokens,
+            critic_robot_state=curr_critic_robot_state,
+            critic_ref_action=curr_critic_ref_action,
         )
         target_q_values = target_q_values.to(dtype=q1.dtype)
         critic_loss = F.mse_loss(q1, target_q_values) + F.mse_loss(q2, target_q_values)
-        return critic_loss, q1, q2, target_q_values
+        q1_overshoot = torch.clamp(q1 - self.critic_q_upper_bound, min=0.0)
+        q2_overshoot = torch.clamp(q2 - self.critic_q_upper_bound, min=0.0)
+        critic_overshoot_penalty = q1.new_zeros(())
+        if self.enable_critic_q_upper_bound and self.critic_overshoot_penalty_coef > 0.0:
+            critic_overshoot_penalty = self.critic_overshoot_penalty_coef * (
+                (q1_overshoot ** 2).mean() + (q2_overshoot ** 2).mean()
+            )
+            critic_loss = critic_loss + critic_overshoot_penalty
+        critic_aux = {
+            "critic_overshoot_penalty": float(critic_overshoot_penalty.detach().item()),
+            "q1_overshoot": float(q1_overshoot.mean().detach().item()),
+            "q2_overshoot": float(q2_overshoot.mean().detach().item()),
+            "q_upper_bound": float(self.critic_q_upper_bound),
+        }
+        return critic_loss, q1, q2, target_q_values, critic_aux
 
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
-        critic_loss, q1, q2, target_q_values = self._compute_critic_outputs(batch)
+        critic_loss, q1, q2, target_q_values, critic_aux = self._compute_critic_outputs(batch)
         return critic_loss, {
             "q1_data": q1.mean().item(),
             "q2_data": q2.mean().item(),
             "target_q": target_q_values.mean().item(),
+            "critic_overshoot_penalty": critic_aux["critic_overshoot_penalty"],
+            "q1_overshoot": critic_aux["q1_overshoot"],
+            "q2_overshoot": critic_aux["q2_overshoot"],
+            "q_upper_bound": critic_aux["q_upper_bound"],
         }
 
     def _compose_actor_loss(self, q_pi: torch.Tensor | None, bc_loss: torch.Tensor):
@@ -2622,9 +2681,13 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         effective_bc_coef = float(self.bc_coef)
         hard_penalty = bc_loss.new_zeros(())
         guard_active = 0.0
+        q_pi_for_loss = None
 
         if q_pi is not None:
-            q_term = (-q_pi).mean()
+            q_pi_for_loss = q_pi
+            if self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound:
+                q_pi_for_loss = torch.clamp(q_pi_for_loss, max=self.critic_q_upper_bound)
+            q_term = (-q_pi_for_loss).mean()
 
         if self.actor_bc_guard_mode == "weighted":
             effective_bc_coef = float(self.actor_bc_weighted_coef)
@@ -2637,6 +2700,14 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         actor_loss = q_weight * q_term + effective_bc_coef * bc_loss + hard_penalty
         metrics = {
             "bc_coef_effective": effective_bc_coef,
+            "q_upper_bound_enabled": float(self.enable_critic_q_upper_bound),
+            "q_upper_bound": float(self.critic_q_upper_bound),
+            "q_loss_clamped": float(
+                self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound and q_pi is not None
+            ),
+            "q_pi_used_for_loss": float(
+                q_pi_for_loss.mean().detach().item()
+            ) if q_pi_for_loss is not None else 0.0,
             "bc_guard_mode": float(
                 0 if self.actor_bc_guard_mode == "none"
                 else 1 if self.actor_bc_guard_mode == "weighted"
@@ -2731,11 +2802,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 "ref_action": ref_action.detach(),
                 "pred_action": pi.detach(),
                 "robot_state": robot_state.detach(),
-                "visual_feat": (visual_feat["visual_feat"] if isinstance(visual_feat, dict) else visual_feat).detach(),
-                "visual_feat_for_state": actor_aux.get(
-                    "visual_feat_for_state",
-                    visual_feat["visual_feat"] if isinstance(visual_feat, dict) else visual_feat,
-                ).detach(),
+                "visual_feat": visual_feat.detach(),
+                "visual_feat_for_state": actor_aux.get("visual_feat_for_state", visual_feat).detach(),
                 "robot_state_for_state": actor_aux.get("robot_state_for_state", robot_state).detach(),
                 "ref_action_flat_for_state": actor_aux.get(
                     "ref_action_flat_for_state", ref_action.reshape(ref_action.shape[0], -1)
@@ -2755,12 +2823,19 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             rl_state=rl_state,
             action=pi,
             use_target=False,
+            critic_visual_tokens=actor_aux.get("critic_visual_tokens", None),
+            critic_robot_state=actor_aux.get("critic_robot_state", None),
+            critic_ref_action=actor_aux.get("critic_ref_action", None),
         )
         q_pi = torch.minimum(q1_pi, q2_pi)
 
         actor_loss, guard_metrics = self._compose_actor_loss(q_pi=q_pi, bc_loss=bc_loss)
         metrics.update(guard_metrics)
         metrics["q_pi"] = q_pi.mean().item()
+        if self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound:
+            metrics["q_pi_clamped"] = torch.clamp(q_pi, max=self.critic_q_upper_bound).mean().item()
+        else:
+            metrics["q_pi_clamped"] = q_pi.mean().item()
         return actor_loss, metrics, debug_bundle
 
     # ---------------------------------------------------------------------

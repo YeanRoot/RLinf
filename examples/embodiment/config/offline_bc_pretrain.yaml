@@ -18,7 +18,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall_423_atten"
+    log_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall_423_atten_4_4
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]

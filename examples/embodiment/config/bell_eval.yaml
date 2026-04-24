@@ -13,12 +13,12 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor, env, rollout: 4-7
+    actor, env, rollout: 0-3
 
 runner:
   task_type: embodied
   logger:
-    log_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall_422_final_fix_original/robotwin_train_giga_world_policy/checkpoints/global_step_40
+    log_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_424/robotwin_train_giga_world_policy/checkpoints/global_step_800/noactor2
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -29,8 +29,8 @@ runner:
   only_eval: True
   val_check_interval: 200
   save_interval: 200
-
-  resume_dir: ${runner.logger.log_path}
+  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_424/robotwin_train_giga_world_policy/checkpoints/global_step_800
+  # resume_dir: ${runner.logger.log_path}
   ckpt_path: null
   resume_load_optimizer_and_scheduler_state: false
 
@@ -56,7 +56,7 @@ algorithm:
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
-    load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_422/mergeall
+    load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_reextract_422/mergeall_original
     sample_ratio: 1
     allow_train_on_demo_only: true
     allow_demo_only_fallback: true
@@ -127,7 +127,7 @@ env:
   enable_offload: False
 
   train:
-    total_num_envs: 4
+    total_num_envs: 16
     reward_coef: ${algorithm.reward_coef}
     max_episode_steps: 192
     max_steps_per_rollout_epoch: 192
@@ -143,7 +143,7 @@ env:
         collect_wrist_camera: true
 
   eval:
-    total_num_envs: 4
+    total_num_envs: 16
     auto_reset: True
     ignore_terminations: False
     max_episode_steps: 192
@@ -214,7 +214,7 @@ actor:
       single_view_height: 192
       prompt: null
       use_safetensors: False
-      use_rl_head_for_rollout: true
+      use_rl_head_for_rollout: false
       visual_feature_dim: 2048
       bc_coef: 1
       ref_action_dropout_p: 0

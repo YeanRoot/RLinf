@@ -13,12 +13,12 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor, env, rollout: 4-7
+    actor, env, rollout: 0-3
 
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall_422_4"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall_423_atten3"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -29,7 +29,7 @@ runner:
   val_check_interval: 1
   save_interval: 20
 
-  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall/robotwin_train_giga_world_policy/checkpoints/global_step_40
+  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall_423_atten_4_3/robotwin_train_giga_world_policy/checkpoints/global_step_20
   ckpt_path: null
   resume_load_optimizer_and_scheduler_state: false
   per_worker_log_path: null
@@ -38,7 +38,7 @@ algorithm:
   replay_buffer:
     enable_cache: True
     cache_size: 2000
-    sample_window_size: 6000
+    sample_window_size: 2000
     min_buffer_size: 0
     require_for_training: false
     store_online_data: false
@@ -52,13 +52,13 @@ algorithm:
     enable: true
     enable_cache: True
     cache_size: 2000
-    sample_window_size: 7000
+    sample_window_size: 2000
     min_buffer_size: 32
     train_actor_steps: 32
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
-    load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_fix_422/mergeall_original
+    load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_reextract_422/mergeall_original
     sample_ratio: 1.0
     allow_train_on_demo_only: true
     allow_demo_only_fallback: true

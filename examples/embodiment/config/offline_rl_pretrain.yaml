@@ -13,12 +13,12 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor, env, rollout: 4-7
+    actor, env, rollout: 0-3
 
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_rl_pretrain_mergeall_422_3"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_rl_pretrain_mergeall_424"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -29,7 +29,7 @@ runner:
   val_check_interval: 1
   save_interval: 20
 
-  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_critic_pretrain_mergeall_422/robotwin_train_giga_world_policy/checkpoints/global_step_220
+  resume_dir: null
   ckpt_path: null
   resume_load_optimizer_and_scheduler_state: false
   per_worker_log_path: null
@@ -58,7 +58,7 @@ algorithm:
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
-    load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_422/mergeall
+    load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_reextract_422/mergeall_original
     sample_ratio: 1.0
     allow_train_on_demo_only: true
     allow_demo_only_fallback: true
@@ -119,7 +119,7 @@ algorithm:
   target_update_freq: 1
   target_policy_noise: 0.0
   target_noise_clip: 0.0
-  bc_coef: 0
+  bc_coef: 50
   ref_action_dropout_p: 0.5
   warmup_steps: 0
   train_actor_steps: 0
@@ -158,15 +158,7 @@ env:
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
-      use_seed: true
-      domain_randomization:
-        random_background: false
-        cluttered_table: false
-        clean_background_rate: 1.0
-        random_head_camera_dis: 0.0
-        random_table_height: 0.0
-        random_light: false
-        crazy_random_light_rate: 0.0
+
 
   eval:
     total_num_envs: 4
@@ -188,15 +180,7 @@ env:
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
-      use_seed: true
-      domain_randomization:
-        random_background: false
-        cluttered_table: false
-        clean_background_rate: 1.0
-        random_head_camera_dis: 0.0
-        random_table_height: 0.0
-        random_light: false
-        crazy_random_light_rate: 0.0        
+     
 
 rollout:
   group_name: "RolloutGroup"
@@ -250,7 +234,7 @@ actor:
       use_safetensors: False
       use_rl_head_for_rollout: False
       visual_feature_dim: 2048
-      bc_coef: 1
+      bc_coef: 50
       ref_action_dropout_p: 0
       target_tau: 0.005
       enable_latent_debug: False

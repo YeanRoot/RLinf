@@ -272,8 +272,22 @@ def _analyze_single_trajectory(
             use_target=False,
         )
         rl_state = actor_aux['rl_state']
-        q1_true, q2_true = policy.critic_forward(rl_state=rl_state, action=true_action, use_target=False)
-        q1_pred, q2_pred = policy.critic_forward(rl_state=rl_state, action=pred_action, use_target=False)
+        q1_true, q2_true = policy.critic_forward(
+            rl_state=rl_state,
+            action=true_action,
+            use_target=False,
+            critic_visual_tokens=actor_aux.get('critic_visual_tokens', None),
+            critic_robot_state=actor_aux.get('critic_robot_state', None),
+            critic_ref_action=actor_aux.get('critic_ref_action', None),
+        )
+        q1_pred, q2_pred = policy.critic_forward(
+            rl_state=rl_state,
+            action=pred_action,
+            use_target=False,
+            critic_visual_tokens=actor_aux.get('critic_visual_tokens', None),
+            critic_robot_state=actor_aux.get('critic_robot_state', None),
+            critic_ref_action=actor_aux.get('critic_ref_action', None),
+        )
         q_true_action = torch.minimum(q1_true, q2_true).squeeze(-1)
         q_pred_action = torch.minimum(q1_pred, q2_pred).squeeze(-1)
         true_exec = policy.postprocess_action_model_batch(true_action, curr_robot_state)
