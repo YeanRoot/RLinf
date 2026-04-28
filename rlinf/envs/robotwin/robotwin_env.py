@@ -52,6 +52,10 @@ class RoboTwinEnv(gym.Env):
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.use_custom_reward = cfg.use_custom_reward
+        self.reward_mode = str(cfg.task_config.get("reward_mode", "sparse")).lower()
+        self.use_dense_stage_reward = self.reward_mode != "sparse"
+        if self.use_dense_stage_reward:
+            self.use_custom_reward = False
 
         self.video_cfg = cfg.video_cfg
 
@@ -288,7 +292,7 @@ class RoboTwinEnv(gym.Env):
                 np.array(truncations).reshape(-1), device=self.device
             )
 
-        if self.use_custom_reward:
+        if self.use_custom_reward and not self.use_dense_stage_reward:
             step_reward = self._calc_step_reward(terminations)
         else:
             if isinstance(step_reward, list):
@@ -326,6 +330,8 @@ class RoboTwinEnv(gym.Env):
         num_envs = chunk_actions.shape[0]
         chunk_step = chunk_actions.shape[1]
         chunk_step_mode = str(self.cfg.get("chunk_step_mode", "vectorized")).lower()
+        if self.use_dense_stage_reward and chunk_step_mode != "sequential":
+            chunk_step_mode = "sequential"
 
         if chunk_step_mode == "sequential":
             obs_list = []
@@ -395,7 +401,7 @@ class RoboTwinEnv(gym.Env):
                 np.array(truncations).reshape(-1), device=self.device
             )
 
-        if self.use_custom_reward:
+        if self.use_custom_reward and not self.use_dense_stage_reward:
             step_reward = self._calc_step_reward(terminations)
         else:
             if isinstance(step_reward, list):

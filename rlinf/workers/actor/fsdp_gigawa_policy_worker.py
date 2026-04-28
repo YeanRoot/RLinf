@@ -365,6 +365,22 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.critic_overshoot_penalty_coef = float(
             policy_head_cfg.get("critic_overshoot_penalty_coef", 1.0)
         )
+        self.auto_critic_q_upper_bound_from_env_reward = None
+        env_train_cfg = self.cfg.env.train
+        if bool(env_train_cfg.get("auto_set_critic_q_upper_bound_from_env_reward", False)):
+            task_cfg = env_train_cfg.get("task_config", {})
+            reward_mode = str(task_cfg.get("reward_mode", "sparse")).lower()
+            reward_is_normalized = bool(task_cfg.get("normalize_reward", False))
+            reward_return_upper_bound = task_cfg.get("reward_return_upper_bound", None)
+            if reward_mode != "sparse":
+                if reward_is_normalized:
+                    self.auto_critic_q_upper_bound_from_env_reward = 1.0
+                elif reward_return_upper_bound is not None:
+                    self.auto_critic_q_upper_bound_from_env_reward = float(reward_return_upper_bound)
+
+        if self.auto_critic_q_upper_bound_from_env_reward is not None:
+            self.critic_q_upper_bound = self.auto_critic_q_upper_bound_from_env_reward
+
         if self.critic_q_upper_bound <= 0.0:
             raise ValueError(
                 f"critic_q_upper_bound must be positive, got {self.critic_q_upper_bound}."

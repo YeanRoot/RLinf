@@ -20,7 +20,7 @@ conda activate pi-rl-h20
 
 python collect_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name collect_bell_data_fix
+  --config-name collect_cup_data
 
 train
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
@@ -66,10 +66,10 @@ python repair_pre_earlystop_buffer.py   --input-root /shared_disk/users/angen.ye
 
 CUDA_VISIBLE_DEVICES=0 python analyze_gigawa_pt_qsa.py \
   --config /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment/config/analysis.yaml \
-  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_reextract_422/offline_collection/rank_1/failure/rank1_0.pt \
-  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_reextract_422/offline_collection/rank_1/failure/rank1_12.pt\
-  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_reextract_422/offline_collection/rank_2/success/rank2_0.pt \
-  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_reextract_422/offline_collection/rank_2/success/rank2_6.pt\
-  --checkpoint /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_424_nobc/robotwin_train_giga_world_policy/checkpoints/global_step_400 \
-  --output-dir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/qsa_debug_rl_424_online_nobc \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_200/actor/gigawa_components/demo_buffer/rank_1/rank0_144_rerank1.pt \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_200/actor/gigawa_components/demo_buffer/rank_1/rank0_204_rerank1.pt \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_5000/actor/gigawa_components/replay_buffer/rank_2/trajectory_2_13ff21f0-2353-52d8-a7f7-f7a801148059.pt \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_5000/actor/gigawa_components/replay_buffer/rank_2/trajectory_4985_cbb4a237-c416-5cc5-a29d-aedb87453060.pt \
+  --checkpoint /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_5000 \
+  --output-dir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/qsa_debug_rl_424_online_cup \
   --device cuda
