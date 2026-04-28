@@ -322,28 +322,6 @@ class CrossAttentionActor(nn.Module):
         return action, fused_state
 
 
-class TwinCritic(nn.Module):
-    def __init__(self, input_dim: int):
-        super().__init__()
-        self.q1 = MLP(
-            input_dim=input_dim,
-            hidden_dims=[2048, 1024, 512],
-            output_dim=1,
-            activate_final=False,
-            layer_norm=False,
-        )
-        self.q2 = MLP(
-            input_dim=input_dim,
-            hidden_dims=[2048, 1024, 512],
-            output_dim=1,
-            activate_final=False,
-            layer_norm=False,
-        )
-
-    def forward(self, x: torch.Tensor, action_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        qa_input = torch.cat([x, action_flat], dim=-1)
-        return self.q1(qa_input), self.q2(qa_input)
-
 
 class TwinCriticValue(nn.Module):
     def __init__(self, input_dim: int):
@@ -367,6 +345,104 @@ class TwinCriticValue(nn.Module):
         return self.q1(x), self.q2(x)
 
 
+class TwinCritic(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        action_chunk: int,
+        critic_arch_mode: str = "q_only",
+        chunk_discount: float = 1.0,
+    ):
+        super().__init__()
+        self.action_chunk = int(action_chunk)
+        self.critic_arch_mode = str(critic_arch_mode).lower()
+        self.chunk_discount = float(chunk_discount)
+
+        valid_modes = {"q_only", "q_aux_reward_chunk", "q_decomposed"}
+        if self.critic_arch_mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported critic_arch_mode={self.critic_arch_mode}, "
+                f"expected one of {sorted(valid_modes)}"
+            )
+
+        if self.critic_arch_mode in {"q_only", "q_aux_reward_chunk"}:
+            self.q1 = MLP(
+                input_dim=input_dim,
+                hidden_dims=[2048, 1024, 512],
+                output_dim=1,
+                activate_final=False,
+                layer_norm=False,
+            )
+            self.q2 = MLP(
+                input_dim=input_dim,
+                hidden_dims=[2048, 1024, 512],
+                output_dim=1,
+                activate_final=False,
+                layer_norm=False,
+            )
+        else:
+            self.tail_q1 = MLP(
+                input_dim=input_dim,
+                hidden_dims=[2048, 1024, 512],
+                output_dim=1,
+                activate_final=False,
+                layer_norm=False,
+            )
+            self.tail_q2 = MLP(
+                input_dim=input_dim,
+                hidden_dims=[2048, 1024, 512],
+                output_dim=1,
+                activate_final=False,
+                layer_norm=False,
+            )
+
+        if self.critic_arch_mode in {"q_aux_reward_chunk", "q_decomposed"}:
+            self.reward_chunk_head = MLP(
+                input_dim=input_dim,
+                hidden_dims=[2048, 1024, 512],
+                output_dim=self.action_chunk,
+                activate_final=False,
+                layer_norm=False,
+            )
+        else:
+            self.reward_chunk_head = None
+
+    def set_chunk_discount(self, chunk_discount: float) -> None:
+        self.chunk_discount = float(chunk_discount)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        action_flat: torch.Tensor,
+        return_aux: bool = False,
+    ):
+        qa_input = torch.cat([x, action_flat], dim=-1)
+        aux: dict[str, torch.Tensor] = {}
+
+        if self.critic_arch_mode == "q_only":
+            q1 = self.q1(qa_input)
+            q2 = self.q2(qa_input)
+            return (q1, q2, aux) if return_aux else (q1, q2)
+
+        reward_chunk_pred = self.reward_chunk_head(qa_input)
+        aux["reward_chunk_pred"] = reward_chunk_pred
+
+        if self.critic_arch_mode == "q_aux_reward_chunk":
+            q1 = self.q1(qa_input)
+            q2 = self.q2(qa_input)
+            return (q1, q2, aux) if return_aux else (q1, q2)
+
+        reward_chunk_sum = reward_chunk_pred.sum(dim=-1, keepdim=True)
+        tail_q1 = self.tail_q1(qa_input)
+        tail_q2 = self.tail_q2(qa_input)
+        q1 = reward_chunk_sum + self.chunk_discount * tail_q1
+        q2 = reward_chunk_sum + self.chunk_discount * tail_q2
+        aux["reward_chunk_sum"] = reward_chunk_sum
+        aux["tail_q1"] = tail_q1
+        aux["tail_q2"] = tail_q2
+        return (q1, q2, aux) if return_aux else (q1, q2)
+
+
 class CrossAttentionCritic(nn.Module):
     def __init__(
         self,
@@ -375,13 +451,46 @@ class CrossAttentionCritic(nn.Module):
         dropout: float,
         robot_state_dim: int,
         action_dim: int,
+        action_chunk: int,
+        critic_arch_mode: str = "q_only",
+        chunk_discount: float = 1.0,
     ):
         super().__init__()
         self.state_proj = nn.Linear(robot_state_dim, hidden_dim)
         self.ref_action_proj = nn.Linear(action_dim, hidden_dim)
         self.action_proj = nn.Linear(action_dim, hidden_dim)
         self.cross_attn = CrossAttentionBlock(hidden_dim, num_heads, dropout)
-        self.value_head = TwinCriticValue(input_dim=hidden_dim)
+        self.action_chunk = int(action_chunk)
+        self.critic_arch_mode = str(critic_arch_mode).lower()
+        self.chunk_discount = float(chunk_discount)
+
+        valid_modes = {"q_only", "q_aux_reward_chunk", "q_decomposed"}
+        if self.critic_arch_mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported critic_arch_mode={self.critic_arch_mode}, "
+                f"expected one of {sorted(valid_modes)}"
+            )
+
+        if self.critic_arch_mode in {"q_only", "q_aux_reward_chunk"}:
+            self.value_head = TwinCriticValue(input_dim=hidden_dim)
+            self.tail_value_head = None
+        else:
+            self.value_head = None
+            self.tail_value_head = TwinCriticValue(input_dim=hidden_dim)
+
+        if self.critic_arch_mode in {"q_aux_reward_chunk", "q_decomposed"}:
+            self.reward_chunk_head = MLP(
+                input_dim=hidden_dim,
+                hidden_dims=[1024, 512],
+                output_dim=1,
+                activate_final=False,
+                layer_norm=False,
+            )
+        else:
+            self.reward_chunk_head = None
+
+    def set_chunk_discount(self, chunk_discount: float) -> None:
+        self.chunk_discount = float(chunk_discount)
 
     def forward(
         self,
@@ -389,7 +498,8 @@ class CrossAttentionCritic(nn.Module):
         robot_state: Optional[torch.Tensor],
         ref_action: Optional[torch.Tensor],
         action: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+    ):
         query_tokens = []
         if robot_state is not None:
             query_tokens.append(self.state_proj(robot_state).unsqueeze(1))
@@ -398,12 +508,34 @@ class CrossAttentionCritic(nn.Module):
         query_tokens.append(self.action_proj(action))
         query_tokens = torch.cat(query_tokens, dim=1)
         fused_tokens = self.cross_attn(query_tokens, visual_tokens)
+        action_token_start = fused_tokens.shape[1] - action.shape[1]
+        fused_action_tokens = fused_tokens[:, action_token_start:]
         fused_state = fused_tokens.mean(dim=1)
-        q1, q2 = self.value_head(fused_state)
-        return q1, q2, fused_state
+        aux: dict[str, torch.Tensor] = {}
+
+        if self.critic_arch_mode == "q_only":
+            q1, q2 = self.value_head(fused_state)
+            return (q1, q2, fused_state, aux) if return_aux else (q1, q2, fused_state)
+
+        reward_chunk_pred = self.reward_chunk_head(fused_action_tokens).squeeze(-1)
+        aux["reward_chunk_pred"] = reward_chunk_pred
+
+        if self.critic_arch_mode == "q_aux_reward_chunk":
+            q1, q2 = self.value_head(fused_state)
+            return (q1, q2, fused_state, aux) if return_aux else (q1, q2, fused_state)
+
+        reward_chunk_sum = reward_chunk_pred.sum(dim=-1, keepdim=True)
+        tail_q1, tail_q2 = self.tail_value_head(fused_state)
+        q1 = reward_chunk_sum + self.chunk_discount * tail_q1
+        q2 = reward_chunk_sum + self.chunk_discount * tail_q2
+        aux["reward_chunk_sum"] = reward_chunk_sum
+        aux["tail_q1"] = tail_q1
+        aux["tail_q2"] = tail_q2
+        return (q1, q2, fused_state, aux) if return_aux else (q1, q2, fused_state)
 
 
 class GigaWorldPolicy(BasePolicy, nn.Module):
+
     """
     RLinf Giga World Action policy wrapper.
 
@@ -507,6 +639,19 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self.bc_coef = float(policy_cfg.get("bc_coef", 1.0))
         self.ref_action_dropout_p = float(policy_cfg.get("ref_action_dropout_p", 0.5))
         self.target_tau = float(policy_cfg.get("target_tau", 0.005))
+        self.critic_arch_mode = str(
+            policy_cfg.get("critic_arch_mode", "q_only")
+        ).lower()
+        valid_critic_arch_modes = {"q_only", "q_aux_reward_chunk", "q_decomposed"}
+        if self.critic_arch_mode not in valid_critic_arch_modes:
+            raise ValueError(
+                f"Unsupported critic_arch_mode={self.critic_arch_mode}, "
+                f"expected one of {sorted(valid_critic_arch_modes)}"
+            )
+        self.critic_reward_chunk_loss_coef = float(
+            policy_cfg.get("critic_reward_chunk_loss_coef", 1.0)
+        )
+        self.critic_chunk_discount = float(policy_cfg.get("critic_chunk_discount", 1.0))
         self.enable_absolute_action_bound = bool(
             policy_cfg.get("enable_absolute_action_bound", True)
         )
@@ -708,6 +853,9 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 dropout=self.cross_attention_dropout,
                 robot_state_dim=self.robot_state_dim,
                 action_dim=self.model_action_dim,
+                action_chunk=self.action_chunk,
+                critic_arch_mode=self.critic_arch_mode,
+                chunk_discount=self.critic_chunk_discount,
             )
             self.rl_state_dim = self.cross_attention_dim
         else:
@@ -723,7 +871,12 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 layer_norm=False,
             )
             critic_input_dim = self.rl_state_dim + self.ref_action_flat_dim
-            self.critic = TwinCritic(input_dim=critic_input_dim)
+            self.critic = TwinCritic(
+                input_dim=critic_input_dim,
+                action_chunk=self.action_chunk,
+                critic_arch_mode=self.critic_arch_mode,
+                chunk_discount=self.critic_chunk_discount,
+            )
 
         # target networks
         self.actor_target = copy.deepcopy(self.actor_head)
@@ -1722,7 +1875,8 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         critic_visual_tokens: Optional[torch.Tensor] = None,
         critic_robot_state: Optional[torch.Tensor] = None,
         critic_ref_action: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+    ):
         critic = self.critic_target if use_target else self.critic
         critic_param = next(critic.parameters())
         critic_device = critic_param.device
@@ -1748,17 +1902,19 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             ref_action = None
             if critic_ref_action is not None:
                 ref_action = critic_ref_action.to(device=critic_device, dtype=critic_dtype)
-            q1, q2, _ = critic(
+            q1, q2, _, critic_aux = critic(
                 visual_tokens=visual_tokens,
                 robot_state=robot_state,
                 ref_action=ref_action,
                 action=action_for_critic,
+                return_aux=True,
             )
-            return q1, q2
+            return (q1, q2, critic_aux) if return_aux else (q1, q2)
 
         rl_state = rl_state.to(device=critic_device, dtype=critic_dtype)
         action_flat = action_for_critic.reshape(action_for_critic.shape[0], -1)
-        return critic(rl_state, action_flat)
+        q1, q2, critic_aux = critic(rl_state, action_flat, return_aux=True)
+        return (q1, q2, critic_aux) if return_aux else (q1, q2)
 
     def target_actor_forward(
         self,
@@ -1781,7 +1937,8 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         critic_visual_tokens: Optional[torch.Tensor] = None,
         critic_robot_state: Optional[torch.Tensor] = None,
         critic_ref_action: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+    ):
         return self.critic_forward(
             rl_state=rl_state,
             action=action,
@@ -1789,6 +1946,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             critic_visual_tokens=critic_visual_tokens,
             critic_robot_state=critic_robot_state,
             critic_ref_action=critic_ref_action,
+            return_aux=return_aux,
         )
 
     @torch.no_grad()
@@ -1857,6 +2015,13 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
     def get_use_rl_head_for_rollout(self) -> bool:
         return bool(int(self.use_rl_head_for_rollout_flag.item()))
+
+    def set_critic_chunk_discount(self, chunk_discount: float) -> None:
+        self.critic_chunk_discount = float(chunk_discount)
+        if hasattr(self.critic, "set_chunk_discount"):
+            self.critic.set_chunk_discount(self.critic_chunk_discount)
+        if hasattr(self.critic_target, "set_chunk_discount"):
+            self.critic_target.set_chunk_discount(self.critic_chunk_discount)
 
     def soft_update_targets(self, tau: Optional[float] = None):
         if tau is None:

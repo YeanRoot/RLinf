@@ -42,6 +42,13 @@ giga_world_policy:
   bc_coef: 1.0
   ref_action_dropout_p: 0.5
   target_tau: 0.005
+  # critic_arch_mode:
+  #   - q_only: current baseline, only predict scalar Q
+  #   - q_aux_reward_chunk: scalar Q + auxiliary reward-chunk head
+  #   - q_decomposed: Q = sum(pred_reward_chunk) + gamma_chunk * tail_Q
+  critic_arch_mode: "q_only"
+  critic_reward_chunk_loss_coef: 1.0
+  critic_chunk_discount: 1.0  # worker will automatically sync this to algorithm.gamma at runtime
   enable_critic_q_upper_bound: True
   critic_q_upper_bound: 1.0
   actor_q_loss_clamp_to_upper_bound: True

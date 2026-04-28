@@ -158,6 +158,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.torch_dtype = next(self.model.parameters()).dtype
 
         policy = self._unwrap_policy(self.model)
+        if hasattr(policy, "set_critic_chunk_discount"):
+            policy.set_critic_chunk_discount(self.discount)
         if self.freeze_visual_layers:
             policy.set_visual_trainable(False)
 
@@ -333,9 +335,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.training_uses_replay = self.target_replay_batch_size > 0
 
         self.critic_actor_ratio = int(self.cfg.algorithm.get("critic_actor_ratio", 2))
-        self.discount = float(self.cfg.algorithm.gamma) ** int(
-            self.cfg.actor.model.get("num_action_chunks", 1)
-        )
+        self.discount = float(self.cfg.algorithm.gamma)
         self.bc_coef = float(self.cfg.algorithm.get("bc_coef", 1.0))
         self.target_update_freq = int(self.cfg.algorithm.get("target_update_freq", 1))
         self.target_tau = float(self.cfg.algorithm.get("tau", 0.005))
@@ -364,6 +364,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
         self.critic_overshoot_penalty_coef = float(
             policy_head_cfg.get("critic_overshoot_penalty_coef", 1.0)
+        )
+        self.critic_arch_mode = str(policy_head_cfg.get("critic_arch_mode", "q_only")).lower()
+        self.critic_reward_chunk_loss_coef = float(
+            policy_head_cfg.get("critic_reward_chunk_loss_coef", 1.0)
         )
         self.auto_critic_q_upper_bound_from_env_reward = None
         env_train_cfg = self.cfg.env.train
@@ -2594,8 +2598,9 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         rewards = batch["rewards"]
         terminations = batch["terminations"]
 
-        rewards_for_bootstrap = rewards.sum(dim=-1, keepdim=True).to(self.torch_dtype)
-        done_mask = terminations.any(dim=-1, keepdim=True).to(self.torch_dtype)
+        reward_chunk_targets = rewards.to(self.device, dtype=self.torch_dtype).reshape(rewards.shape[0], -1)
+        rewards_for_bootstrap = rewards.sum(dim=-1, keepdim=True).to(self.device, dtype=self.torch_dtype)
+        done_mask = terminations.any(dim=-1, keepdim=True).to(self.device, dtype=self.torch_dtype)
 
         with torch.no_grad():
             curr_visual_feat = self._build_visual_feat_for_actor(curr_obs["visual_latent"])
@@ -2642,6 +2647,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 critic_visual_tokens=next_actor_aux.get("critic_visual_tokens", None),
                 critic_robot_state=next_actor_aux.get("critic_robot_state", None),
                 critic_ref_action=next_actor_aux.get("critic_ref_action", None),
+                return_aux=False,
             )
             target_q = torch.minimum(target_q1, target_q2)
             if self.enable_critic_q_upper_bound and self.critic_target_clamp_to_upper_bound:
@@ -2650,7 +2656,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             if self.enable_critic_q_upper_bound and self.critic_target_clamp_to_upper_bound:
                 target_q_values = torch.clamp(target_q_values, max=self.critic_q_upper_bound)
 
-        q1, q2 = self.model(
+        q1, q2, model_critic_aux = self.model(
             forward_type=ForwardType.DEFAULT,
             mode="critic",
             rl_state=curr_rl_state,
@@ -2659,9 +2665,20 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             critic_visual_tokens=curr_critic_visual_tokens,
             critic_robot_state=curr_critic_robot_state,
             critic_ref_action=curr_critic_ref_action,
+            return_aux=True,
         )
         target_q_values = target_q_values.to(dtype=q1.dtype)
         critic_loss = F.mse_loss(q1, target_q_values) + F.mse_loss(q2, target_q_values)
+
+        reward_chunk_loss = q1.new_zeros(())
+        reward_chunk_pred_mean = q1.new_zeros(())
+        if model_critic_aux.get("reward_chunk_pred", None) is not None:
+            reward_chunk_pred = model_critic_aux["reward_chunk_pred"].to(dtype=q1.dtype)
+            reward_chunk_targets_local = reward_chunk_targets.to(dtype=reward_chunk_pred.dtype)
+            reward_chunk_loss = F.mse_loss(reward_chunk_pred, reward_chunk_targets_local)
+            critic_loss = critic_loss + self.critic_reward_chunk_loss_coef * reward_chunk_loss
+            reward_chunk_pred_mean = reward_chunk_pred.mean()
+
         q1_overshoot = torch.clamp(q1 - self.critic_q_upper_bound, min=0.0)
         q2_overshoot = torch.clamp(q2 - self.critic_q_upper_bound, min=0.0)
         critic_overshoot_penalty = q1.new_zeros(())
@@ -2675,6 +2692,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "q1_overshoot": float(q1_overshoot.mean().detach().item()),
             "q2_overshoot": float(q2_overshoot.mean().detach().item()),
             "q_upper_bound": float(self.critic_q_upper_bound),
+            "critic_arch_mode": self.critic_arch_mode,
+            "reward_chunk_loss": float(reward_chunk_loss.detach().item()),
+            "reward_chunk_pred_mean": float(reward_chunk_pred_mean.detach().item()),
+            "reward_chunk_target_mean": float(reward_chunk_targets.mean().detach().item()),
+            "reward_chunk_loss_coef": float(self.critic_reward_chunk_loss_coef),
         }
         return critic_loss, q1, q2, target_q_values, critic_aux
 
@@ -2689,6 +2711,16 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "q1_overshoot": critic_aux["q1_overshoot"],
             "q2_overshoot": critic_aux["q2_overshoot"],
             "q_upper_bound": critic_aux["q_upper_bound"],
+            "reward_chunk_loss": critic_aux["reward_chunk_loss"],
+            "reward_chunk_pred_mean": critic_aux["reward_chunk_pred_mean"],
+            "reward_chunk_target_mean": critic_aux["reward_chunk_target_mean"],
+            "reward_chunk_loss_coef": critic_aux["reward_chunk_loss_coef"],
+            "critic_arch_mode_id": float(
+                0 if critic_aux["critic_arch_mode"] == "q_only"
+                else 1 if critic_aux["critic_arch_mode"] == "q_aux_reward_chunk"
+                else 2 if critic_aux["critic_arch_mode"] == "q_decomposed"
+                else -1
+            ),
         }
 
     def _compose_actor_loss(self, q_pi: torch.Tensor | None, bc_loss: torch.Tensor):

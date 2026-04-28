@@ -106,8 +106,8 @@ algorithm:
     save_all: true
     save_success: true
     save_failure: true
-    quality_mode: terminal_and_reward
-    success_threshold: 0.999
+    quality_mode: terminal_only
+    success_threshold: 0.999 # unused when quality_mode=terminal_only
     trajectory_format: pt
     enable_cache: false
     cache_size: 64

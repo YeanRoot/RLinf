@@ -89,6 +89,7 @@ class RecordVideo(gym.Wrapper):
         self._current_chunk_indices: Optional[np.ndarray] = None
         self._reward_chunk_indices: Optional[np.ndarray] = None
         self._done_chunk_indices: Optional[np.ndarray] = None
+        self._done_step_indices: Optional[np.ndarray] = None
         self._done_latched: Optional[np.ndarray] = None
 
     def _ensure_episode_tracking(self) -> None:
@@ -98,6 +99,7 @@ class RecordVideo(gym.Wrapper):
         self._current_chunk_indices = np.zeros((self._num_envs,), dtype=np.int64)
         self._reward_chunk_indices = np.full((self._num_envs,), -1, dtype=np.int64)
         self._done_chunk_indices = np.full((self._num_envs,), -1, dtype=np.int64)
+        self._done_step_indices = np.full((self._num_envs,), -1, dtype=np.int64)
         self._done_latched = np.zeros((self._num_envs,), dtype=bool)
 
     def _start_new_episode(self, env_mask: Optional[np.ndarray] = None) -> None:
@@ -109,6 +111,7 @@ class RecordVideo(gym.Wrapper):
         self._current_chunk_indices[env_mask] = 0
         self._reward_chunk_indices[env_mask] = -1
         self._done_chunk_indices[env_mask] = -1
+        self._done_step_indices[env_mask] = -1
         self._done_latched[env_mask] = False
 
     def _active_video_path(self, video_sub_dir: Optional[str] = None) -> str:
@@ -141,6 +144,7 @@ class RecordVideo(gym.Wrapper):
             "current_chunk": int(self._current_chunk_indices[env_id]),
             "reward_chunk": int(self._reward_chunk_indices[env_id]),
             "done_chunk": int(self._done_chunk_indices[env_id]),
+            "done_step": int(self._done_step_indices[env_id]),
             "video_env_idx": int(env_id),
         }
 
@@ -148,6 +152,7 @@ class RecordVideo(gym.Wrapper):
         merged = self._get_overlay_info(env_id)
         merged.update(info_item)
         return merged
+
 
     def _to_env_bool_array(self, value: Any) -> np.ndarray:
         if value is None:
@@ -158,6 +163,8 @@ class RecordVideo(gym.Wrapper):
         if value.ndim == 1:
             if value.shape[0] == self._num_envs:
                 return value.astype(bool)
+            if self._num_envs == 1:
+                return np.array([value.astype(bool).any()], dtype=bool)
             flat = value.reshape(-1)
             out = np.zeros((self._num_envs,), dtype=bool)
             out[: min(self._num_envs, flat.shape[0])] = flat[: self._num_envs].astype(bool)
@@ -172,6 +179,28 @@ class RecordVideo(gym.Wrapper):
         out[: min(self._num_envs, flat.shape[0])] = flat[: self._num_envs].astype(bool)
         return out
 
+    def _first_true_step_for_env(self, value: Any, env_id: int) -> int:
+        if value is None:
+            return -1
+        value = self._to_numpy(value)
+        if value.ndim == 0:
+            return 0 if bool(value.item()) else -1
+        if value.ndim == 1:
+            if self._num_envs == 1:
+                idx = np.flatnonzero(value.astype(bool))
+                return int(idx[0]) if idx.size > 0 else -1
+            if value.shape[0] == self._num_envs:
+                return 0 if bool(value[env_id]) else -1
+            idx = np.flatnonzero(value.astype(bool))
+            return int(idx[0]) if idx.size > 0 else -1
+        if value.ndim >= 2 and value.shape[0] == self._num_envs:
+            env_value = value[env_id]
+            idx = np.argwhere(np.asarray(env_value).astype(bool))
+            return int(idx[0][0]) if idx.size > 0 else -1
+        idx = np.argwhere(np.asarray(value).astype(bool))
+        return int(idx[0][0]) if idx.size > 0 else -1
+
+
     def _update_chunk_tracking(self, rewards: Optional[Any], terminations: Optional[Any]) -> None:
         self._ensure_episode_tracking()
         reward_mask = self._to_env_bool_array(rewards)
@@ -180,6 +209,8 @@ class RecordVideo(gym.Wrapper):
         self._reward_chunk_indices[new_reward_mask] = self._current_chunk_indices[new_reward_mask]
         new_done_mask = (~self._done_latched) & done_mask & (self._done_chunk_indices < 0)
         self._done_chunk_indices[new_done_mask] = self._current_chunk_indices[new_done_mask]
+        for env_id in np.flatnonzero(new_done_mask):
+            self._done_step_indices[env_id] = self._first_true_step_for_env(terminations, int(env_id))
         self._done_latched[new_done_mask] = True
 
     def _advance_chunk_indices(self, done_mask: Optional[np.ndarray] = None) -> None:
