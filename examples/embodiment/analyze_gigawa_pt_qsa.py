@@ -119,15 +119,59 @@ def _load_pt_trajectory(pt_path: Path) -> dict[str, Any]:
     return _squeeze_batch_dim(data)
 
 
-def _build_chunk_mc_returns(rewards: torch.Tensor, terminations: torch.Tensor, gamma: float) -> torch.Tensor:
-    reward_chunk = rewards.sum(dim=-1).float()
-    done_chunk = terminations.any(dim=-1).float()
-    q_true = torch.zeros_like(reward_chunk)
-    running = torch.zeros((), dtype=torch.float32)
-    for t in reversed(range(reward_chunk.shape[0])):
-        running = reward_chunk[t] + (1.0 - done_chunk[t]) * gamma * running
-        q_true[t] = running
-    return q_true
+def _build_step_mc_returns_at_chunk_start(
+    rewards: torch.Tensor,
+    terminations: torch.Tensor,
+    step_gamma: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build Monte-Carlo Q targets with primitive-step discounting.
+
+    The old analysis script first summed rewards inside each chunk and then applied
+    gamma once between chunks:
+
+        Q_chunk[t] = sum_i r[t, i] + gamma * Q_chunk[t + 1]
+
+    This function instead flattens all primitive steps and applies gamma at every
+    environment step:
+
+        G[k] = r[k] + (1 - done[k]) * step_gamma * G[k + 1]
+
+    The returned chunk-level target is G at the first primitive step of each
+    chunk, so it matches a critic that evaluates one chunk action from the chunk
+    start. If termination happens inside a chunk, the recurrence cuts off at
+    that primitive step.
+    """
+    if rewards.shape != terminations.shape:
+        raise ValueError(
+            f'rewards and terminations must have the same shape, got '
+            f'{tuple(rewards.shape)} vs {tuple(terminations.shape)}'
+        )
+    if rewards.ndim == 1:
+        rewards_2d = rewards[:, None]
+        terminations_2d = terminations[:, None]
+        squeeze_step_dim = True
+    elif rewards.ndim == 2:
+        rewards_2d = rewards
+        terminations_2d = terminations
+        squeeze_step_dim = False
+    else:
+        raise ValueError(f'Expected rewards shape [T] or [T, H], got {tuple(rewards.shape)}')
+
+    flat_rewards = rewards_2d.float().reshape(-1)
+    flat_done = terminations_2d.bool().reshape(-1)
+    q_step_flat = torch.zeros_like(flat_rewards, dtype=torch.float32)
+    running = torch.zeros((), dtype=torch.float32, device=flat_rewards.device)
+
+    for step_idx in reversed(range(flat_rewards.numel())):
+        done = flat_done[step_idx].float()
+        running = flat_rewards[step_idx] + (1.0 - done) * float(step_gamma) * running
+        q_step_flat[step_idx] = running
+
+    q_step = q_step_flat.view_as(rewards_2d)
+    q_chunk_start = q_step[:, 0].contiguous()
+    if squeeze_step_dim:
+        q_step = q_step[:, 0]
+    return q_chunk_start, q_step
 
 
 def _tensor_to_np(x: torch.Tensor) -> np.ndarray:
@@ -209,19 +253,54 @@ def _trajectory_output_dir(pt_path: Path, root_out: Path, seen: dict[str, int]) 
     return out
 
 
-def _resolve_pt_paths(args) -> list[Path]:
+def _as_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v is not None and str(v) != '']
+    return [str(value)]
+
+
+def _select_list(cfg, key: str) -> list[str]:
+    value = OmegaConf.select(cfg, key, default=[])
+    if value is None:
+        return []
+    value = OmegaConf.to_container(value, resolve=True) if OmegaConf.is_config(value) else value
+    return _as_list(value)
+
+
+def _select_optional_str(cfg, key: str, default: str | None = None) -> str | None:
+    value = OmegaConf.select(cfg, key, default=default)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _select_optional_int(cfg, key: str, default: int | None = None) -> int | None:
+    value = OmegaConf.select(cfg, key, default=default)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _resolve_pt_paths(
+    pt: list[str] | None = None,
+    pt_glob: list[str] | None = None,
+    input_dir: list[str] | None = None,
+    pt_list_file: str | None = None,
+) -> list[Path]:
     paths: list[Path] = []
-    for p in args.pt or []:
+    for p in pt or []:
         paths.append(Path(p))
-    for pat in args.pt_glob or []:
+    for pat in pt_glob or []:
         paths.extend(sorted(Path().glob(pat)))
-    for d in args.input_dir or []:
+    for d in input_dir or []:
         dpath = Path(d)
         if not dpath.is_dir():
             raise FileNotFoundError(f'input_dir not found: {dpath}')
         paths.extend(sorted(dpath.rglob('*.pt')))
-    if args.pt_list_file:
-        with open(args.pt_list_file, 'r', encoding='utf-8') as f:
+    if pt_list_file:
+        with open(pt_list_file, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith('#'):
@@ -234,13 +313,53 @@ def _resolve_pt_paths(args) -> list[Path]:
             uniq.append(Path(rp))
             seen.add(rp)
     if not uniq:
-        raise ValueError('No pt files resolved. Use --pt, --pt-glob, --input-dir, or --pt-list-file.')
+        raise ValueError(
+            'No pt files resolved. Set analysis.pt, analysis.pt_glob, analysis.input_dir, '
+            'or analysis.pt_list_file in the config, or pass --pt/--pt-glob/--input-dir/--pt-list-file.'
+        )
     return uniq
+
+
+def _resolve_discount_from_config(cfg, action_chunk: int) -> tuple[float, str, float, float]:
+    input_gamma = OmegaConf.select(cfg, 'algorithm.gamma', default=None)
+    if input_gamma is None:
+        raise KeyError('Missing required config field: algorithm.gamma')
+    input_gamma = float(input_gamma)
+    if not (0.0 <= input_gamma <= 1.0):
+        raise ValueError(f'algorithm.gamma should be in [0, 1], got {input_gamma}')
+
+    gamma_mode = OmegaConf.select(cfg, 'algorithm.gamma_mode', default=None)
+    if gamma_mode is None:
+        raise KeyError(
+            'Missing required config field: algorithm.gamma_mode. '
+            'Use gamma_mode: chunk if algorithm.gamma is chunk-level, '
+            'or gamma_mode: step if algorithm.gamma is primitive-step-level.'
+        )
+    gamma_mode = str(gamma_mode).lower().strip()
+    if gamma_mode not in ('chunk', 'step'):
+        raise ValueError(f'Unsupported algorithm.gamma_mode={gamma_mode!r}. Expected "chunk" or "step".')
+
+    if gamma_mode == 'chunk':
+        step_gamma = input_gamma ** (1.0 / float(action_chunk))
+        effective_chunk_gamma = input_gamma
+    else:
+        step_gamma = input_gamma
+        effective_chunk_gamma = input_gamma ** int(action_chunk)
+    return input_gamma, gamma_mode, step_gamma, effective_chunk_gamma
+
+
+def _resolve_device(device_str: str | None) -> torch.device:
+    if device_str is None or str(device_str).lower() == 'auto':
+        device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    return torch.device(str(device_str))
 
 
 def _analyze_single_trajectory(
     policy,
-    gamma: float,
+    step_gamma: float,
+    input_gamma: float,
+    gamma_mode: str,
+    effective_chunk_gamma: float,
     pt_path: Path,
     out_dir: Path,
     action_chunk: int,
@@ -293,7 +412,13 @@ def _analyze_single_trajectory(
         true_exec = policy.postprocess_action_model_batch(true_action, curr_robot_state)
         pred_exec = policy.postprocess_action_model_batch(pred_action, curr_robot_state)
 
-    q_mc_true = _build_chunk_mc_returns(rewards=rewards, terminations=terminations, gamma=gamma).to(device)
+    q_mc_true, q_mc_step_all = _build_step_mc_returns_at_chunk_start(
+        rewards=rewards,
+        terminations=terminations,
+        step_gamma=step_gamma,
+    )
+    q_mc_true = q_mc_true.to(device)
+    q_mc_step_all = q_mc_step_all.to(device)
 
     model_diff = pred_action - true_action
     exec_diff = pred_exec - true_exec
@@ -314,7 +439,7 @@ def _analyze_single_trajectory(
             ('critic_q(true_action)', _tensor_to_np(q_true_action)),
             ('critic_q(pred_action)', _tensor_to_np(q_pred_action)),
         ],
-        title='Q(s,a) curves by chunk',
+        title='Q(s,a) curves by chunk (MC target uses primitive-step discount)',
         xlabel='chunk index',
         ylabel='Q value',
         out_path=out_dir / 'q_curves.png',
@@ -325,7 +450,7 @@ def _analyze_single_trajectory(
             ('critic_q(true_action)-q_mc_true', _tensor_to_np(q_true_action - q_mc_true)),
             ('critic_q(pred_action)-q_mc_true', _tensor_to_np(q_pred_action - q_mc_true)),
         ],
-        title='Q error vs Monte Carlo ground truth',
+        title='Q error vs step-discounted Monte Carlo ground truth',
         xlabel='chunk index',
         ylabel='Q error',
         out_path=out_dir / 'q_error_curves.png',
@@ -375,7 +500,10 @@ def _analyze_single_trajectory(
         'weights_path': str(weights_path.resolve()),
         'config_path': str(config_path.resolve()),
         'device': str(device),
-        'gamma': gamma,
+        'input_gamma': input_gamma,
+        'gamma_mode': gamma_mode,
+        'step_gamma': step_gamma,
+        'effective_chunk_gamma': effective_chunk_gamma,
         'num_chunks': int(true_action.shape[0]),
         'action_chunk': action_chunk,
         'action_dim': action_dim,
@@ -421,6 +549,7 @@ def _analyze_single_trajectory(
         pred_action_exec=_tensor_to_np(pred_exec),
         diff_action_exec=_tensor_to_np(exec_diff),
         q_mc_true=_tensor_to_np(q_mc_true),
+        q_mc_step_all=_tensor_to_np(q_mc_step_all),
         q_true_action=_tensor_to_np(q_true_action),
         q_pred_action=_tensor_to_np(q_pred_action),
         mse_per_chunk_model=_tensor_to_np(mse_per_chunk_model),
@@ -438,7 +567,10 @@ def _analyze_single_trajectory(
         f'weights_path: {weights_path.resolve()}',
         f'config_path: {config_path.resolve()}',
         f'device: {device}',
-        f'gamma: {gamma}',
+        f'input_gamma: {input_gamma}',
+        f'gamma_mode: {gamma_mode}',
+        f'step_gamma: {step_gamma}',
+        f'effective_chunk_gamma: {effective_chunk_gamma}',
         f'num_chunks: {true_action.shape[0]} | action_chunk: {action_chunk} | action_dim: {action_dim}',
         f'trajectory_metadata: {json.dumps(traj.get("metadata", {}), ensure_ascii=False)}',
         '',
@@ -469,17 +601,16 @@ def _analyze_single_trajectory(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Analyze one or more GigaWA trajectory pt files against actor/critic checkpoints.')
-    parser.add_argument('--config', type=str, required=True, help='Path to yaml config used to construct the GigaWorldPolicy model.')
-    parser.add_argument('--pt', type=str, action='append', default=[], help='Path to a saved trajectory .pt file. Repeat for multiple files.')
-    parser.add_argument('--pt-glob', type=str, action='append', default=[], help='Glob pattern for .pt files. Repeatable.')
-    parser.add_argument('--input-dir', type=str, action='append', default=[], help='Directory to recursively search for .pt files. Repeatable.')
-    parser.add_argument('--pt-list-file', type=str, default=None, help='Text file with one .pt path per line.')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to full_weights.pt or checkpoint dir containing model_state_dict/full_weights.pt.')
-    parser.add_argument('--output-dir', type=str, required=True, help='Root directory to save per-trajectory results.')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--chunk-index', type=int, default=None, help='Chunk index to render detailed action matrices. Default renders selected chunks.')
-    parser.add_argument('--max-chunk-matrix-plots', type=int, default=8, help='If --chunk-index is not set, render up to this many chunk matrix plots per trajectory.')
-    parser.add_argument('--gamma', type=float, default=None, help='Override gamma. Default uses algorithm.gamma from config.')
+    parser.add_argument('--config', type=str, required=True, help='Path to yaml config. Discount is read from algorithm.gamma and algorithm.gamma_mode.')
+    parser.add_argument('--pt', type=str, action='append', default=[], help='Optional runtime override: trajectory .pt file. Repeat for multiple files.')
+    parser.add_argument('--pt-glob', type=str, action='append', default=[], help='Optional runtime override: glob pattern for .pt files. Repeatable.')
+    parser.add_argument('--input-dir', type=str, action='append', default=[], help='Optional runtime override: directory to recursively search for .pt files. Repeatable.')
+    parser.add_argument('--pt-list-file', type=str, default=None, help='Optional runtime override: text file with one .pt path per line.')
+    parser.add_argument('--checkpoint', type=str, default=None, help='Optional runtime override: full_weights.pt or checkpoint dir. Default reads analysis.checkpoint.')
+    parser.add_argument('--output-dir', type=str, default=None, help='Optional runtime override: output directory. Default reads analysis.output_dir.')
+    parser.add_argument('--device', type=str, default=None, help='Optional runtime override: device. Default reads analysis.device or auto.')
+    parser.add_argument('--chunk-index', type=int, default=None, help='Optional runtime override: chunk index to render detailed action matrices.')
+    parser.add_argument('--max-chunk-matrix-plots', type=int, default=None, help='Optional runtime override: number of chunk matrix plots. Default reads analysis.max_chunk_matrix_plots or 8.')
     args = parser.parse_args()
 
     script_path = Path(__file__).resolve()
@@ -487,23 +618,50 @@ def main() -> None:
 
     from rlinf.models import get_model
 
-    cfg, model_cfg = _load_model_cfg_from_config(Path(args.config))
-    gamma = float(args.gamma if args.gamma is not None else cfg.algorithm.gamma)
-    out_root = Path(args.output_dir)
+    config_path = Path(args.config)
+    cfg, model_cfg = _load_model_cfg_from_config(config_path)
+
+    action_chunk = int(model_cfg.num_action_chunks)
+    action_dim = int(model_cfg.action_dim)
+    input_gamma, gamma_mode, step_gamma, effective_chunk_gamma = _resolve_discount_from_config(cfg, action_chunk)
+
+    checkpoint = args.checkpoint or _select_optional_str(cfg, 'analysis.checkpoint')
+    if checkpoint is None:
+        raise KeyError('Missing checkpoint. Set analysis.checkpoint in config or pass --checkpoint.')
+    weights_path = _resolve_full_weights_path(checkpoint)
+
+    output_dir = args.output_dir or _select_optional_str(cfg, 'analysis.output_dir')
+    if output_dir is None:
+        raise KeyError('Missing output_dir. Set analysis.output_dir in config or pass --output-dir.')
+    out_root = Path(output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    pt_paths = _resolve_pt_paths(args)
-    weights_path = _resolve_full_weights_path(args.checkpoint)
+    pt = args.pt if args.pt else _select_list(cfg, 'analysis.pt')
+    pt_glob = args.pt_glob if args.pt_glob else _select_list(cfg, 'analysis.pt_glob')
+    input_dir = args.input_dir if args.input_dir else _select_list(cfg, 'analysis.input_dir')
+    pt_list_file = args.pt_list_file or _select_optional_str(cfg, 'analysis.pt_list_file')
+    pt_paths = _resolve_pt_paths(pt=pt, pt_glob=pt_glob, input_dir=input_dir, pt_list_file=pt_list_file)
+
+    device = _resolve_device(args.device or _select_optional_str(cfg, 'analysis.device', default='auto'))
+    chunk_index = args.chunk_index
+    if chunk_index is None:
+        chunk_index = _select_optional_int(cfg, 'analysis.chunk_index', default=None)
+    max_chunk_matrix_plots = args.max_chunk_matrix_plots
+    if max_chunk_matrix_plots is None:
+        max_chunk_matrix_plots = _select_optional_int(cfg, 'analysis.max_chunk_matrix_plots', default=8)
+    max_chunk_matrix_plots = int(max_chunk_matrix_plots)
+
+    print('[analyze_gigawa_pt_qsa_batch] discount config:')
+    print(f'  algorithm.gamma={input_gamma}')
+    print(f'  algorithm.gamma_mode={gamma_mode}')
+    print(f'  step_gamma={step_gamma}')
+    print(f'  effective_chunk_gamma={effective_chunk_gamma}')
 
     policy = get_model(model_cfg)
     state_dict = torch.load(weights_path, map_location='cpu')
     missing, unexpected = policy.load_state_dict(state_dict, strict=False)
-    device = torch.device(args.device)
     policy = policy.to(device)
     policy.eval()
-
-    action_chunk = int(model_cfg.num_action_chunks)
-    action_dim = int(model_cfg.action_dim)
 
     seen: dict[str, int] = {}
     aggregate: list[dict[str, Any]] = []
@@ -513,15 +671,18 @@ def main() -> None:
         aggregate.append(
             _analyze_single_trajectory(
                 policy=policy,
-                gamma=gamma,
+                step_gamma=step_gamma,
+                input_gamma=input_gamma,
+                gamma_mode=gamma_mode,
+                effective_chunk_gamma=effective_chunk_gamma,
                 pt_path=pt_path,
                 out_dir=traj_out,
                 action_chunk=action_chunk,
                 action_dim=action_dim,
-                chunk_index=args.chunk_index,
-                max_chunk_matrix_plots=args.max_chunk_matrix_plots,
+                chunk_index=chunk_index,
+                max_chunk_matrix_plots=max_chunk_matrix_plots,
                 device=device,
-                config_path=Path(args.config),
+                config_path=config_path,
                 weights_path=weights_path,
                 missing=list(missing),
                 unexpected=list(unexpected),
@@ -529,9 +690,31 @@ def main() -> None:
         )
 
     with open(out_root / 'aggregate_summary.json', 'w', encoding='utf-8') as f:
-        json.dump({'num_trajectories': len(aggregate), 'items': aggregate}, f, indent=2)
+        json.dump(
+            {
+                'num_trajectories': len(aggregate),
+                'weights_path': str(weights_path.resolve()),
+                'config_path': str(config_path.resolve()),
+                'input_gamma': input_gamma,
+                'gamma_mode': gamma_mode,
+                'step_gamma': step_gamma,
+                'effective_chunk_gamma': effective_chunk_gamma,
+                'items': aggregate,
+            },
+            f,
+            indent=2,
+        )
 
-    lines = [f'num_trajectories: {len(aggregate)}', f'weights_path: {weights_path.resolve()}', '']
+    lines = [
+        f'num_trajectories: {len(aggregate)}',
+        f'weights_path: {weights_path.resolve()}',
+        f'config_path: {config_path.resolve()}',
+        f'input_gamma: {input_gamma}',
+        f'gamma_mode: {gamma_mode}',
+        f'step_gamma: {step_gamma}',
+        f'effective_chunk_gamma: {effective_chunk_gamma}',
+        '',
+    ]
     header = 'name | num_chunks | model_mse_mean | exec_mse_mean | q_true_abs_err_mean | q_pred_abs_err_mean | pt_path'
     lines.append(header)
     lines.append('-' * len(header))

@@ -1,5 +1,6 @@
 algorithm:
-  gamma: 0.82
+  gamma: 0.9836
+  gamma_mode: step
 actor:
   model:
     model_type: giga_world_policy
