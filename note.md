@@ -10,13 +10,13 @@ source /mnt/pfs/users/angen.ye/myconda/conda/etc/profile.d/conda.sh
 conda activate pi-rl
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf
 export REPO_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RLinf
-export ROBOTWIN_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-main
+export ROBOTWIN_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-RLinf_support
 export PYTHONPATH=$ROBOTWIN_PATH:$REPO_PATH:$PYTHONPATH
 
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
 
 conda activate pi-rl-h20
-
+export ROBOTWIN_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-main
 
 python collect_embodied_agent_gigawa.py \
   --config-path ./config \
@@ -56,7 +56,7 @@ python train_embodied_agent_gigawa_offline_rl_fast.py \
   --config-path ./config \
   --config-name offline_rl_pretrain
 
-tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/tensorboard \
+tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick_drop0.5/tensorboard \
   --host 0.0.0.0 \
   --port 6006
 
