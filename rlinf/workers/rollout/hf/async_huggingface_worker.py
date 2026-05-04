@@ -85,12 +85,38 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 async_op=True,
             )
 
+    def _rollout_uses_trainable_policy(self) -> bool:
+        model = getattr(self, "hf_model", None)
+        getter = getattr(model, "get_use_rl_head_for_rollout", None)
+        if callable(getter):
+            try:
+                return bool(getter())
+            except Exception:
+                pass
+        return bool(
+            self.cfg.actor.model.get("giga_world_policy", {}).get(
+                "use_rl_head_for_rollout", False
+            )
+        )
+
     async def wait_if_stale(self) -> None:
         if self.staleness_threshold is None:
             return
-        assert self.finished_episodes is not None, (
-            "finished_episodes should be initialized."
-        )
+        # Async generate() is long-running.  The runner initializes this via
+        # set_global_step(), but keep lazy initialization as a guard so rollout
+        # never crashes before the first training step.
+        if self.finished_episodes is None:
+            self.finished_episodes = (
+                self.version * self.total_num_train_envs * self.rollout_epoch
+            )
+
+        # During the initial WA-only warmup, the rollout policy is fixed and the
+        # actor has not produced a new trainable rollout version yet.  Applying
+        # staleness here can deadlock: with threshold=4, each rollout rank only
+        # collects about 5 trajectories, while the replay buffer requires 64.
+        if self.version <= 0 or not self._rollout_uses_trainable_policy():
+            return
+
         while True:
             capacity = (
                 (self.staleness_threshold + self.version + 1)

@@ -49,12 +49,19 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         # Data channels
         self.env_metric_channel = Channel.create("EnvMetric")
         self.rollout_metric_channel = Channel.create("RolloutMetric")
-        self.replay_channel = Channel.create("ReplayBuffer")
+        self.replay_channel = Channel.create(
+            "ReplayBuffer",
+            maxsize=int(self.cfg.runner.get("replay_channel_maxsize", 8)),
+        )
 
         self._pending_rollout_weight_sync = None
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
         self.sync_weight_no_wait = self.cfg.actor.get("sync_weight_no_wait", False)
+        self.disable_inline_eval = bool(
+            self.cfg.runner.get("async_disable_inline_eval", True)
+        )
+        self._inline_eval_skip_warned = False
 
     def get_env_metrics(self) -> tuple[dict, list[dict], list[dict]]:
         results: list[dict] = []
@@ -136,6 +143,13 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
     def run(self):
         start_step = self.global_step
         start_time = time.time()
+
+        # Async rollout workers use ``finished_episodes`` for staleness control.
+        # The sync runner initializes it through rollout.set_global_step() before
+        # every generation step; async generation is long-running, so initialize
+        # it once before rollout.generate() starts.
+        self.actor.set_global_step(self.global_step)
+        self.rollout.set_global_step(self.global_step)
         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
 
         env_handle: Handle = self.env.interact(
@@ -164,6 +178,8 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 if not skip_step:
                     self.global_step += 1
                     if self.global_step % self.weight_sync_interval == 0:
+                        self.actor.set_global_step(self.global_step)
+                        self.rollout.set_global_step(self.global_step)
                         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
 
                     training_metrics = {
@@ -184,6 +200,16 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                     if save_model:
                         self._save_checkpoint()
                     eval_metrics = {}
+                    if run_val and self.disable_inline_eval:
+                        if not self._inline_eval_skip_warned:
+                            self.logger.info(
+                                "Skipping inline eval in AsyncEmbodiedRunner because "
+                                "runner.async_disable_inline_eval=true. Run eval in a "
+                                "separate only_eval job, or set this flag to false if "
+                                "you intentionally want inline async eval."
+                            )
+                            self._inline_eval_skip_warned = True
+                        run_val = False
                     if run_val:
                         with self.timer("eval"):
                             eval_metrics = self.evaluate()

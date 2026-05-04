@@ -399,6 +399,30 @@ class Trajectory:
     sample_infos: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def contiguous_(self) -> "Trajectory":
+        """Make every tensor inside this trajectory contiguous in-place.
+
+        Ray/RLinf P2P channels require all tensors in transferred objects to be
+        contiguous.  ``torch.chunk`` returns views, so trajectories produced by
+        ``to_splited_trajectories`` can contain non-contiguous tensors even when
+        the original full trajectory was contiguous.
+        """
+
+        def _contiguous(value):
+            if isinstance(value, torch.Tensor):
+                return value.cpu().contiguous()
+            if isinstance(value, dict):
+                return {key: _contiguous(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [_contiguous(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(_contiguous(item) for item in value)
+            return value
+
+        for field_name in self.__dataclass_fields__.keys():
+            setattr(self, field_name, _contiguous(getattr(self, field_name)))
+        return self
+
     @staticmethod
     def _generate_field_mask(
         ref_tensor: torch.Tensor, mask: torch.Tensor, traj_len: int
@@ -772,11 +796,14 @@ class EmbodiedRolloutResult:
             elif isinstance(value, torch.Tensor):
                 chunks = torch.chunk(value, split_size, dim=1)
                 for i in range(split_size):
-                    setattr(splited_trajectories[i], field_name, chunks[i])
+                    setattr(splited_trajectories[i], field_name, chunks[i].contiguous())
             else:
                 raise ValueError(
                     f"Unsupported value type: {type(value)} for field_name: {field_name}"
                 )
+
+        for trajectory in splited_trajectories:
+            trajectory.contiguous_()
 
         return splited_trajectories
 

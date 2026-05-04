@@ -757,6 +757,13 @@ class EnvWorker(Worker):
             self.actor_split_num
         )
         for trajectory in trajectories:
+            # ``to_splited_trajectories`` uses torch.chunk internally.  Chunked
+            # tensors are views and can be non-contiguous, while RLinf P2P
+            # communication requires every tensor in the transferred object to
+            # be contiguous.  Keep this guard here so async replay-channel sends
+            # never fail even if future fields are added to Trajectory.
+            if hasattr(trajectory, "contiguous_"):
+                trajectory.contiguous_()
             channel.put(trajectory, async_op=True)
 
     def _append_completed_train_chunk_step(
