@@ -1,0 +1,49 @@
+defaults:
+  - env/realworld_piper_collect@env.eval
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env:
+      node_group: piper
+      placement: 0
+  node_groups:
+    - label: piper
+      node_ranks: 0
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: null
+    project_name: rlinf
+    experiment_name: "collect-data-piper"
+    logger_backends: ["tensorboard"]
+  num_data_episodes: 20
+  record_task_description: False
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    ignore_terminations: False
+    auto_reset: False
+    override_cfg:
+      target_qpos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.7265600440000001, 1.7784158, -1.436356404, 0.03384136, 1.1249810040000001, 0.176812384, 0.0289]  # 14D joint target (left 7 + right 7)
+      reward_threshold: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.095, 0.095, 0.095, 0.095, 0.095, 0.1]  # per-joint error threshold
+      success_hold_steps: 5
+      obs_img_resolution: [128, 128]
+
+  data_collection:
+    enabled: True
+    save_dir: ${runner.logger.log_path}/collected_data
+    export_format: "lerobot"
+    only_success: True
+    robot_type: "piper"
+    fps: 30

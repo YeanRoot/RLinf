@@ -14,6 +14,8 @@
 
 from .franka import FrankaEnv, FrankaRobotConfig, FrankaRobotState
 from .franka import tasks as franka_tasks
+from .piper import PiperController, PiperEnv, PiperRobotConfig, PiperRobotState
+from .piper import task as piper_tasks
 from .realworld_env import RealWorldEnv
 from .xsquare import Turtle2Env, Turtle2RobotConfig, Turtle2RobotState
 from .xsquare import tasks as xsquare_tasks
@@ -25,6 +27,11 @@ __all__ = [
     "FrankaRobotConfig",
     "FrankaRobotState",
     "franka_tasks",
+    "PiperController",
+    "PiperEnv",
+    "PiperRobotConfig",
+    "PiperRobotState",
+    "piper_tasks",
     "Turtle2Env",
     "Turtle2RobotConfig",
     "Turtle2RobotState",

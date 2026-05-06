@@ -51,14 +51,18 @@ class ROSController:
                     if proc.name() == "roscore":
                         self._ros_core = proc
 
-                if self._ros_core is None:
+                # Skip roscore launch if RLINF_SKIP_ROS_CLEANUP is set
+                # This assumes roscore is already running externally
+                skip_roscore_launch = os.environ.get("RLINF_SKIP_ROS_CLEANUP", "0") == "1"
+                
+                if self._ros_core is None and not skip_roscore_launch:
                     self._ros_core = psutil.Popen(
                         ["roscore"], stdout=sys.stdout, stderr=sys.stdout
                     )
                     time.sleep(1)  # Wait for roscore to start
 
         # Initialize ros node
-        rospy.init_node("franka_controller", anonymous=True)
+        rospy.init_node("franka_controller", anonymous=True, disable_signals=True)
 
         # ROS channels
         self._output_channels: dict[str, rospy.Publisher] = {}
