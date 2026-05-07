@@ -14,7 +14,7 @@
 
 from gymnasium.envs.registration import register
 
-from rlinf.envs.realworld.piper.task.test_peg_insertion_env import PiperPegInsertionEnv
+from rlinf.envs.realworld.piper.task.peg_insertion_env import PiperPegInsertionEnv
 
 register(
     id="PiperPegInsertionEnv-v1",

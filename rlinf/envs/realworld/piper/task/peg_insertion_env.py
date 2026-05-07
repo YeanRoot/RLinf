@@ -46,6 +46,7 @@ class PiperPegInsertionEnv(PiperEnv):
         worker_info=None,
         hardware_info=None,
         env_idx: int = 0,
+        **kwargs,
     ) -> None:
         if override_cfg is None:
             override_cfg = {}
