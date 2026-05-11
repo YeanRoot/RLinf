@@ -21,3 +21,4 @@ rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
 examples/results/
+docs/superpowers/*

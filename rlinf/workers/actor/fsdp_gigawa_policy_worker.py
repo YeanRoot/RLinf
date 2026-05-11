@@ -41,6 +41,7 @@ from rlinf.utils.metric_utils import append_to_dict, compute_split_num
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.algorithms.td3 import TD3Algorithm
 
 
 class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
@@ -369,6 +370,9 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             raise ValueError(
                 f"critic_q_upper_bound must be positive, got {self.critic_q_upper_bound}."
             )
+
+        self.td3 = TD3Algorithm(self.cfg.algorithm, policy_head_cfg)
+        self.td3.set_discount(self.discount)
         self.warmup_steps = int(self.cfg.algorithm.get("warmup_steps", 0))
         self.rollout_actor_after_warmup = bool(
             self.cfg.algorithm.get("rollout_actor_after_warmup", True)
@@ -1823,22 +1827,15 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         }
 
     def _maybe_update_targets(self, actor_updated: bool, critic_updated: bool):
-        if self.update_step % self.target_update_freq != 0:
+        tau = self.td3.get_target_update_tau(
+            self.update_step,
+            self.stage_actor_bc_only,
+            self.stage_freeze_actor,
+            actor_updated=actor_updated,
+            critic_updated=critic_updated,
+        )
+        if tau is None:
             return
-
-        should_update = False
-        tau = self.target_tau
-        if self.stage_actor_bc_only:
-            should_update = actor_updated
-            tau = 1.0
-        elif self.stage_freeze_actor:
-            should_update = critic_updated
-        else:
-            should_update = actor_updated or critic_updated
-
-        if not should_update:
-            return
-
         policy = self._unwrap_policy(self.model)
         policy.soft_update_targets(tau=tau)
         self._maybe_enable_rollout_rl_head()
@@ -2568,99 +2565,16 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
     def _compute_critic_outputs(self, batch):
         policy = self._unwrap_policy(self.model)
-
-        curr_obs = batch["curr_obs"]
-        next_obs = batch["next_obs"]
-        actions = self._reshape_runtime_action_tensor(
-            batch["actions"].to(self.device, dtype=self.torch_dtype),
-            tensor_name="batch.actions",
-        )
-        rewards = batch["rewards"]
-        terminations = batch["terminations"]
-
-        rewards_for_bootstrap = rewards.sum(dim=-1, keepdim=True).to(self.torch_dtype)
-        done_mask = terminations.any(dim=-1, keepdim=True).to(self.torch_dtype)
-
-        with torch.no_grad():
-            curr_visual_feat = self._build_visual_feat_for_actor(curr_obs["visual_latent"])
-            _, curr_actor_aux = self.model(
-                forward_type=ForwardType.DEFAULT,
-                mode="actor",
-                visual_feat=curr_visual_feat.detach(),
-                robot_state=curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
-                ref_action=self._reshape_runtime_action_tensor(
-                    curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
-                    tensor_name="curr_obs.ref_action",
-                ),
-                ref_action_dropout_p=0.0,
-                use_target=False,
-            )
-            curr_rl_state = curr_actor_aux["rl_state"].detach()
-            curr_critic_visual_tokens = curr_actor_aux.get("critic_visual_tokens", None)
-            if curr_critic_visual_tokens is not None:
-                curr_critic_visual_tokens = curr_critic_visual_tokens.detach()
-            curr_critic_robot_state = curr_actor_aux.get("critic_robot_state", None)
-            if curr_critic_robot_state is not None:
-                curr_critic_robot_state = curr_critic_robot_state.detach()
-            curr_critic_ref_action = curr_actor_aux.get("critic_ref_action", None)
-            if curr_critic_ref_action is not None:
-                curr_critic_ref_action = curr_critic_ref_action.detach()
-
-            next_visual_feat = self._build_visual_feat_for_actor(next_obs["visual_latent"])
-            next_actions, next_actor_aux = policy.target_actor_forward(
-                visual_feat=next_visual_feat.detach(),
-                robot_state=next_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
-                ref_action=self._reshape_runtime_action_tensor(
-                    next_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
-                    tensor_name="next_obs.ref_action",
-                )
-            )
-            if self.target_policy_noise > 0.0:
-                noise = torch.randn_like(next_actions) * self.target_policy_noise
-                noise = noise.clamp(-self.target_noise_clip, self.target_noise_clip)
-                next_actions = next_actions + noise
-            next_rl_state = next_actor_aux["rl_state"]
-            target_q1, target_q2 = policy.target_critic_forward(
-                rl_state=next_rl_state,
-                action=next_actions,
-                critic_visual_tokens=next_actor_aux.get("critic_visual_tokens", None),
-                critic_robot_state=next_actor_aux.get("critic_robot_state", None),
-                critic_ref_action=next_actor_aux.get("critic_ref_action", None),
-            )
-            target_q = torch.minimum(target_q1, target_q2)
-            if self.enable_critic_q_upper_bound and self.critic_target_clamp_to_upper_bound:
-                target_q = torch.clamp(target_q, max=self.critic_q_upper_bound)
-            target_q_values = rewards_for_bootstrap + (1.0 - done_mask) * self.discount * target_q
-            if self.enable_critic_q_upper_bound and self.critic_target_clamp_to_upper_bound:
-                target_q_values = torch.clamp(target_q_values, max=self.critic_q_upper_bound)
-
-        q1, q2 = self.model(
+        return self.td3.compute_critic_loss(
+            policy=policy,
+            model=self.model,
+            batch=batch,
+            build_visual_feat_fn=self._build_visual_feat_for_actor,
+            reshape_action_fn=self._reshape_runtime_action_tensor,
+            device=self.device,
+            dtype=self.torch_dtype,
             forward_type=ForwardType.DEFAULT,
-            mode="critic",
-            rl_state=curr_rl_state,
-            action=actions,
-            use_target=False,
-            critic_visual_tokens=curr_critic_visual_tokens,
-            critic_robot_state=curr_critic_robot_state,
-            critic_ref_action=curr_critic_ref_action,
         )
-        target_q_values = target_q_values.to(dtype=q1.dtype)
-        critic_loss = F.mse_loss(q1, target_q_values) + F.mse_loss(q2, target_q_values)
-        q1_overshoot = torch.clamp(q1 - self.critic_q_upper_bound, min=0.0)
-        q2_overshoot = torch.clamp(q2 - self.critic_q_upper_bound, min=0.0)
-        critic_overshoot_penalty = q1.new_zeros(())
-        if self.enable_critic_q_upper_bound and self.critic_overshoot_penalty_coef > 0.0:
-            critic_overshoot_penalty = self.critic_overshoot_penalty_coef * (
-                (q1_overshoot ** 2).mean() + (q2_overshoot ** 2).mean()
-            )
-            critic_loss = critic_loss + critic_overshoot_penalty
-        critic_aux = {
-            "critic_overshoot_penalty": float(critic_overshoot_penalty.detach().item()),
-            "q1_overshoot": float(q1_overshoot.mean().detach().item()),
-            "q2_overshoot": float(q2_overshoot.mean().detach().item()),
-            "q_upper_bound": float(self.critic_q_upper_bound),
-        }
-        return critic_loss, q1, q2, target_q_values, critic_aux
 
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
@@ -2676,51 +2590,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         }
 
     def _compose_actor_loss(self, q_pi: torch.Tensor | None, bc_loss: torch.Tensor):
-        q_term = bc_loss.new_zeros(())
-        q_weight = 1.0
-        effective_bc_coef = float(self.bc_coef)
-        hard_penalty = bc_loss.new_zeros(())
-        guard_active = 0.0
-        q_pi_for_loss = None
-
-        if q_pi is not None:
-            q_pi_for_loss = q_pi
-            if self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound:
-                q_pi_for_loss = torch.clamp(q_pi_for_loss, max=self.critic_q_upper_bound)
-            q_term = (-q_pi_for_loss).mean()
-
-        if self.actor_bc_guard_mode == "weighted":
-            effective_bc_coef = float(self.actor_bc_weighted_coef)
-        elif self.actor_bc_guard_mode == "hard_penalty":
-            exceed = torch.clamp(bc_loss - self.actor_bc_guard_threshold, min=0.0)
-            if float(exceed.detach().item()) > 0.0:
-                guard_active = 1.0
-            hard_penalty = self.actor_bc_penalty_coef * (exceed ** self.actor_bc_penalty_power)
-
-        actor_loss = q_weight * q_term + effective_bc_coef * bc_loss + hard_penalty
-        metrics = {
-            "bc_coef_effective": effective_bc_coef,
-            "q_upper_bound_enabled": float(self.enable_critic_q_upper_bound),
-            "q_upper_bound": float(self.critic_q_upper_bound),
-            "q_loss_clamped": float(
-                self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound and q_pi is not None
-            ),
-            "q_pi_used_for_loss": float(
-                q_pi_for_loss.mean().detach().item()
-            ) if q_pi_for_loss is not None else 0.0,
-            "bc_guard_mode": float(
-                0 if self.actor_bc_guard_mode == "none"
-                else 1 if self.actor_bc_guard_mode == "weighted"
-                else 2 if self.actor_bc_guard_mode == "hard_penalty"
-                else 3 if self.actor_bc_guard_mode == "trust_region"
-                else -1
-            ),
-            "bc_guard_threshold": float(self.actor_bc_guard_threshold),
-            "bc_guard_penalty": float(hard_penalty.detach().item()),
-            "bc_guard_active": guard_active,
-            "q_weight": q_weight,
-        }
-        return actor_loss, metrics
+        return self.td3.compose_actor_loss(q_pi=q_pi, bc_loss=bc_loss)
 
     @torch.no_grad()
     def _compute_mean_bc_loss_on_batches(self, micro_batch_list: list[dict[str, torch.Tensor]]) -> float:
