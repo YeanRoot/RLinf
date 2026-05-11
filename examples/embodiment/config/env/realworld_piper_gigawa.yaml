@@ -1,0 +1,37 @@
+env_type: realworld
+
+total_num_envs: null
+
+auto_reset: False
+ignore_terminations: False
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 192
+max_episode_steps: 192
+
+# Piper dual-arm joint-space stack.
+realworld_stack: piper_joint
+use_spacemouse: False
+
+# Keep this order consistent with GigaWorld Policy training:
+# [cam_high | cam_left_wrist | cam_right_wrist].
+main_image_key: cam_high
+wrist_image_keys:
+  - cam_left_wrist
+  - cam_right_wrist
+
+# Initial real-machine version: keyboard labels success/failure.
+# a -> failure / done, b -> continue, c -> success / done
+keyboard_reward_wrapper: single_stage
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  id: "PiperPegInsertionEnv-v1"
+  num_envs: null

@@ -62,6 +62,8 @@ class RealWorldEnv(gym.Env):
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
         self.main_image_key = cfg.main_image_key
+        wrist_image_keys = cfg.get("wrist_image_keys", None)
+        self.wrist_image_keys = list(wrist_image_keys) if wrist_image_keys else []
         self.manual_episode_control_only = bool(
             self.override_cfg.get("manual_episode_control_only", False)
         )
@@ -264,6 +266,21 @@ class RealWorldEnv(gym.Env):
                 f"main_image_key {self.main_image_key!r} not in {list(frames)}"
             )
         obs["main_images"] = frames[self.main_image_key]
+
+        if self.wrist_image_keys:
+            missing_wrist_keys = [
+                key for key in self.wrist_image_keys if key not in frames
+            ]
+            if missing_wrist_keys:
+                raise KeyError(
+                    f"wrist_image_keys {missing_wrist_keys!r} not in {list(frames)}"
+                )
+            # Keep the order from config so GigaWorldPolicy sees
+            # [left_wrist, right_wrist], matching WA training preprocessing.
+            obs["wrist_images"] = np.stack(
+                [frames[key] for key in self.wrist_image_keys], axis=1
+            )
+
         raw_images = OrderedDict(sorted(frames.items()))
         raw_images.pop(self.main_image_key)
 

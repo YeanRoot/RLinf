@@ -23,8 +23,14 @@ python collect_embodied_agent_gigawa.py \
   --config-name collect_bell_data_fix
 
 train
-cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
-python train_embodied_agent_gigawa.py   --config-path ./config   --config-name online_rl_cup
+
+source switch_env gigaworld
+
+cd /home/ubuntu/users/angen.ye/gwp/RLinf
+export PYTHONPATH=$PWD:$PYTHONPATH
+
+cd /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment
+python train_embodied_agent_gigawa.py   --config-path ./config   --config-name online_rl_piper_gigawa
 
 eval:
 python train_embodied_agent_gigawa.py \
@@ -74,3 +80,38 @@ CUDA_VISIBLE_DEVICES=3 python analyze_gigawa_pt_qsa.py \
   --output-dir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/qsa_debug_rl_429_online_cup_step_0.9836_4 \
   --device cuda
 
+sudo chmod -R a+rwX /home/ubuntu/users/angen.ye/gwp/RLinf
+
+sudo docker run -it \
+  --name gwp_piper \
+  -v /home/ubuntu/users/angen.ye:/home/ubuntu/users/angen.ye \
+  -w /home/ubuntu/users/angen.ye \
+  --entrypoint /bin/bash \
+  giga-rlinf:gwp_piper
+
+#在宿主机的终端中
+export DISPLAY=:1
+xhost +local:
+#启动docker容器
+ sudo docker run -it --gpus all \
+    --privileged \
+    --network host \
+    --shm-size="24g" \
+    -v /home/ubuntu/users/angen.ye:/home/ubuntu/users/angen.ye \
+    -e DISPLAY=$DISPLAY \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    -v /dev/input:/dev/input \
+    --device /dev/uinput \
+    --name piper \
+    giga-rlinf:gwp_piper /bin/bash
+  sudo docker start -ai gwp_piper
+
+  sudo docker exec -it piper /bin/bash
+
+
+
+ cd ~/cobot_magic/Piper_ros_private-ros-noetic-interrupt/
+ bash can_config-4arms.sh
+
+ export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ echo 'export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> ~/.bashrc

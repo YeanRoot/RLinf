@@ -513,7 +513,8 @@ class PiperEnv(gym.Env):
             if left_action is not None and right_action is not None:
                 left_action = np.zeros(7, dtype=np.float64)
                 right_action[6] = 0.0
-            self._controller.move_arm(left_action, right_action)
+            # self._controller.move_arm(left_action, right_action)
+            print(f"left right arm: {left_action}\n{right_action}")
         elif self.config.is_dummy:
             self._logger.debug(f"Dummy step: left={left_action}, right={right_action}")
 
@@ -592,7 +593,7 @@ class PiperEnv(gym.Env):
         right_reset = np.array([
             0.7386661800000001, 1.549620296, -1.284977372, 0.047343016, 1.066229612, 0.176812384, 0.0289
         ], dtype=np.float64)
-        self._controller.move_arm(left_reset, right_reset)
+        # self._controller.move_arm(left_reset, right_reset)
 
         # ---- Wait for joints to reach reset pose ----
         self._controller._wait_for_joint(

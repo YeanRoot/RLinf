@@ -27,6 +27,10 @@ giga_world_policy:
   single_view_width: 256
   single_view_height: 192
   prompt: null
+  # Optional: use the exact cached T5 embedding used during WA training/inference.
+  # When set, it takes precedence over `prompt` / env task_descriptions.
+  prompt_embeds_path: null
+  prompt_embeds_max_length: 64
   use_safetensors: False
   wa_num_action_chunks: 48
 

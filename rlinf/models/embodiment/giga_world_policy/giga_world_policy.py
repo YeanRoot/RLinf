@@ -15,6 +15,7 @@
 import copy
 import importlib.util
 import json
+import pickle
 import os
 import sys
 import types
@@ -445,6 +446,10 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self.guidance_scale = float(policy_cfg.guidance_scale)
         self.num_frames = int(policy_cfg.get("num_frames", 5))
         self.prompt_override = policy_cfg.get("prompt", None)
+        self.prompt_embeds_path = policy_cfg.get("prompt_embeds_path", None)
+        self.prompt_embeds_max_length = int(
+            policy_cfg.get("prompt_embeds_max_length", 64)
+        )
         self.robotype = str(policy_cfg.robotype)
         self.single_view_size = (
             int(policy_cfg.get("single_view_width", 256)),
@@ -598,6 +603,18 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         )
         self.pipe.to(self.device_ref)
         self._freeze_pipe_modules()
+        fixed_prompt_embeds = self._load_fixed_prompt_embeds(
+            self.prompt_embeds_path,
+            max_length=self.prompt_embeds_max_length,
+        )
+        if fixed_prompt_embeds is not None:
+            self.register_buffer(
+                "fixed_prompt_embeds",
+                fixed_prompt_embeds,
+                persistent=False,
+            )
+        else:
+            self.fixed_prompt_embeds = None
 
         self.model_action_dim = int(self.pipe.transformer.action_encoder[0].in_features)
         self.vae_z_dim = int(self.pipe.vae.config.z_dim)
@@ -918,6 +935,62 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         return str(task_descriptions[index])
 
     @staticmethod
+    def _extract_prompt_embeds_from_payload(payload: Any) -> torch.Tensor:
+        if isinstance(payload, torch.Tensor):
+            return payload
+        if isinstance(payload, dict):
+            if isinstance(payload.get("prompt_embeds"), torch.Tensor):
+                return payload["prompt_embeds"]
+            condition_dict = payload.get("condition_dict", None)
+            if isinstance(condition_dict, dict) and isinstance(
+                condition_dict.get("prompt_embeds"), torch.Tensor
+            ):
+                return condition_dict["prompt_embeds"]
+        raise TypeError(
+            "Unsupported prompt embedding payload. Expected a Tensor or a dict "
+            "containing `prompt_embeds`."
+        )
+
+    def _load_fixed_prompt_embeds(
+        self,
+        prompt_embeds_path: Optional[str],
+        max_length: int,
+    ) -> Optional[torch.Tensor]:
+        if not prompt_embeds_path:
+            return None
+        prompt_embeds_path = os.path.expanduser(str(prompt_embeds_path))
+        if not os.path.isfile(prompt_embeds_path):
+            raise FileNotFoundError(
+                f"prompt_embeds_path does not exist: {prompt_embeds_path}"
+            )
+
+        try:
+            payload = torch.load(prompt_embeds_path, map_location="cpu")
+        except Exception:
+            with open(prompt_embeds_path, "rb") as f:
+                payload = pickle.load(f)
+
+        prompt_embeds = self._extract_prompt_embeds_from_payload(payload)
+        if prompt_embeds.ndim == 3 and prompt_embeds.shape[0] == 1:
+            prompt_embeds = prompt_embeds.squeeze(0)
+        if prompt_embeds.ndim != 2:
+            raise ValueError(
+                "Loaded prompt embeddings must have shape [seq_len, hidden_dim] "
+                f"or [1, seq_len, hidden_dim], got {tuple(prompt_embeds.shape)}"
+            )
+
+        prompt_embeds = prompt_embeds.detach().cpu()
+        if prompt_embeds.shape[0] >= max_length:
+            prompt_embeds = prompt_embeds[:max_length]
+        else:
+            prompt_embeds = F.pad(
+                prompt_embeds,
+                (0, 0, 0, max_length - prompt_embeds.shape[0]),
+                value=0,
+            )
+        return prompt_embeds.to(device=self.device_ref, dtype=torch.float32).unsqueeze(0)
+
+    @staticmethod
     def _tensor_summary(x: torch.Tensor) -> str:
         x = x.detach().float().cpu()
         return (
@@ -1193,9 +1266,12 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             guidance_scale=self.guidance_scale,
             num_inference_steps=self.num_inference_steps,
             image=ref_image,
-            prompt=prompt,
             return_dict=False,
         )
+        if self.fixed_prompt_embeds is not None:
+            common_kwargs["prompt_embeds"] = self.fixed_prompt_embeds
+        else:
+            common_kwargs["prompt"] = prompt
 
         if want_debug:
             try:
