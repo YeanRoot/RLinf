@@ -33,10 +33,9 @@ cd /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment
 python train_embodied_agent_gigawa.py   --config-path ./config   --config-name online_rl_piper_gigawa
 
 eval:
-python train_embodied_agent_gigawa.py \
+python eval_embodied_agent.py \
   --config-path ./config \
-  --config-name cup_eval \
-  ++actor.fsdp_config.use_orig_params=true
+  --config-name eval_piper_gigawa_wa_only
 
 # original all sliding 
 python reshard_offline_collection.py \
@@ -115,3 +114,7 @@ xhost +local:
 
  export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
  echo 'export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> ~/.bashrc
+
+ export RLINF_SKIP_ROS_CLEANUP=1
+source /opt/ros/noetic/setup.bash
+source /opt/venv/piper_ws/setup_piper_ros.sh

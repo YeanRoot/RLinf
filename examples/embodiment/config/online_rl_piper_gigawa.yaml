@@ -14,7 +14,12 @@ cluster:
   num_nodes: 1
 
   component_placement:
-    actor, env, rollout: 0
+    # actor / rollout need GPU 0; the real-world env itself is CPU-side.
+    actor: 0
+    rollout: 0
+    env:
+      node_group: node
+      placement: 0
 
 runner:
   task_type: embodied

@@ -1,0 +1,28 @@
+defaults:
+  - online_rl_piper_gigawa
+  - _self_
+
+# Real-machine WA-only debug/eval: one rollout model on GPU, real-world env on CPU node.
+runner:
+  only_eval: true
+  async_rollout_training: false
+  val_check_interval: -1
+
+rollout:
+  collect_transitions: false
+  collect_prev_infos: false
+
+env:
+  eval:
+    override_cfg:
+      is_dummy: false
+      joint_action_mode: absolute
+      enable_human_intervention: false
+
+actor:
+  model:
+    giga_world_policy:
+      use_rl_head_for_rollout: false
+      inference_only: true
+      minimal_prompt_embeds_pipeline: true
+      expand_timesteps: true

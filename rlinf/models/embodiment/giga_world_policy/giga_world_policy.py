@@ -450,6 +450,14 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self.prompt_embeds_max_length = int(
             policy_cfg.get("prompt_embeds_max_length", 64)
         )
+        self.inference_only = bool(policy_cfg.get("inference_only", False))
+        self.minimal_prompt_embeds_pipeline = bool(
+            policy_cfg.get("minimal_prompt_embeds_pipeline", False)
+        )
+        if self.minimal_prompt_embeds_pipeline and not self.prompt_embeds_path:
+            raise ValueError(
+                "minimal_prompt_embeds_pipeline=True requires prompt_embeds_path to be set."
+            )
         self.robotype = str(policy_cfg.robotype)
         self.single_view_size = (
             int(policy_cfg.get("single_view_width", 256)),
@@ -590,17 +598,55 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             subfolder="vae",
             torch_dtype=torch_dtype,
         )
-        transformer = CasualWorldActionTransformer.from_pretrained(
-            transformer_ckpt,
+        transformer_load_kwargs = dict(
             use_safetensors=bool(policy_cfg.get("use_safetensors", False)),
-        ).to(torch_dtype)
-
-        self.pipe = WAPipeline.from_pretrained(
-            base_model_dir,
-            vae=vae,
-            transformer=transformer,
             torch_dtype=torch_dtype,
         )
+        try:
+            transformer = CasualWorldActionTransformer.from_pretrained(
+                transformer_ckpt,
+                low_cpu_mem_usage=True,
+                **transformer_load_kwargs,
+            )
+        except TypeError:
+            # Keep compatibility with older custom ModelMixin versions that do not
+            # expose low_cpu_mem_usage / torch_dtype in from_pretrained.
+            transformer = CasualWorldActionTransformer.from_pretrained(
+                transformer_ckpt,
+                use_safetensors=bool(policy_cfg.get("use_safetensors", False)),
+            ).to(torch_dtype)
+
+        if self.minimal_prompt_embeds_pipeline:
+            from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+
+            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                base_model_dir,
+                subfolder="scheduler",
+            )
+            self.pipe = WAPipeline(
+                tokenizer=None,
+                text_encoder=None,
+                vae=vae,
+                scheduler=scheduler,
+                image_processor=None,
+                image_encoder=None,
+                transformer=transformer,
+                transformer_2=None,
+                boundary_ratio=None,
+                expand_timesteps=bool(policy_cfg.get("expand_timesteps", True)),
+            )
+            print(
+                "[giga_world_policy] using minimal prompt-embeds-only WA pipeline "
+                "(text_encoder/tokenizer/image_encoder skipped)",
+                flush=True,
+            )
+        else:
+            self.pipe = WAPipeline.from_pretrained(
+                base_model_dir,
+                vae=vae,
+                transformer=transformer,
+                torch_dtype=torch_dtype,
+            )
         self.pipe.to(self.device_ref)
         self._freeze_pipe_modules()
         fixed_prompt_embeds = self._load_fixed_prompt_embeds(
@@ -693,6 +739,24 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         # ----------------------------
         self.ref_action_flat_dim = self.action_chunk * self.model_action_dim
         self.robot_state_dim = self.model_action_dim
+        if self.inference_only:
+            if self.get_use_rl_head_for_rollout():
+                raise ValueError(
+                    "inference_only=True requires use_rl_head_for_rollout=False."
+                )
+            if self.enable_action_compare_debug:
+                raise ValueError(
+                    "inference_only=True is incompatible with enable_action_compare_debug=True."
+                )
+            # These lightweight placeholders keep .to() and state_dict handling
+            # simple while ensuring no actor/critic parameters are allocated for
+            # WA-only real-world evaluation.
+            self.visual_compressor = nn.Identity()
+            self.actor_head = nn.Identity()
+            self.critic = nn.Identity()
+            self.actor_target = nn.Identity()
+            self.critic_target = nn.Identity()
+            return
         self.visual_cond_dim = 0 if self.visual_input_mode == "remove" else self.visual_feature_dim
         self.robot_state_cond_dim = 0 if self.robot_state_input_mode == "remove" else self.robot_state_dim
         self.ref_action_cond_dim = 0 if self.ref_action_input_mode == "remove" else self.ref_action_flat_dim
