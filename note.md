@@ -25,7 +25,7 @@ export PYTHONPATH=$ROBOTWIN_PATH:$REPO_PATH:$PYTHONPATH
 
 python collect_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name collect_bell_data_fix
+  --config-name collect_cup_data
 
 train
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment

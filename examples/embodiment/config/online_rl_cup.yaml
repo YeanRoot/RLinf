@@ -12,17 +12,17 @@ hydra:
 
 cluster:
   num_nodes: 1
-  component_placement:
-    actor, env, rollout: 0-3
   # component_placement:
-  #   actor: 0-1
-  #   rollout: 2
-  #   env: 3
+  #   actor, env, rollout: 0-3
+  component_placement:
+    actor: 0-1
+    rollout: 2
+    env: 3
 
 runner:
   task_type: embodied
   logger:
-    log_path:  "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_cup_513_dense_test"
+    log_path:  "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_cup_513_dense_test4"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -155,7 +155,7 @@ env:
   enable_offload: False
 
   train:
-    total_num_envs: 4
+    total_num_envs: 1
     reward_coef: ${algorithm.reward_coef}
     reward_mode: dense
     use_custom_reward: false
@@ -176,7 +176,7 @@ env:
 
 
   eval:
-    total_num_envs: 4
+    total_num_envs: 1
     auto_reset: True
     ignore_terminations: False
     reward_mode: sparse
