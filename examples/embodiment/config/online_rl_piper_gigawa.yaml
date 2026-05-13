@@ -24,7 +24,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path:  "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_piper_gigawa"
+    log_path:  "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/online_rl_piper_gigawa2"
     project_name: rlinf
     experiment_name: "realworld_piper_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -41,7 +41,7 @@ runner:
   replay_channel_maxsize: 8
   weight_sync_interval: 20
 
-  only_eval: true
+  only_eval: false
   val_check_interval: -1
   save_interval: 200
 
@@ -55,8 +55,8 @@ algorithm:
     cache_size: 2000
     sample_window_size: 8000
     min_buffer_size: 2
-    auto_save: False
-    auto_save_path: null
+    auto_save: True
+    auto_save_path: ${runner.logger.log_path}/pt_debug/replay
     trajectory_format: pt
     enable_preload: False
     prefetch_size: 10
@@ -68,15 +68,15 @@ algorithm:
     sample_window_size: 6000
     min_buffer_size: 0
     train_actor_steps: 2
-    auto_save: False
-    auto_save_path: null
+    auto_save: True
+    auto_save_path: ${runner.logger.log_path}/pt_debug/demo
     trajectory_format: pt
     load_path: null
-    sample_ratio: 0
+    sample_ratio: 0.5
     allow_train_on_demo_only: true
     allow_demo_only_fallback: true
-    allow_replay_only_fallback: false
-    store_online_interventions: false
+    allow_replay_only_fallback: true
+    store_online_interventions: true
 
   normalize_advantages: False
   kl_penalty: kl
@@ -123,7 +123,18 @@ algorithm:
   target_noise_clip: 0.0
   bc_coef: 50
   ref_action_dropout_p: 0
-  warmup_steps: 2
+  actor_bc_target: batch_action
+  use_action_valid_mask: true
+
+  # Use primitive-step observations to rebuild clean training windows after
+  # real-world teleoperation interrupts a model chunk.
+  gigawa_sliding_window:
+    enable: true
+    offset_stride: 12
+    max_offsets: 1
+    augment_mode: preserve_ref_action
+
+  warmup_steps: 64
   train_actor_steps: 0
   rollout_actor_after_warmup: true
   rollout_actor_min_actor_updates: 500
@@ -157,16 +168,29 @@ env:
   train:
     total_num_envs: 1
     reward_coef: ${algorithm.reward_coef}
-    max_episode_steps: 192
-    max_steps_per_rollout_epoch: 192
+    max_episode_steps: 960
+    max_steps_per_rollout_epoch: 960
     group_size: 1
-    auto_reset: False
+    break_chunk_on_intervention: true
+    collect_intervention_until_release: true
+    # Operational simplification: once human teleop starts, keep teleop until success/failure.
+    # The old policy chunk is discarded; human chunks are stored with valid masks.
+    pad_interrupted_chunks: true
+    intervention_max_steps: 960
+    debug_intervention_chunks: true
+    auto_reset: True
     ignore_terminations: False
     override_cfg:
       is_dummy: false
       # GigaWorldPolicy has already converted predicted delta actions to absolute qpos.
       joint_action_mode: absolute
       enable_human_intervention: true
+      # After success/failure, reset will move the arms to the reset pose and then
+      # wait here until you manually reset the objects and press this key.
+      wait_user_ready_after_reset: true
+      reset_ready_key: b
+      reset_ready_timeout_sec: null
+      post_reset_settle_sec: 0.5
       camera_names:
         - cam_high
         - cam_left_wrist
@@ -181,9 +205,9 @@ env:
     total_num_envs: 1
     auto_reset: False
     ignore_terminations: False
-    max_episode_steps: 192
+    max_episode_steps: 960
     reward_coef: ${algorithm.reward_coef}
-    max_steps_per_rollout_epoch: 192
+    max_steps_per_rollout_epoch: 960
     group_size: 1
     use_fixed_reset_state_ids: False
     override_cfg:
@@ -256,6 +280,8 @@ actor:
       norm_json: "/home/ubuntu/users/angen.ye/gwp/norm_stats_delta.json"
       diffusers_src: null
       robotype: "aloha"
+      actor_robot_state_mode: normalized
+      keep_raw_robot_state: true
       num_inference_steps: 10
       guidance_scale: 0.0
       num_frames: 5

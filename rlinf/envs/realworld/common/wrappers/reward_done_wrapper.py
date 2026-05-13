@@ -53,7 +53,13 @@ class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
         last_intervened = False
         done = False
         reward = 0
-        key = self.listener.get_key()
+        key = None
+        # Use one-shot key consumption so a held success/failure key cannot
+        # immediately terminate the next episode after reset.
+        for candidate in ("a", "b", "c"):
+            if self.listener.consume_press(candidate):
+                key = candidate
+                break
         print(f"Key pressed: {key}")
         if key not in ["a", "b", "c"]:
             return last_intervened, done, reward
@@ -86,7 +92,11 @@ class KeyboardRewardDoneMultiStageWrapper(BaseKeyboardRewardDoneWrapper):
         last_intervened = False
         done = False
         reward = 0
-        key = self.listener.get_key()
+        key = None
+        for candidate in ("a", "b", "c", "q"):
+            if self.listener.consume_press(candidate):
+                key = candidate
+                break
         print(f"Key pressed: {key}")
         if key == "a":
             self.reward_stage = 0

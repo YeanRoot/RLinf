@@ -557,6 +557,16 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self.robot_state_input_mode = str(
             policy_cfg.get("robot_state_input_mode", "normal")
         ).lower()
+        self.actor_robot_state_mode = str(
+            policy_cfg.get("actor_robot_state_mode", "normalized")
+        ).lower()
+        valid_actor_robot_state_modes = {"normalized", "raw"}
+        if self.actor_robot_state_mode not in valid_actor_robot_state_modes:
+            raise ValueError(
+                f"Unsupported actor_robot_state_mode={self.actor_robot_state_mode}, "
+                f"expected one of {sorted(valid_actor_robot_state_modes)}"
+            )
+        self.keep_raw_robot_state = bool(policy_cfg.get("keep_raw_robot_state", True))
         valid_robot_state_input_modes = {"normal", "zero", "remove"}
         if self.robot_state_input_mode not in valid_robot_state_input_modes:
             raise ValueError(
@@ -1422,6 +1432,62 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         pred_action[:, :, self.delta_mask] += state_pad[self.delta_mask]
         return pred_action[:, :, : self.env_action_dim].float()
 
+    def model_action_to_exec_action(
+        self,
+        model_action: torch.Tensor,
+        raw_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert normalized-delta model action to executable absolute qpos."""
+        if model_action.dim() == 2:
+            batch, flat = model_action.shape
+            chunk = flat // self.model_action_dim
+            model_view = model_action.view(batch, chunk, self.model_action_dim)
+        else:
+            model_view = model_action
+            batch, chunk = model_view.shape[:2]
+        raw_state = raw_state.to(device=model_view.device, dtype=model_view.dtype)
+        if raw_state.dim() == 2:
+            raw_state = raw_state[:, None, :].expand(batch, chunk, raw_state.shape[-1])
+        if raw_state.shape[-1] < self.model_action_dim:
+            pad = torch.zeros(*raw_state.shape[:-1], self.model_action_dim - raw_state.shape[-1], device=raw_state.device, dtype=raw_state.dtype)
+            raw_state = torch.cat([raw_state, pad], dim=-1)
+        raw_state = raw_state[..., : self.model_action_dim]
+        delta = model_view * self.delta_std.clamp_min(1e-8) + self.delta_mean
+        exec_action = delta.clone()
+        exec_action[..., self.delta_mask] += raw_state[..., self.delta_mask]
+        exec_action = exec_action[..., : self.env_action_dim].float()
+        return exec_action.reshape(batch, -1) if model_action.dim() == 2 else exec_action
+
+    def exec_action_to_model_action(
+        self,
+        exec_action: torch.Tensor,
+        raw_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert executable absolute qpos action to normalized-delta model action."""
+        if exec_action.dim() == 2:
+            batch, flat = exec_action.shape
+            chunk = flat // self.env_action_dim
+            exec_view = exec_action.view(batch, chunk, self.env_action_dim)
+        else:
+            exec_view = exec_action
+            batch, chunk = exec_view.shape[:2]
+        raw_state = raw_state.to(device=exec_view.device, dtype=exec_view.dtype)
+        if raw_state.dim() == 2:
+            raw_state = raw_state[:, None, :].expand(batch, chunk, raw_state.shape[-1])
+        if raw_state.shape[-1] < self.model_action_dim:
+            pad = torch.zeros(*raw_state.shape[:-1], self.model_action_dim - raw_state.shape[-1], device=raw_state.device, dtype=raw_state.dtype)
+            raw_state = torch.cat([raw_state, pad], dim=-1)
+        raw_state = raw_state[..., : self.model_action_dim]
+        if exec_view.shape[-1] < self.model_action_dim:
+            pad = torch.zeros(*exec_view.shape[:-1], self.model_action_dim - exec_view.shape[-1], device=exec_view.device, dtype=exec_view.dtype)
+            exec_full = torch.cat([exec_view, pad], dim=-1)
+        else:
+            exec_full = exec_view[..., : self.model_action_dim]
+        delta = exec_full.clone()
+        delta[..., self.delta_mask] = exec_full[..., self.delta_mask] - raw_state[..., self.delta_mask]
+        model_action = (delta - self.delta_mean) / self.delta_std.clamp_min(1e-8)
+        return model_action.reshape(batch, -1) if exec_action.dim() == 2 else model_action
+
     @torch.no_grad()
     def _extract_frozen_backbone_single(
         self,
@@ -1457,12 +1523,20 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             norm_state=norm_state,
         )[0]  # [Z, T, H, W]
 
-        return {
+        actor_robot_state = (
+            norm_state[0].float()
+            if self.actor_robot_state_mode == "normalized"
+            else state_pad.float()
+        )
+        out = {
             "visual_latent": visual_latent,             # [Z, T, H, W]
-            "robot_state": state_pad.float(),           # [state_dim]
+            "robot_state": actor_robot_state,           # [state_dim], normalized by default for actor/critic
             "ref_action": ref_action_model,             # [C, A_model]
             "ref_action_exec": ref_action_exec,         # [C, A_env]
         }
+        if self.keep_raw_robot_state:
+            out["raw_robot_state"] = state_pad.float()
+        return out
 
     @torch.no_grad()
     def extract_frozen_backbone_batch(self, env_obs: dict[str, Any]) -> dict[str, torch.Tensor]:
@@ -1481,12 +1555,15 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         robot_state = torch.stack([o["robot_state"] for o in outs], dim=0).to(self.device_ref)
         ref_action = torch.stack([o["ref_action"] for o in outs], dim=0).to(self.device_ref)
         ref_action_exec = torch.stack([o["ref_action_exec"] for o in outs], dim=0).to(self.device_ref)
-        return {
+        result = {
             "visual_latent": visual_latent,
             "robot_state": robot_state,
             "ref_action": ref_action,
             "ref_action_exec": ref_action_exec,
         }
+        if "raw_robot_state" in outs[0]:
+            result["raw_robot_state"] = torch.stack([o["raw_robot_state"] for o in outs], dim=0).to(self.device_ref)
+        return result
 
     def encode_visual(self, visual_latent: torch.Tensor) -> torch.Tensor:
         """

@@ -120,6 +120,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.actor_bc_trust_region_eval_dropout_p = float(
             actor_bc_guard_cfg.get("trust_region_eval_dropout_p", 0.0)
         )
+        self.actor_bc_target = str(self.cfg.algorithm.get("actor_bc_target", "batch_action")).lower()
+        if self.actor_bc_target not in {"batch_action", "ref_action"}:
+            raise ValueError(
+                f"Unsupported actor_bc_target={self.actor_bc_target}; expected batch_action or ref_action."
+            )
+        self.use_action_valid_mask = bool(self.cfg.algorithm.get("use_action_valid_mask", True))
 
     # ---------------------------------------------------------------------
     # Init / setup
@@ -1876,11 +1882,14 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     def _extract_step_features(self, obs_step: dict[str, Any]) -> dict[str, torch.Tensor]:
         policy = self._unwrap_policy(self.model)
         feat = policy.extract_frozen_backbone_batch(obs_step)
-        return {
+        out = {
             "visual_latent": feat["visual_latent"].cpu().contiguous(),
             "robot_state": feat["robot_state"].cpu().contiguous(),
             "ref_action": feat["ref_action"].cpu().contiguous(),
         }
+        if "raw_robot_state" in feat:
+            out["raw_robot_state"] = feat["raw_robot_state"].cpu().contiguous()
+        return out
 
     def _get_source_actions(self, traj: Trajectory) -> torch.Tensor:
         if traj.forward_inputs and "model_action" in traj.forward_inputs:
@@ -2048,6 +2057,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             model_weights_id=traj.model_weights_id,
             actions=self._narrow_time_dim(traj.actions, end_t) if traj.actions is not None else None,
             intervene_flags=self._narrow_time_dim(traj.intervene_flags, end_t) if traj.intervene_flags is not None else None,
+            action_valid_mask=self._narrow_time_dim(traj.action_valid_mask, end_t) if traj.action_valid_mask is not None else None,
             rewards=self._narrow_time_dim(traj.rewards, end_t) if traj.rewards is not None else None,
             terminations=self._narrow_time_dim(traj.terminations, end_t) if traj.terminations is not None else None,
             truncations=self._narrow_time_dim(traj.truncations, end_t) if traj.truncations is not None else None,
@@ -2105,6 +2115,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 model_weights_id=traj.model_weights_id,
                 actions=self._select_batch_sample(traj.actions, batch_idx, batch_size) if traj.actions is not None else None,
                 intervene_flags=self._select_batch_sample(traj.intervene_flags, batch_idx, batch_size) if traj.intervene_flags is not None else None,
+                action_valid_mask=self._select_batch_sample(traj.action_valid_mask, batch_idx, batch_size) if traj.action_valid_mask is not None else None,
                 rewards=self._select_batch_sample(traj.rewards, batch_idx, batch_size) if traj.rewards is not None else None,
                 terminations=self._select_batch_sample(traj.terminations, batch_idx, batch_size) if traj.terminations is not None else None,
                 truncations=self._select_batch_sample(traj.truncations, batch_idx, batch_size) if traj.truncations is not None else None,
@@ -2170,6 +2181,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             model_weights_id=traj.model_weights_id,
             actions=source_actions.cpu().contiguous(),
             intervene_flags=traj.intervene_flags[:traj_len].cpu().contiguous() if traj.intervene_flags is not None else None,
+            action_valid_mask=traj.action_valid_mask[:traj_len].cpu().contiguous() if traj.action_valid_mask is not None else None,
             rewards=traj.rewards[:traj_len].cpu().contiguous() if traj.rewards is not None else None,
             terminations=traj.terminations[:traj_len].cpu().contiguous() if traj.terminations is not None else None,
             truncations=traj.truncations[:traj_len].cpu().contiguous() if traj.truncations is not None else None,
@@ -2261,6 +2273,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         prev_values = traj.prev_values[:traj_len] if traj.prev_values is not None else None
         versions = traj.versions[:traj_len] if traj.versions is not None else None
         intervene_flags = traj.intervene_flags[:traj_len] if traj.intervene_flags is not None else None
+        action_valid_mask = traj.action_valid_mask[:traj_len] if traj.action_valid_mask is not None else None
         primitive_obs = self._build_primitive_obs_dict(traj, traj_len=traj_len)
         if "states" not in primitive_obs:
             return [self._convert_standard_trajectory_for_gigawa(traj)]
@@ -2288,11 +2301,36 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         primitive_intervene = None
         if intervene_flags is not None:
-            primitive_intervene = intervene_flags.view(
-                traj_len, batch_size, action_chunk, action_dim
-            ).permute(0, 2, 1, 3).reshape(
-                traj_len * action_chunk, batch_size, action_dim
-            ).to(torch.bool).cpu().contiguous()
+            if intervene_flags.dim() == 4:
+                primitive_intervene = intervene_flags.view(
+                    traj_len, batch_size, action_chunk, action_dim
+                ).permute(0, 2, 1, 3).reshape(
+                    traj_len * action_chunk, batch_size, action_dim
+                )
+            elif intervene_flags.dim() == 3:
+                # [T,B,C] primitive flags; expand across action_dim for legacy
+                # consumers that expect flattened per-action flags.
+                primitive_intervene = intervene_flags.permute(0, 2, 1).reshape(
+                    traj_len * action_chunk, batch_size
+                )[:, :, None].expand(-1, -1, action_dim)
+            else:
+                primitive_intervene = None
+            if primitive_intervene is not None:
+                primitive_intervene = primitive_intervene.to(torch.bool).cpu().contiguous()
+
+        primitive_valid = None
+        if action_valid_mask is not None:
+            if action_valid_mask.dim() == 4:
+                # [T,B,C,A] -> primitive step mask
+                primitive_valid = action_valid_mask.any(dim=-1)
+            elif action_valid_mask.dim() == 3:
+                primitive_valid = action_valid_mask
+            else:
+                primitive_valid = None
+            if primitive_valid is not None:
+                primitive_valid = primitive_valid.permute(0, 2, 1).reshape(
+                    traj_len * action_chunk, batch_size
+                ).to(torch.bool).cpu().contiguous()
 
         primitive_logprobs = None
         if prev_logprobs is not None:
@@ -2327,6 +2365,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             window_truncations = []
             window_dones = []
             window_intervene = [] if primitive_intervene is not None else None
+            window_valid_mask = [] if primitive_valid is not None else None
             window_logprobs = [] if primitive_logprobs is not None else None
             source_chunk_indices = []
 
@@ -2337,9 +2376,21 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
             for start_idx in start_indices:
                 valid_len = min(action_chunk, total_primitive_steps - start_idx)
+                if primitive_valid is not None:
+                    # Only keep the consecutive valid prefix. Padding after a
+                    # teleop interruption must not become a training target.
+                    valid_seq = primitive_valid[start_idx : start_idx + valid_len]
+                    if not bool(valid_seq[:, 0].any().item()):
+                        continue
+                    valid_len = 0
+                    for _j in range(int(valid_seq.shape[0])):
+                        if bool(valid_seq[_j, 0].item()):
+                            valid_len += 1
+                        else:
+                            break
                 if valid_len <= 0:
                     continue
-                next_idx = start_idx + valid_len
+                next_idx = min(start_idx + valid_len, int(next(iter(primitive_obs.values())).shape[0]) - 1)
 
                 curr_step_obs = {key: value[start_idx] for key, value in primitive_obs.items()}
                 next_step_obs = {key: value[next_idx] for key, value in primitive_obs.items()}
@@ -2419,6 +2470,17 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     window_intervene.append(
                         padded_intervene.permute(1, 0, 2).reshape(batch_size, -1).cpu().contiguous()
                     )
+                if primitive_valid is not None:
+                    padded_valid = primitive_valid[start_idx : start_idx + valid_len]
+                    if valid_len < action_chunk:
+                        pad_count = action_chunk - valid_len
+                        pad_valid = torch.zeros(
+                            (pad_count, padded_valid.shape[1]),
+                            dtype=padded_valid.dtype,
+                            device=padded_valid.device,
+                        )
+                        padded_valid = torch.cat([padded_valid, pad_valid], dim=0)
+                    window_valid_mask.append(padded_valid.permute(1, 0).cpu().contiguous())
                 if primitive_logprobs is not None:
                     window_logprobs.append(
                         self._pad_primitive_scalar_chunk(
@@ -2445,6 +2507,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     model_weights_id=traj.model_weights_id,
                     actions=torch.stack(window_actions, dim=0),
                     intervene_flags=torch.stack(window_intervene, dim=0) if window_intervene is not None else None,
+                    action_valid_mask=torch.stack(window_valid_mask, dim=0) if window_valid_mask is not None else None,
                     rewards=torch.stack(window_rewards, dim=0) if primitive_rewards is not None else None,
                     terminations=torch.stack(window_terminations, dim=0) if primitive_terminations is not None else None,
                     truncations=torch.stack(window_truncations, dim=0) if primitive_truncations is not None else None,
@@ -2783,11 +2846,23 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             use_target=False,
         )
 
-        bc_loss = policy.compute_bc_loss(pi, ref_action)
+        bc_target = ref_action
+        if self.actor_bc_target == "batch_action" and "actions" in batch:
+            bc_target = self._reshape_runtime_action_tensor(
+                batch["actions"].to(self.device, dtype=self.torch_dtype),
+                tensor_name="batch.actions",
+            )
+        valid_mask = None
+        if self.use_action_valid_mask and "action_valid_mask" in batch:
+            valid_mask = batch["action_valid_mask"].to(self.device, dtype=torch.bool)
+            if valid_mask.dim() == 3 and valid_mask.shape[1] == 1:
+                valid_mask = valid_mask.squeeze(1)
+        bc_loss = policy.compute_bc_loss(pi, bc_target, valid_mask=valid_mask)
 
         metrics = {
             "bc_loss": bc_loss.item(),
             "ref_action_dropout_p": self.ref_action_dropout_p,
+            "actor_bc_target_is_batch_action": float(self.actor_bc_target == "batch_action"),
             "training_stage": float(
                 0 if self.stage_actor_bc_only else 1 if self.stage_freeze_actor else 2
             ),

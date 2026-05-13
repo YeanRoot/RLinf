@@ -67,6 +67,16 @@ class RealWorldEnv(gym.Env):
         self.manual_episode_control_only = bool(
             self.override_cfg.get("manual_episode_control_only", False)
         )
+        self.break_chunk_on_intervention = bool(
+            cfg.get("break_chunk_on_intervention", False)
+        )
+        self.collect_intervention_until_release = bool(
+            cfg.get("collect_intervention_until_release", False)
+        )
+        self.pad_interrupted_chunks = bool(cfg.get("pad_interrupted_chunks", True))
+        self.intervention_max_steps = int(cfg.get("intervention_max_steps", 96))
+        self.debug_intervention_chunks = bool(cfg.get("debug_intervention_chunks", True))
+        self._last_raw_states = None
 
         self._init_env()
 
@@ -235,9 +245,34 @@ class RealWorldEnv(gym.Env):
         infos["episode"] = to_tensor(episode_info)
         return infos
 
+    def _raw_state_from_raw_obs(self, raw_obs):
+        raw_states = OrderedDict(sorted(raw_obs["state"].items()))
+        return np.concatenate([value for value in raw_states.values()], axis=-1)
+
+    def _hold_action_from_obs(self, obs):
+        # obs is wrapped tensor obs; use current raw qpos to safely hold position.
+        states = obs.get("states", None) if isinstance(obs, dict) else None
+        if isinstance(states, torch.Tensor):
+            return states.detach().cpu().numpy().copy()
+        if states is not None:
+            return np.asarray(states).copy()
+        if self._last_raw_states is not None:
+            return self._last_raw_states.copy()
+        return np.zeros((self.num_envs, 14), dtype=np.float64)
+
+    def _pad_tensor_list(self, values, target_len, *, fill_like=None, fill_value=0):
+        if not values:
+            raise RuntimeError("Cannot pad an empty tensor list.")
+        out = list(values)
+        ref = fill_like if fill_like is not None else values[-1]
+        while len(out) < target_len:
+            out.append(torch.full_like(ref, fill_value))
+        return out
+
     def reset(self, *, reset_state_ids=None, seed=None, options=None, env_idx=None):
         # TODO: handle partial reset
         raw_obs, infos = self.env.reset(seed=seed, options=options)
+        self._last_raw_states = self._raw_state_from_raw_obs(raw_obs).copy()
 
         extracted_obs = self._wrap_obs(raw_obs)
         if env_idx is not None:
@@ -294,9 +329,20 @@ class RealWorldEnv(gym.Env):
     def step(self, actions=None, auto_reset=True):
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
+        if actions is None:
+            actions = self._last_raw_states.copy() if self._last_raw_states is not None else np.zeros((self.num_envs, 14), dtype=np.float64)
+
+        policy_actions_abs = np.asarray(actions, dtype=np.float64).copy()
+        raw_states_before = (
+            self._last_raw_states.copy()
+            if self._last_raw_states is not None
+            else np.zeros_like(policy_actions_abs, dtype=np.float64)
+        )
 
         self._elapsed_steps += 1
         raw_obs, _reward, terminations, truncations, infos = self.env.step(actions)
+        raw_states_after = self._raw_state_from_raw_obs(raw_obs).copy()
+        self._last_raw_states = raw_states_after.copy()
         timeout_truncations = self.elapsed_steps >= self.cfg.max_episode_steps
         if not self.manual_episode_control_only:
             truncations = timeout_truncations
@@ -304,11 +350,17 @@ class RealWorldEnv(gym.Env):
         obs = self._wrap_obs(raw_obs)
         step_reward = self._calc_step_reward(_reward)
         success_current_step = np.isclose(step_reward, 1.0)
+        teleop_active = np.zeros(self.num_envs, dtype=bool)
+        if "teleop_active" in infos:
+            for env_id in range(self.num_envs):
+                teleop_active[env_id] = bool(infos["teleop_active"][env_id])
+
         intervene_flag = np.zeros(self.num_envs, dtype=bool)
         if "intervene_action" in infos:
             for env_id in range(self.num_envs):
                 if infos["intervene_action"][env_id] is not None:
                     intervene_flag[env_id] = True
+        intervene_flag = intervene_flag | teleop_active
 
         infos = self._record_metrics(
             step_reward,
@@ -321,14 +373,27 @@ class RealWorldEnv(gym.Env):
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False
 
-        intervene_action = np.zeros_like(actions)
+        intervene_action = np.zeros_like(policy_actions_abs)
+        executed_action_abs = policy_actions_abs.copy()
         if "intervene_action" in infos:
             for env_id in range(self.num_envs):
                 env_intervene_action = infos["intervene_action"][env_id]
                 if env_intervene_action is not None:
                     intervene_action[env_id] = env_intervene_action.copy()
+                    executed_action_abs[env_id] = env_intervene_action.copy()
+        if "executed_action_abs" in infos:
+            for env_id in range(self.num_envs):
+                env_executed_action = infos["executed_action_abs"][env_id]
+                if env_executed_action is not None:
+                    executed_action_abs[env_id] = env_executed_action.copy()
+
         infos["intervene_action"] = to_tensor(intervene_action)
         infos["intervene_flag"] = to_tensor(intervene_flag)
+        infos["teleop_active"] = to_tensor(teleop_active)
+        infos["policy_action_abs"] = to_tensor(policy_actions_abs)
+        infos["executed_action_abs"] = to_tensor(executed_action_abs)
+        infos["raw_state_before_action"] = to_tensor(raw_states_before)
+        infos["raw_state_after_action"] = to_tensor(raw_states_after)
 
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset
@@ -344,51 +409,149 @@ class RealWorldEnv(gym.Env):
 
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
-        chunk_size = chunk_actions.shape[1]
+        chunk_size = int(chunk_actions.shape[1])
         obs_list = []
         infos_list = []
-
         chunk_rewards = []
-
         raw_chunk_terminations = []
         raw_chunk_truncations = []
-
         raw_chunk_intervene_actions = []
         raw_chunk_intervene_flag = []
-        for i in range(chunk_size):
+        raw_chunk_valid_mask = []
+        raw_chunk_policy_actions_abs = []
+        raw_chunk_executed_actions_abs = []
+        raw_chunk_raw_states_before = []
+
+        interrupted = False
+        intervention_steps = 0
+        i = 0
+        latest_obs = None
+        latest_infos = None
+        latest_terminations = None
+        latest_truncations = None
+
+        def _append_record(extracted_obs, step_reward, terminations, truncations, infos, *, valid=True):
+            obs_list.append(extracted_obs)
+            infos_list.append(infos)
+            chunk_rewards.append(step_reward)
+            raw_chunk_terminations.append(terminations)
+            raw_chunk_truncations.append(truncations)
+            raw_chunk_intervene_actions.append(infos["intervene_action"])
+            raw_chunk_intervene_flag.append(infos["intervene_flag"])
+            raw_chunk_valid_mask.append(
+                torch.ones_like(infos["intervene_flag"], dtype=torch.bool)
+                if valid else torch.zeros_like(infos["intervene_flag"], dtype=torch.bool)
+            )
+            raw_chunk_policy_actions_abs.append(infos["policy_action_abs"])
+            raw_chunk_executed_actions_abs.append(infos["executed_action_abs"])
+            raw_chunk_raw_states_before.append(infos["raw_state_before_action"])
+
+        while i < chunk_size:
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions, auto_reset=False
             )
-            obs_list.append(extracted_obs)
-            infos_list.append(infos)
-            if "intervene_action" in infos:
-                raw_chunk_intervene_actions.append(infos["intervene_action"])
-                raw_chunk_intervene_flag.append(infos["intervene_flag"])
+            latest_obs, latest_infos = extracted_obs, infos
+            latest_terminations, latest_truncations = terminations, truncations
+            _append_record(extracted_obs, step_reward, terminations, truncations, infos, valid=True)
 
-            chunk_rewards.append(step_reward)
-            raw_chunk_terminations.append(terminations)
-            raw_chunk_truncations.append(truncations)
+            intervention_now = bool(infos["intervene_flag"].any().item())
+            done_now = bool(torch.logical_or(terminations, truncations).any().item())
+            if intervention_now and self.break_chunk_on_intervention:
+                interrupted = True
+                intervention_steps += 1
+                break
+            if done_now:
+                break
+            i += 1
+
+        # If teleop started, stop consuming the stale model chunk.  Keep sampling
+        # human actions until teleop is released or this chunk is full.  If the
+        # human holds teleop for > chunk_size steps, the next rollout/env cycle
+        # will immediately enter this branch again and create another segment.
+        while (
+            interrupted
+            and self.collect_intervention_until_release
+            and len(chunk_rewards) < chunk_size
+            and intervention_steps < self.intervention_max_steps
+        ):
+            hold_action = self._hold_action_from_obs(latest_obs)
+            extracted_obs, step_reward, terminations, truncations, infos = self.step(
+                hold_action, auto_reset=False
+            )
+            latest_obs, latest_infos = extracted_obs, infos
+            latest_terminations, latest_truncations = terminations, truncations
+
+            intervention_now = bool(infos["intervene_flag"].any().item())
+            if not intervention_now:
+                # Teleop has been released.  This hold step is only used to obtain
+                # a fresh observation for replanning and is not a training sample.
+                break
+
+            _append_record(extracted_obs, step_reward, terminations, truncations, infos, valid=True)
+            intervention_steps += 1
+            if torch.logical_or(terminations, truncations).any().item():
+                break
+
+        if not obs_list:
+            raise RuntimeError("RealWorldEnv.chunk_step produced no environment steps.")
+
+        valid_steps = len(chunk_rewards)
+        if self.pad_interrupted_chunks and valid_steps < chunk_size:
+            pad_count = chunk_size - valid_steps
+            last_obs = latest_obs if latest_obs is not None else obs_list[-1]
+            last_infos = latest_infos if latest_infos is not None else infos_list[-1]
+            zero_reward = torch.zeros_like(chunk_rewards[-1])
+            false_term = torch.zeros_like(raw_chunk_terminations[-1], dtype=torch.bool)
+            false_trunc = torch.zeros_like(raw_chunk_truncations[-1], dtype=torch.bool)
+            for _ in range(pad_count):
+                obs_list.append(last_obs)
+                infos_list.append(last_infos)
+                chunk_rewards.append(zero_reward.clone())
+                raw_chunk_terminations.append(false_term.clone())
+                raw_chunk_truncations.append(false_trunc.clone())
+                raw_chunk_intervene_actions.append(torch.zeros_like(raw_chunk_intervene_actions[-1]))
+                raw_chunk_intervene_flag.append(torch.zeros_like(raw_chunk_intervene_flag[-1], dtype=torch.bool))
+                raw_chunk_valid_mask.append(torch.zeros_like(raw_chunk_valid_mask[-1], dtype=torch.bool))
+                raw_chunk_policy_actions_abs.append(raw_chunk_policy_actions_abs[-1].clone())
+                raw_chunk_executed_actions_abs.append(raw_chunk_executed_actions_abs[-1].clone())
+                raw_chunk_raw_states_before.append(raw_chunk_raw_states_before[-1].clone())
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
-        raw_chunk_terminations = torch.stack(
-            raw_chunk_terminations, dim=1
-        )  # [num_envs, chunk_steps]
-        raw_chunk_truncations = torch.stack(
-            raw_chunk_truncations, dim=1
-        )  # [num_envs, chunk_steps]
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
 
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
         infos_last = infos_list[-1] if infos_list else {}
-        if raw_chunk_intervene_actions:
-            infos_last["intervene_action"] = torch.stack(
-                raw_chunk_intervene_actions, dim=1
-            ).reshape(self.num_envs, -1)
-            infos_last["intervene_flag"] = torch.stack(raw_chunk_intervene_flag, dim=1)
-            infos_list[-1] = infos_last
+        infos_last["intervene_action"] = torch.stack(
+            raw_chunk_intervene_actions, dim=1
+        ).reshape(self.num_envs, -1)
+        infos_last["intervene_flag"] = torch.stack(raw_chunk_intervene_flag, dim=1)
+        infos_last["action_valid_mask"] = torch.stack(raw_chunk_valid_mask, dim=1)
+        infos_last["policy_action_abs"] = torch.stack(
+            raw_chunk_policy_actions_abs, dim=1
+        ).reshape(self.num_envs, -1)
+        infos_last["executed_action_abs"] = torch.stack(
+            raw_chunk_executed_actions_abs, dim=1
+        ).reshape(self.num_envs, -1)
+        infos_last["raw_state_before_action"] = torch.stack(
+            raw_chunk_raw_states_before, dim=1
+        )
+        infos_last["chunk_interrupted"] = to_tensor(np.asarray([interrupted] * self.num_envs, dtype=bool))
+        infos_last["executed_steps"] = to_tensor(np.asarray([valid_steps] * self.num_envs, dtype=np.int64))
+        infos_list[-1] = infos_last
+
+        if self.debug_intervention_chunks and interrupted:
+            print(
+                "[RealWorldEnv INTERVENTION] "
+                f"valid_steps={valid_steps}/{chunk_size}, "
+                f"intervene_flags={infos_last['intervene_flag'].cpu().numpy().astype(int).tolist()}, "
+                f"valid_mask={infos_last['action_valid_mask'].cpu().numpy().astype(int).tolist()}",
+                flush=True,
+            )
 
         if past_dones.any() and self.auto_reset:
             obs_list[-1], infos_list[-1] = self._handle_auto_reset(

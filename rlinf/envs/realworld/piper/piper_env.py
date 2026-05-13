@@ -168,6 +168,16 @@ class PiperRobotConfig:
     # None or <=0: wait indefinitely until teleop releases.
     teleop_release_reset_timeout_sec: Optional[float] = None
 
+    # After reset pose is reached, optionally block until the operator confirms
+    # the scene has been manually reset.  This prevents the next episode from
+    # immediately starting to execute policy actions before objects are ready.
+    wait_user_ready_after_reset: bool = False
+    reset_ready_key: str = "b"
+    reset_ready_timeout_sec: Optional[float] = None
+    reset_ready_poll_sec: float = 0.1
+    reset_ready_log_interval_sec: float = 2.0
+    post_reset_settle_sec: float = 0.5
+
     # ---- ZMQ inference service (reserved) ----
     inference_host: str = "127.0.0.1"
     inference_port: int = 8080
@@ -389,6 +399,55 @@ class PiperEnv(gym.Env):
                     break
             time.sleep(poll)
 
+    def _wait_for_user_ready_after_reset(self) -> None:
+        """Pause after physical reset until the operator confirms the next episode.
+
+        Press ``reset_ready_key`` after manually resetting the scene/object.  The
+        method runs inside ``reset()``, so no new observation is returned to the
+        rollout worker and no policy action can be generated while waiting.
+        """
+        if self.config.is_dummy or not self.config.wait_user_ready_after_reset:
+            return
+        if self._keyboard is None:
+            self._logger.warning(
+                "reset: wait_user_ready_after_reset=True but no keyboard listener is available; "
+                "continuing without operator confirmation."
+            )
+            return
+
+        ready_key = str(self.config.reset_ready_key)
+        poll = max(float(self.config.reset_ready_poll_sec), 0.05)
+        timeout = self.config.reset_ready_timeout_sec
+        log_interval = max(float(self.config.reset_ready_log_interval_sec), 0.5)
+        start = time.time()
+        last_log = 0.0
+
+        # Wait until any success/failure key held from the previous episode is released.
+        while self._keyboard.get_key() in {"a", "c"}:
+            time.sleep(poll)
+
+        while True:
+            if self._keyboard.consume_press(ready_key):
+                self._logger.info("reset: operator ready key '%s' received; starting next episode.", ready_key)
+                return
+
+            now = time.time()
+            if now - last_log >= log_interval:
+                self._logger.info(
+                    "reset: waiting for operator to reset the scene, then press '%s' to start next episode.",
+                    ready_key,
+                )
+                last_log = now
+
+            if timeout is not None and float(timeout) > 0.0 and now - start > float(timeout):
+                self._logger.warning(
+                    "reset: no operator ready key '%s' after %.1f s; starting next episode anyway.",
+                    ready_key,
+                    float(timeout),
+                )
+                return
+            time.sleep(poll)
+
     # ==================================================================
     # Action / observation spaces
     # ==================================================================
@@ -461,6 +520,12 @@ class PiperEnv(gym.Env):
         action = np.asarray(action, dtype=np.float64)
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
+        raw_state_before_action = (
+            self._controller.get_qpos().copy()
+            if not self.config.is_dummy and self._controller is not None
+            else np.zeros(14, dtype=np.float64)
+        )
+
         # ---- Delta / absolute_normalized: policy output [-1,1]^14 -> absolute joint target ----
         if self.config.joint_action_mode == "absolute_normalized":
             assert self._joint_limit_low is not None and self._joint_limit_high is not None
@@ -496,6 +561,9 @@ class PiperEnv(gym.Env):
         # ---- If policy disabled, hold current position ----
         if not self._policy_enabled and not self.config.is_dummy and self._controller is not None:
             action = self._controller.get_qpos()
+
+        # Keep the final policy command in env-space before any teleop override.
+        policy_action_abs = np.asarray(action, dtype=np.float64).copy()
 
         # ---- Split into left/right arm actions ----
         left_action, right_action = split_dual_arm_action(action)
@@ -538,15 +606,37 @@ class PiperEnv(gym.Env):
         )
         truncated = self._num_steps >= self.config.max_num_steps
 
-        # ---- Build info: record master arm action when teleop is active ----
-        # Combine left (7D) + right (7D) master arm targets into a single 14D action.
-        info: dict = {}
+        # ---- Build info: record what was proposed vs what was actually executed ----
+        # Combine left (7D) + right (7D) master arm targets into a single 14D
+        # absolute-qpos action when teleoperation is active.
+        info: dict = {
+            "teleop_active": bool(teleop_active),
+            "policy_action_abs": policy_action_abs.copy(),
+            "raw_state_before_action": raw_state_before_action.copy(),
+        }
+
+        executed_action_abs = policy_action_abs.copy()
         if teleop_active:
             with self._master_action_lock:
                 if self._master_action_left is not None and self._master_action_right is not None:
-                    info["intervene_action"] = np.concatenate(
+                    executed_action_abs = np.concatenate(
                         [self._master_action_left, self._master_action_right]
                     )
+                    info["intervene_action"] = executed_action_abs.copy()
+                    info["intervene_action_abs"] = executed_action_abs.copy()
+                else:
+                    # Teleop is active but the master joint message has not arrived
+                    # yet.  Do not silently treat this as a policy step; use the
+                    # observed puppet qpos after the step as a conservative executed
+                    # action for logging/training, and mark the step as intervened.
+                    executed_action_abs = observation["state"]["qpos"].copy()
+                    info["intervene_action"] = executed_action_abs.copy()
+                    info["intervene_action_abs"] = executed_action_abs.copy()
+                    info["intervene_action_missing_master"] = True
+                    self._logger.warning(
+                        "Teleop is active but master action is missing; using current puppet qpos as intervention action."
+                    )
+        info["executed_action_abs"] = executed_action_abs.copy()
 
         return observation, reward, terminated, truncated, info
 
@@ -607,7 +697,12 @@ class PiperEnv(gym.Env):
             atol=0.05,
         )
 
-        time.sleep(0.5)
+        settle_sec = max(float(self.config.post_reset_settle_sec), 0.0)
+        if settle_sec > 0:
+            time.sleep(settle_sec)
+
+        self._logger.info("PiperEnv reset pose reached.")
+        self._wait_for_user_ready_after_reset()
 
         observation = self._get_observation()
         self._logger.info("PiperEnv reset complete.")

@@ -103,18 +103,56 @@ xhost +local:
     --device /dev/uinput \
     --name piper \
     giga-rlinf:gwp_piper /bin/bash
-  sudo docker start -ai gwp_piper
 
+启动docker
+  sudo docker start -ai piper
+
+重新docker
   sudo docker exec -it piper /bin/bash
 
-
-
+容器外设置波特率
  cd ~/cobot_magic/Piper_ros_private-ros-noetic-interrupt/
  bash can_config-4arms.sh
 
+gpu报错用这个
  export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
  echo 'export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> ~/.bashrc
 
+
+启动ros节点
  export RLINF_SKIP_ROS_CLEANUP=1
 source /opt/ros/noetic/setup.bash
 source /opt/venv/piper_ws/setup_piper_ros.sh
+
+上使能
+roslaunch piper start_ms_piper_double_agilex_delta_qpose.launch auto_enable:=1
+
+启动相机
+roslaunch realsense2_camera multi_camera.launch
+
+git端口
+mkdir -p ~/.ssh
+
+cat > ~/.ssh/config <<'EOF'
+Host github.com
+  Hostname ssh.github.com
+  Port 443
+  User git
+EOF
+
+chmod 600 ~/.ssh/config
+
+按 c：
+  reward = +1
+  done / terminated = True
+  表示成功
+
+按 a：
+  reward = -1
+  done / terminated = True
+  表示失败
+
+按 b：
+  reward = 0
+  done / terminated = False
+  表示中性标记，不结束

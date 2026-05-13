@@ -55,8 +55,14 @@ class EnvOutput:
     truncations: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
 
-    intervene_actions: Optional[torch.Tensor] = None  # [B]
-    intervene_flags: Optional[torch.Tensor] = None  # [B]
+    intervene_actions: Optional[torch.Tensor] = None  # legacy/env-space abs action, [B, C*A] when present
+    intervene_flags: Optional[torch.Tensor] = None  # [B, C] or [B, C*A]
+    executed_actions_exec: Optional[torch.Tensor] = None  # final executed env-space abs action, [B, C*A]
+    executed_actions_model: Optional[torch.Tensor] = None  # final executed model-space normalized delta, [B, C*A]
+    policy_actions_exec: Optional[torch.Tensor] = None  # original policy env-space abs action, [B, C*A]
+    policy_actions_model: Optional[torch.Tensor] = None  # original policy model-space action, [B, C*A]
+    action_valid_mask: Optional[torch.Tensor] = None  # [B, C], false for padding after chunk interruption
+    raw_states_before_action: Optional[torch.Tensor] = None  # [B, C, state_dim]
 
     # Optional list of per-substep observations returned by env.chunk_step().
     # Each element follows the same schema as `obs` and corresponds to the
@@ -96,6 +102,17 @@ class EnvOutput:
             if self.intervene_flags is not None
             else None
         )
+        for _field_name in (
+            "executed_actions_exec",
+            "executed_actions_model",
+            "policy_actions_exec",
+            "policy_actions_model",
+            "action_valid_mask",
+            "raw_states_before_action",
+        ):
+            _value = getattr(self, _field_name)
+            if _value is not None:
+                setattr(self, _field_name, _value.cpu().contiguous())
         if self.chunk_step_obs_list is not None:
             self.chunk_step_obs_list = [
                 put_tensor_device(obs, "cpu") if obs is not None else None
@@ -238,6 +255,24 @@ class EnvOutput:
             allow_partial_none=True,
             fill_value=False,
         )
+        merged_executed_actions_exec = _merge_optional_tensor_field(
+            "executed_actions_exec", allow_partial_none=True, fill_value=0.0
+        )
+        merged_executed_actions_model = _merge_optional_tensor_field(
+            "executed_actions_model", allow_partial_none=True, fill_value=0.0
+        )
+        merged_policy_actions_exec = _merge_optional_tensor_field(
+            "policy_actions_exec", allow_partial_none=True, fill_value=0.0
+        )
+        merged_policy_actions_model = _merge_optional_tensor_field(
+            "policy_actions_model", allow_partial_none=True, fill_value=0.0
+        )
+        merged_action_valid_mask = _merge_optional_tensor_field(
+            "action_valid_mask", allow_partial_none=True, fill_value=False
+        )
+        merged_raw_states_before_action = _merge_optional_tensor_field(
+            "raw_states_before_action", allow_partial_none=True, fill_value=0.0
+        )
         # turn to EnvOutput and turn to dict to call post init for tensor processing
         return EnvOutput(
             obs=merged_obs,
@@ -248,6 +283,12 @@ class EnvOutput:
             rewards=merged_rewards,
             intervene_actions=merged_intervene_actions,
             intervene_flags=merged_intervene_flags,
+            executed_actions_exec=merged_executed_actions_exec,
+            executed_actions_model=merged_executed_actions_model,
+            policy_actions_exec=merged_policy_actions_exec,
+            policy_actions_model=merged_policy_actions_model,
+            action_valid_mask=merged_action_valid_mask,
+            raw_states_before_action=merged_raw_states_before_action,
         ).to_dict()
 
     def to_dict(self) -> dict[str, Any]:
@@ -265,6 +306,12 @@ class EnvOutput:
         env_output_dict["rewards"] = self.rewards
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
+        env_output_dict["executed_actions_exec"] = self.executed_actions_exec
+        env_output_dict["executed_actions_model"] = self.executed_actions_model
+        env_output_dict["policy_actions_exec"] = self.policy_actions_exec
+        env_output_dict["policy_actions_model"] = self.policy_actions_model
+        env_output_dict["action_valid_mask"] = self.action_valid_mask
+        env_output_dict["raw_states_before_action"] = self.raw_states_before_action
 
         return env_output_dict
 
@@ -385,6 +432,7 @@ class Trajectory:
     model_weights_id: str = ""  # str(uuid(versions))
     actions: torch.Tensor = None
     intervene_flags: torch.Tensor = None
+    action_valid_mask: torch.Tensor = None
     rewards: torch.Tensor = None
     terminations: torch.Tensor = None
     truncations: torch.Tensor = None
@@ -469,10 +517,24 @@ class Trajectory:
         if self.intervene_flags is None or (~self.intervene_flags).all():
             return None
 
+        valid_mask = None
+        if self.action_valid_mask is not None:
+            valid_mask = self.action_valid_mask
+            if valid_mask.dim() == self.intervene_flags.dim() and valid_mask.shape[-1] != self.intervene_flags.shape[-1]:
+                valid_mask = valid_mask.any(dim=-1)
+            if valid_mask.dim() == self.intervene_flags.dim() - 1:
+                valid_mask = valid_mask.to(torch.bool)
+
+        intervene_bool = self.intervene_flags.to(torch.bool)
+        if valid_mask is not None and valid_mask.dim() == intervene_bool.dim() - 1:
+            intervene_bool = intervene_bool & valid_mask.unsqueeze(-1)
+        elif valid_mask is not None and valid_mask.shape == intervene_bool.shape:
+            intervene_bool = intervene_bool & valid_mask
+
         if mode == "any":
-            mask = self.intervene_flags.any(dim=-1)
+            mask = intervene_bool.any(dim=-1)
         elif mode == "all":
-            mask = self.intervene_flags.all(dim=-1)
+            mask = intervene_bool.all(dim=-1)
         else:
             raise NotImplementedError(
                 f"Unsupported extract_intervene_traj mode: {mode}"
@@ -500,6 +562,7 @@ class Trajectory:
             prev_logprobs = apply_mask(self.prev_logprobs, i)
             prev_values = apply_mask(self.prev_values, i)
             intervene_flags = apply_mask(self.intervene_flags, i)
+            action_valid_mask = apply_mask(self.action_valid_mask, i)
 
             forward_inputs = apply_mask_to_dict(self.forward_inputs, i)
             curr_obs = apply_mask_to_dict(self.curr_obs, i)
@@ -520,6 +583,7 @@ class Trajectory:
                     model_weights_id=self.model_weights_id,
                     actions=actions,
                     intervene_flags=intervene_flags,
+                    action_valid_mask=action_valid_mask,
                     rewards=rewards,
                     terminations=terminations,
                     truncations=truncations,
@@ -549,6 +613,7 @@ class EmbodiedRolloutResult:
     intervene_flags: list[torch.Tensor] = field(
         default_factory=list
     )  # trajectory_length
+    action_valid_masks: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
     rewards: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
     terminations: list[torch.Tensor] = field(
         default_factory=list
@@ -578,8 +643,18 @@ class EmbodiedRolloutResult:
     def append_step_result(self, result: ChunkStepResult):
         if result.actions is not None:
             self.actions.append(result.actions)
+            # Primitive-step flags/masks are [B, C].  Prefer the reward chunk
+            # shape when available; otherwise infer C from flattened action.
+            if result.rewards is not None and result.rewards.dim() >= 2:
+                bsz, chunk = int(result.rewards.shape[0]), int(result.rewards.shape[1])
+            else:
+                bsz = int(result.actions.shape[0])
+                chunk = 1
             self.intervene_flags.append(
-                torch.zeros_like(result.actions, dtype=torch.bool)
+                torch.zeros((bsz, chunk), dtype=torch.bool)
+            )
+            self.action_valid_masks.append(
+                torch.ones((bsz, chunk), dtype=torch.bool)
             )
         if result.rewards is not None:
             self.rewards.append(result.rewards)
@@ -606,55 +681,112 @@ class EmbodiedRolloutResult:
             save_flags = save_flags[:, None]
         assert save_flags.dim() == 2, f"Expected 2D tensor, got {save_flags.shape=}"
 
-        last_action = self.actions[-1]
         bsz, num_action_chunks = save_flags.shape
-        expanded_flags = save_flags.reshape(bsz, num_action_chunks, 1).expand_as(
-            last_action.reshape(bsz, num_action_chunks, -1)
-        )
-        self.intervene_flags[-1] = expanded_flags.reshape(bsz, -1).to(torch.bool)
+        self.intervene_flags[-1] = save_flags.reshape(bsz, num_action_chunks).to(torch.bool)
 
     def update_last_actions(
-        self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor
+        self,
+        executed_actions_model: torch.Tensor | None = None,
+        intervene_flags: torch.Tensor | None = None,
+        *,
+        executed_actions_exec: torch.Tensor | None = None,
+        action_valid_mask: torch.Tensor | None = None,
+        policy_actions_model: torch.Tensor | None = None,
+        policy_actions_exec: torch.Tensor | None = None,
+        raw_states_before_action: torch.Tensor | None = None,
     ):
-        # action: [bsz, num-chunk-size x action-dim]
-        # intervene_actions: [bsz, num-chunk-size x action-dim]
-        # intervene_flags: [bsz, num-chunk-size]
+        """Replace the last recorded chunk with the actually executed actions.
 
-        if self.actions and len(self.actions) > 0:
-            last_action = self.actions[-1]
-            assert last_action.dim() == 2, (
-                f"Expected 2D tensor, got {last_action.shape=}"
-            )
-            assert intervene_actions.dim() == 2, (
-                f"Expected 2D tensor, got {intervene_actions.shape=}"
-            )
+        Contract used by real-world GigaWA training:
 
-            # Normalize intervene_flags dimensions
+        - ``trajectory.actions`` and ``forward_inputs["model_action"]`` are always
+          model-space actions (normalized deltas) and are the tensors used by
+          actor/critic training.
+        - ``forward_inputs["action"]`` / ``action_exec`` are env-space absolute
+          qpos actions for debugging and replay inspection.
+        - ``action_valid_mask`` is [B, C] and masks padding introduced when a
+          model chunk is interrupted by teleoperation.
+        """
+
+        if not self.actions:
+            return
+
+        last_action_model = self.actions[-1]
+        assert last_action_model.dim() == 2, (
+            f"Expected 2D tensor, got {last_action_model.shape=}"
+        )
+
+        bsz = int(last_action_model.shape[0])
+
+        if executed_actions_model is None:
+            executed_actions_model = last_action_model
+        executed_actions_model = executed_actions_model.cpu().contiguous()
+        assert executed_actions_model.dim() == 2, (
+            f"Expected executed_actions_model to be [B, C*A], got {executed_actions_model.shape=}"
+        )
+        self.actions[-1] = executed_actions_model
+
+        if executed_actions_exec is not None:
+            executed_actions_exec = executed_actions_exec.cpu().contiguous()
+        if policy_actions_model is not None:
+            policy_actions_model = policy_actions_model.cpu().contiguous()
+        if policy_actions_exec is not None:
+            policy_actions_exec = policy_actions_exec.cpu().contiguous()
+        if raw_states_before_action is not None:
+            raw_states_before_action = raw_states_before_action.cpu().contiguous()
+
+        # Infer primitive chunk count from masks if possible; fall back to existing mask.
+        chunk = None
+        if action_valid_mask is not None:
+            if action_valid_mask.dim() == 1:
+                action_valid_mask = action_valid_mask[:, None]
+            chunk = int(action_valid_mask.shape[1])
+        elif intervene_flags is not None:
             if intervene_flags.dim() == 1:
                 intervene_flags = intervene_flags[:, None]
-            assert intervene_flags.dim() == 2, (
-                f"Expected 2D tensor, got {intervene_flags.shape=}"
-            )
+            if intervene_flags.dim() == 2:
+                chunk = int(intervene_flags.shape[1])
+        elif self.action_valid_masks:
+            chunk = int(self.action_valid_masks[-1].shape[1])
+        else:
+            chunk = 1
 
-            bsz, num_action_chunks = intervene_flags.shape[:2]
-            flags = intervene_flags.reshape(-1, num_action_chunks, 1)
+        if intervene_flags is None:
+            intervene_flags = torch.zeros((bsz, chunk), dtype=torch.bool)
+        else:
+            if intervene_flags.dim() == 1:
+                intervene_flags = intervene_flags[:, None]
+            if intervene_flags.dim() == 3:
+                intervene_flags = intervene_flags.any(dim=-1)
+            intervene_flags = intervene_flags.to(torch.bool).cpu().contiguous()
 
-            # Combine intervene_actions and last_action based on flags
-            last_full_action = intervene_actions.reshape(
-                bsz, num_action_chunks, -1
-            ) * flags + last_action.reshape(bsz, num_action_chunks, -1) * (~flags)
-            self.actions[-1] = last_full_action.reshape(bsz, -1)
+        if action_valid_mask is None:
+            action_valid_mask = torch.ones((bsz, int(intervene_flags.shape[1])), dtype=torch.bool)
+        else:
+            if action_valid_mask.dim() == 1:
+                action_valid_mask = action_valid_mask[:, None]
+            if action_valid_mask.dim() == 3:
+                action_valid_mask = action_valid_mask.any(dim=-1)
+            action_valid_mask = action_valid_mask.to(torch.bool).cpu().contiguous()
 
-            full_flags = flags.expand_as(last_full_action).reshape(bsz, -1)
-            self.intervene_flags[-1] = full_flags
+        self.intervene_flags[-1] = intervene_flags
+        if self.action_valid_masks:
+            self.action_valid_masks[-1] = action_valid_mask
 
-            if self.forward_inputs:
-                last_fi = self.forward_inputs[-1]
-                if "action" in last_fi:
-                    last_fi["action"] = (
-                        last_full_action.reshape(bsz, -1).cpu().contiguous()
-                    )
-                last_fi.pop("model_action", None)
+        if self.forward_inputs:
+            last_fi = self.forward_inputs[-1]
+            last_fi["model_action"] = executed_actions_model
+            if executed_actions_exec is not None:
+                last_fi["action"] = executed_actions_exec
+                last_fi["action_exec"] = executed_actions_exec
+            if policy_actions_model is not None:
+                last_fi["policy_action_model"] = policy_actions_model
+            if policy_actions_exec is not None:
+                last_fi["policy_action_exec"] = policy_actions_exec
+            if raw_states_before_action is not None:
+                last_fi["raw_states_before_action"] = raw_states_before_action
+            last_fi["action_valid_mask"] = action_valid_mask
+            last_fi["intervene_flags"] = intervene_flags
 
     def append_transitions(self, curr_obs=None, next_obs=None):
         assert curr_obs is not None and next_obs is not None
@@ -676,6 +808,10 @@ class EmbodiedRolloutResult:
         if len(self.intervene_flags) > 0:
             trajectory.intervene_flags = (
                 torch.stack(self.intervene_flags, dim=0).cpu().contiguous()
+            )
+        if len(self.action_valid_masks) > 0:
+            trajectory.action_valid_mask = (
+                torch.stack(self.action_valid_masks, dim=0).cpu().contiguous()
             )
         if len(self.rewards) > 0:
             trajectory.rewards = torch.stack(self.rewards, dim=0).cpu().contiguous()

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 from collections import defaultdict
 from typing import Any, Literal
 
@@ -51,6 +52,10 @@ class EnvWorker(Worker):
 
         self.last_obs_list = []
         self.last_intervened_info_list = []
+        self._gigawa_action_stats_loaded = False
+        self._gigawa_delta_mean = None
+        self._gigawa_delta_std = None
+        self._gigawa_delta_mask = None
         self.rollout_epoch = self.cfg.algorithm.get("rollout_epoch", 1)
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
@@ -94,6 +99,157 @@ class EnvWorker(Worker):
             // self.eval_execute_action_horizon
         )
         self.actor_split_num = self.get_actor_split_num()
+
+    def _build_delta_mask(self, robotype: str, dim: int) -> torch.Tensor:
+        # Keep this in sync with GigaWorldPolicy._build_delta_mask.
+        robotype = str(robotype).lower()
+        embed_id = 1 if robotype in {"agibot", "agibot_g1", "agibot_world"} else 0
+        if embed_id == 0:
+            base = np.array(
+                [True, True, True, True, True, True, False,
+                 True, True, True, True, True, True, False],
+                dtype=bool,
+            )
+        else:
+            base = np.array(
+                [True, True, True, True, True, True, True, False,
+                 True, True, True, True, True, True, True, False],
+                dtype=bool,
+            )
+        if dim > len(base):
+            base = np.pad(base, (0, dim - len(base)), constant_values=False)
+        else:
+            base = base[:dim]
+        return torch.as_tensor(base, dtype=torch.bool)
+
+    def _load_gigawa_action_stats(self, *, action_dim: int, device: torch.device):
+        if self._gigawa_action_stats_loaded:
+            return
+        policy_cfg = self.cfg.actor.model.get("giga_world_policy", {})
+        norm_json = policy_cfg.get("norm_json", None)
+        if not norm_json:
+            raise RuntimeError("giga_world_policy.norm_json is required to convert real-world intervention actions.")
+        with open(str(norm_json), "r", encoding="utf-8") as f:
+            stats_payload = json.load(f)
+        stats = stats_payload.get("norm_stats", stats_payload)
+
+        def _stat(name: str, key: str, default: float) -> torch.Tensor:
+            if name in stats and key in stats[name]:
+                value = stats[name][key]
+            else:
+                value = default
+            tensor = torch.as_tensor(value, dtype=torch.float32)
+            if tensor.numel() >= action_dim:
+                tensor = tensor.flatten()[:action_dim]
+            else:
+                pad = torch.full((action_dim - tensor.numel(),), float(default), dtype=torch.float32)
+                tensor = torch.cat([tensor.flatten(), pad], dim=0)
+            return tensor.to(device=device)
+
+        self._gigawa_delta_mean = _stat("action", "mean", 0.0)
+        self._gigawa_delta_std = _stat("action", "std", 1.0).clamp_min(1e-8)
+        robotype = policy_cfg.get("robotype", "aloha")
+        self._gigawa_delta_mask = self._build_delta_mask(robotype, action_dim).to(device=device)
+        self._gigawa_action_stats_loaded = True
+
+    def _exec_action_to_model_action(
+        self,
+        exec_actions: torch.Tensor,
+        raw_states_before_action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert env-space absolute qpos actions to GigaWA model-space normalized deltas."""
+        if exec_actions is None:
+            return None
+        device = exec_actions.device
+        exec_actions = exec_actions.float()
+        if exec_actions.dim() == 2:
+            # [B, C*A]
+            batch, flat = exec_actions.shape
+            action_dim = int(self.cfg.actor.model.get("action_dim", 14))
+            chunk = flat // action_dim
+            exec_view = exec_actions.view(batch, chunk, action_dim)
+        elif exec_actions.dim() == 3:
+            exec_view = exec_actions
+            batch, chunk, action_dim = exec_view.shape
+        else:
+            raise RuntimeError(f"Unsupported exec_actions shape: {tuple(exec_actions.shape)}")
+
+        self._load_gigawa_action_stats(action_dim=action_dim, device=device)
+
+        raw_states = raw_states_before_action.float().to(device=device)
+        if raw_states.dim() == 2:
+            raw_states = raw_states[:, None, :].expand(batch, chunk, raw_states.shape[-1])
+        if raw_states.shape[-1] < action_dim:
+            pad = torch.zeros(*raw_states.shape[:-1], action_dim - raw_states.shape[-1], device=device)
+            raw_states = torch.cat([raw_states, pad], dim=-1)
+        raw_states = raw_states[..., :action_dim]
+
+        delta = exec_view.clone()
+        mask = self._gigawa_delta_mask
+        delta[..., mask] = exec_view[..., mask] - raw_states[..., mask]
+        model_action = (delta - self._gigawa_delta_mean) / self._gigawa_delta_std
+        return model_action.reshape(batch, -1).contiguous()
+
+    def _build_executed_action_tensors(
+        self,
+        rollout_result: RolloutResult,
+        env_output: EnvOutput,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Return executed model/env actions and valid/intervention masks for storage."""
+        policy_model = rollout_result.forward_inputs.get("model_action", None) if rollout_result.forward_inputs else None
+        policy_exec = rollout_result.forward_inputs.get("action", None) if rollout_result.forward_inputs else None
+        if policy_model is None:
+            return None, policy_exec, env_output.intervene_flags, env_output.action_valid_mask
+
+        device = policy_model.device
+        policy_model = policy_model.float()
+        executed_exec = (
+            env_output.executed_actions_exec.to(device=device).float()
+            if env_output.executed_actions_exec is not None
+            else (policy_exec.to(device=device).float() if policy_exec is not None else None)
+        )
+        if executed_exec is None:
+            executed_exec = policy_exec.to(device=device).float() if policy_exec is not None else None
+
+        flags = env_output.intervene_flags
+        if flags is None:
+            action_dim = int(self.cfg.actor.model.get("action_dim", 14))
+            chunk = policy_model.shape[-1] // action_dim
+            flags = torch.zeros((policy_model.shape[0], chunk), dtype=torch.bool, device=device)
+        else:
+            flags = flags.to(device=device, dtype=torch.bool)
+            if flags.dim() == 1:
+                flags = flags[:, None]
+            if flags.dim() == 3:
+                flags = flags.any(dim=-1)
+
+        valid_mask = env_output.action_valid_mask
+        if valid_mask is None:
+            valid_mask = torch.ones_like(flags, dtype=torch.bool, device=device)
+        else:
+            valid_mask = valid_mask.to(device=device, dtype=torch.bool)
+            if valid_mask.dim() == 1:
+                valid_mask = valid_mask[:, None]
+            if valid_mask.dim() == 3:
+                valid_mask = valid_mask.any(dim=-1)
+
+        executed_model = policy_model.clone()
+        if env_output.raw_states_before_action is not None and executed_exec is not None:
+            human_model = self._exec_action_to_model_action(
+                executed_exec.to(device=device),
+                env_output.raw_states_before_action.to(device=device),
+            )
+            action_dim = int(self.cfg.actor.model.get("action_dim", 14))
+            chunk = policy_model.shape[-1] // action_dim
+            flags_view = (flags & valid_mask).view(policy_model.shape[0], chunk, 1)
+            executed_model_view = executed_model.view(policy_model.shape[0], chunk, action_dim)
+            human_model_view = human_model.view(policy_model.shape[0], chunk, action_dim)
+            executed_model_view = torch.where(flags_view, human_model_view, executed_model_view)
+            executed_model = executed_model_view.reshape(policy_model.shape[0], -1).contiguous()
+
+        return executed_model.cpu().contiguous(), (
+            executed_exec.cpu().contiguous() if executed_exec is not None else None
+        ), flags.cpu().contiguous(), valid_mask.cpu().contiguous()
 
     def init_worker(self):
         self.dst_ranks = {
@@ -395,10 +551,18 @@ class EnvWorker(Worker):
             infos["intervene_action"] if "intervene_action" in infos else None
         )
         intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
+        executed_actions_exec = infos.get("executed_action_abs", None)
+        policy_actions_exec = infos.get("policy_action_abs", None)
+        action_valid_mask = infos.get("action_valid_mask", None)
+        raw_states_before_action = infos.get("raw_state_before_action", None)
         if self.cfg.env.train.auto_reset and chunk_dones.any():
             if "intervene_action" in infos["final_info"]:
                 intervene_actions = infos["final_info"]["intervene_action"]
                 intervene_flags = infos["final_info"]["intervene_flag"]
+                executed_actions_exec = infos["final_info"].get("executed_action_abs", executed_actions_exec)
+                policy_actions_exec = infos["final_info"].get("policy_action_abs", policy_actions_exec)
+                action_valid_mask = infos["final_info"].get("action_valid_mask", action_valid_mask)
+                raw_states_before_action = infos["final_info"].get("raw_state_before_action", raw_states_before_action)
 
         env_output = EnvOutput(
             obs=extracted_obs,
@@ -411,6 +575,10 @@ class EnvWorker(Worker):
             truncations=chunk_truncations,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
+            executed_actions_exec=executed_actions_exec,
+            policy_actions_exec=policy_actions_exec,
+            action_valid_mask=action_valid_mask,
+            raw_states_before_action=raw_states_before_action,
             chunk_step_obs_list=obs_list if isinstance(obs_list, (list, tuple)) else None,
         )
         return env_output, env_info
@@ -775,11 +943,31 @@ class EnvWorker(Worker):
         bootstrap_values: torch.Tensor | None,
     ) -> None:
         rewards = self.compute_bootstrap_rewards(env_output, bootstrap_values)
+        executed_model, executed_exec, executed_flags, valid_mask = self._build_executed_action_tensors(
+            rollout_result, env_output
+        )
+        forward_inputs = dict(rollout_result.forward_inputs) if rollout_result.forward_inputs else {}
+        if executed_model is not None:
+            forward_inputs["model_action"] = executed_model
+        if executed_exec is not None:
+            forward_inputs["action"] = executed_exec
+            forward_inputs["action_exec"] = executed_exec
+        if env_output.policy_actions_exec is not None:
+            forward_inputs["policy_action_exec"] = env_output.policy_actions_exec.cpu().contiguous()
+        if rollout_result.forward_inputs and "model_action" in rollout_result.forward_inputs:
+            forward_inputs["policy_action_model"] = rollout_result.forward_inputs["model_action"].cpu().contiguous()
+        if valid_mask is not None:
+            forward_inputs["action_valid_mask"] = valid_mask
+        if executed_flags is not None:
+            forward_inputs["intervene_flags"] = executed_flags
+        if env_output.raw_states_before_action is not None:
+            forward_inputs["raw_states_before_action"] = env_output.raw_states_before_action.cpu().contiguous()
+
         chunk_step_result = ChunkStepResult(
-            actions=rollout_result.forward_inputs.get("action", None),
+            actions=executed_model if executed_model is not None else rollout_result.forward_inputs.get("model_action", rollout_result.forward_inputs.get("action", None)),
             prev_logprobs=rollout_result.prev_logprobs if self.collect_prev_infos else None,
             prev_values=rollout_result.prev_values if self.collect_prev_infos else None,
-            forward_inputs=rollout_result.forward_inputs,
+            forward_inputs=forward_inputs,
             versions=rollout_result.versions,
             dones=env_output.dones,
             truncations=env_output.truncations,
@@ -791,10 +979,15 @@ class EnvWorker(Worker):
             self.rollout_results[stage_id].mark_last_step_with_flags(
                 rollout_result.save_flags
             )
-        if env_output.intervene_actions is not None:
+        if executed_model is not None:
             self.rollout_results[stage_id].update_last_actions(
-                env_output.intervene_actions,
-                env_output.intervene_flags,
+                executed_actions_model=executed_model,
+                intervene_flags=executed_flags,
+                executed_actions_exec=executed_exec,
+                action_valid_mask=valid_mask,
+                policy_actions_model=rollout_result.forward_inputs.get("model_action", None) if rollout_result.forward_inputs else None,
+                policy_actions_exec=env_output.policy_actions_exec,
+                raw_states_before_action=env_output.raw_states_before_action,
             )
 
         if self.collect_transitions:
