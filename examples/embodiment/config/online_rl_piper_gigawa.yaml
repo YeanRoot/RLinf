@@ -172,11 +172,16 @@ env:
     max_steps_per_rollout_epoch: 960
     group_size: 1
     break_chunk_on_intervention: true
-    collect_intervention_until_release: true
-    # Operational simplification: once human teleop starts, keep teleop until success/failure.
-    # The old policy chunk is discarded; human chunks are stored with valid masks.
+    # Once intervention starts inside a 12-step chunk, latch human correction until
+    # the current chunk ends. Then auto-disable teleop and let the next chunk be
+    # planned/executed by the model from the latest observation.
+    latch_intervention_until_chunk_end: true
+    collect_intervention_until_release: false
     pad_interrupted_chunks: true
     intervention_max_steps: 960
+    force_disable_teleop_on_chunk_end: true
+    force_disable_teleop_on_terminal: true
+    force_disable_teleop_on_timeout: true
     debug_intervention_chunks: true
     auto_reset: True
     ignore_terminations: False

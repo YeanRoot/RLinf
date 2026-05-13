@@ -375,6 +375,29 @@ class PiperEnv(gym.Env):
         except Exception:
             return False
 
+    def force_disable_teleop(self, reason: str = "") -> None:
+        """Force ROS teleoperation off so policy/reset can regain control.
+
+        The master/slave teleop node uses ``/enable_message_publish`` to decide
+        whether slave arms should follow the master arms.  When a chunk-level
+        intervention ends, or when success/failure/timeout terminates an episode,
+        we must clear this flag; otherwise reset/policy commands can keep fighting
+        the teleop node.
+        """
+        if self.config.is_dummy:
+            return
+        try:
+            was_active = bool(rospy.get_param("/enable_message_publish", False))
+            rospy.set_param("/enable_message_publish", False)
+            if was_active:
+                self._logger.info("Teleop disabled automatically. reason=%s", reason)
+        except Exception as exc:
+            self._logger.warning(
+                "Failed to disable teleop automatically. reason=%s error=%s",
+                reason,
+                exc,
+            )
+
     def _wait_for_teleop_release_before_reset(self) -> None:
         """Block physical reset until teleop releases, avoiding ``move_arm`` vs master conflict."""
         if self.config.is_dummy or not self.config.wait_teleop_release_before_reset:

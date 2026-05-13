@@ -31,6 +31,13 @@ class BaseKeyboardRewardDoneWrapper(gym.Wrapper):
     def _check_keypress(self) -> tuple[bool, bool, float]:
         raise NotImplementedError
 
+    def _force_disable_teleop_if_available(self, reason: str) -> None:
+        """Best-effort teleop release for real-robot terminal events."""
+        target_env = getattr(self.env, "unwrapped", self.env)
+        fn = getattr(target_env, "force_disable_teleop", None)
+        if callable(fn):
+            fn(reason=reason)
+
     def step(
         self, action: ActType
     ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
@@ -39,6 +46,11 @@ class BaseKeyboardRewardDoneWrapper(gym.Wrapper):
         last_intervened, updated_reward, updated_terminated = self.reward_terminated()
         if last_intervened or self.reward_mode == "always_replace":
             reward = updated_reward
+        if updated_terminated:
+            info["manual_terminal"] = True
+            info["manual_success"] = bool(updated_reward == 1)
+            info["manual_failure"] = bool(updated_reward == 0)
+            self._force_disable_teleop_if_available("keyboard_terminal")
         return observation, reward, updated_terminated, truncated, info
 
     def reward_terminated(
@@ -66,7 +78,10 @@ class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
 
         last_intervened = True
         if key == "a":
-            reward = -1
+            # Failure / abort ends the episode but does not give negative reward.
+            # In real-world sparse terminal reward, reward only indicates task completion:
+            # success=1, failure/timeout/unfinished=0.
+            reward = 0
             done = True
             last_intervened = True
         elif key == "b":

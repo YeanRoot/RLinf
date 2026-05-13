@@ -70,12 +70,30 @@ class RealWorldEnv(gym.Env):
         self.break_chunk_on_intervention = bool(
             cfg.get("break_chunk_on_intervention", False)
         )
+        # New real-robot corrective relabeling mode:
+        # once intervention starts inside a chunk, latch it until the current
+        # chunk ends; then automatically release teleop and let the next chunk
+        # be planned from the latest observation.
+        self.latch_intervention_until_chunk_end = bool(
+            cfg.get("latch_intervention_until_chunk_end", False)
+        )
+        # Kept for backward compatibility with older configs.  When
+        # latch_intervention_until_chunk_end=True this is intentionally ignored.
         self.collect_intervention_until_release = bool(
             cfg.get("collect_intervention_until_release", False)
         )
         self.pad_interrupted_chunks = bool(cfg.get("pad_interrupted_chunks", True))
         self.intervention_max_steps = int(cfg.get("intervention_max_steps", 96))
         self.debug_intervention_chunks = bool(cfg.get("debug_intervention_chunks", True))
+        self.force_disable_teleop_on_chunk_end = bool(
+            cfg.get("force_disable_teleop_on_chunk_end", True)
+        )
+        self.force_disable_teleop_on_terminal = bool(
+            cfg.get("force_disable_teleop_on_terminal", True)
+        )
+        self.force_disable_teleop_on_timeout = bool(
+            cfg.get("force_disable_teleop_on_timeout", True)
+        )
         self._last_raw_states = None
 
         self._init_env()
@@ -260,6 +278,25 @@ class RealWorldEnv(gym.Env):
             return self._last_raw_states.copy()
         return np.zeros((self.num_envs, 14), dtype=np.float64)
 
+    def _force_disable_teleop_for_all_envs(self, reason: str) -> None:
+        """Best-effort teleop release for all vectorized real-world envs."""
+        envs = getattr(self.env, "envs", [])
+        for env in envs:
+            called = False
+            for target in (env, getattr(env, "unwrapped", None)):
+                if target is None:
+                    continue
+                fn = getattr(target, "force_disable_teleop", None)
+                if callable(fn):
+                    fn(reason=reason)
+                    called = True
+                    break
+            if not called and self.debug_intervention_chunks:
+                print(
+                    f"[RealWorldEnv] force_disable_teleop unavailable for env={type(env).__name__}, reason={reason}",
+                    flush=True,
+                )
+
     def _pad_tensor_list(self, values, target_len, *, fill_like=None, fill_value=0):
         if not values:
             raise RuntimeError("Cannot pad an empty tensor list.")
@@ -347,6 +384,14 @@ class RealWorldEnv(gym.Env):
         if not self.manual_episode_control_only:
             truncations = timeout_truncations
 
+        # Terminal events must release teleop immediately.  Otherwise reset/policy
+        # commands can keep fighting the master-arm teleop node.  Failure/timeout
+        # still has reward 0; this only changes control ownership.
+        if bool(np.asarray(terminations).any()) and self.force_disable_teleop_on_terminal:
+            self._force_disable_teleop_for_all_envs(reason="terminal")
+        if bool(np.asarray(truncations).any()) and self.force_disable_teleop_on_timeout:
+            self._force_disable_teleop_for_all_envs(reason="timeout")
+
         obs = self._wrap_obs(raw_obs)
         step_reward = self._calc_step_reward(_reward)
         success_current_step = np.isclose(step_reward, 1.0)
@@ -408,6 +453,19 @@ class RealWorldEnv(gym.Env):
         )
 
     def chunk_step(self, chunk_actions):
+        """Execute a model action chunk with chunk-latched intervention.
+
+        Real-robot intervention semantics:
+        - If no intervention occurs, execute the full model chunk.
+        - Once intervention is detected at primitive step k, the remainder of the
+          current chunk is treated as human correction.  We stop consuming stale
+          model actions and feed a hold action to the env; while teleop is active,
+          PiperEnv ignores that command and records the actual puppet action.
+        - At the end of the chunk, teleop is force-disabled so the next chunk is
+          automatically planned/executed by the model from the latest observation.
+        - If success/failure/timeout happens inside the chunk, remaining entries
+          are padded with action_valid_mask=False.
+        """
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = int(chunk_actions.shape[1])
         obs_list = []
@@ -423,12 +481,21 @@ class RealWorldEnv(gym.Env):
         raw_chunk_raw_states_before = []
 
         interrupted = False
-        intervention_steps = 0
-        i = 0
+        intervention_latched = False
+        intervention_start_step = None
         latest_obs = None
         latest_infos = None
-        latest_terminations = None
-        latest_truncations = None
+
+        def _force_intervention_suffix_info(infos):
+            """Make latched suffix explicit even if teleop briefly flickers off."""
+            if "intervene_flag" in infos:
+                infos["intervene_flag"] = torch.ones_like(
+                    infos["intervene_flag"], dtype=torch.bool
+                )
+            if "intervene_action" in infos and "executed_action_abs" in infos:
+                # Keep training/debug contracts aligned: intervention action is
+                # exactly the executed env-space action for latched suffix steps.
+                infos["intervene_action"] = infos["executed_action_abs"].clone()
 
         def _append_record(extracted_obs, step_reward, terminations, truncations, infos, *, valid=True):
             obs_list.append(extracted_obs)
@@ -446,57 +513,66 @@ class RealWorldEnv(gym.Env):
             raw_chunk_executed_actions_abs.append(infos["executed_action_abs"])
             raw_chunk_raw_states_before.append(infos["raw_state_before_action"])
 
-        while i < chunk_size:
-            actions = chunk_actions[:, i]
+        for i in range(chunk_size):
+            # Once intervention is latched, never execute the stale remainder of
+            # the model chunk.  PiperEnv ignores this hold command while teleop is
+            # active and records the true puppet action instead.
+            if intervention_latched:
+                actions = self._hold_action_from_obs(latest_obs)
+            else:
+                actions = chunk_actions[:, i]
+
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions, auto_reset=False
             )
             latest_obs, latest_infos = extracted_obs, infos
-            latest_terminations, latest_truncations = terminations, truncations
-            _append_record(extracted_obs, step_reward, terminations, truncations, infos, valid=True)
 
             intervention_now = bool(infos["intervene_flag"].any().item())
-            done_now = bool(torch.logical_or(terminations, truncations).any().item())
-            if intervention_now and self.break_chunk_on_intervention:
+            if (
+                intervention_now
+                and self.break_chunk_on_intervention
+                and self.latch_intervention_until_chunk_end
+                and not intervention_latched
+            ):
+                intervention_latched = True
                 interrupted = True
-                intervention_steps += 1
-                break
+                intervention_start_step = i
+
+            if intervention_latched:
+                _force_intervention_suffix_info(infos)
+
+            _append_record(extracted_obs, step_reward, terminations, truncations, infos, valid=True)
+
+            done_now = bool(torch.logical_or(terminations, truncations).any().item())
             if done_now:
                 break
-            i += 1
 
-        # If teleop started, stop consuming the stale model chunk.  Keep sampling
-        # human actions until teleop is released or this chunk is full.  If the
-        # human holds teleop for > chunk_size steps, the next rollout/env cycle
-        # will immediately enter this branch again and create another segment.
-        while (
-            interrupted
-            and self.collect_intervention_until_release
-            and len(chunk_rewards) < chunk_size
-            and intervention_steps < self.intervention_max_steps
-        ):
-            hold_action = self._hold_action_from_obs(latest_obs)
-            extracted_obs, step_reward, terminations, truncations, infos = self.step(
-                hold_action, auto_reset=False
-            )
-            latest_obs, latest_infos = extracted_obs, infos
-            latest_terminations, latest_truncations = terminations, truncations
-
-            intervention_now = bool(infos["intervene_flag"].any().item())
-            if not intervention_now:
-                # Teleop has been released.  This hold step is only used to obtain
-                # a fresh observation for replanning and is not a training sample.
-                break
-
-            _append_record(extracted_obs, step_reward, terminations, truncations, infos, valid=True)
-            intervention_steps += 1
-            if torch.logical_or(terminations, truncations).any().item():
+            if (
+                intervention_now
+                and self.break_chunk_on_intervention
+                and not self.latch_intervention_until_chunk_end
+            ):
+                # Legacy behavior: terminate the current chunk when intervention starts.
+                interrupted = True
                 break
 
         if not obs_list:
             raise RuntimeError("RealWorldEnv.chunk_step produced no environment steps.")
 
         valid_steps = len(chunk_rewards)
+
+        # If the chunk completed normally after a latched intervention, release
+        # teleop so the next chunk is generated/executed by the model.
+        last_done = bool(
+            torch.logical_or(raw_chunk_terminations[-1], raw_chunk_truncations[-1]).any().item()
+        )
+        if (
+            intervention_latched
+            and not last_done
+            and self.force_disable_teleop_on_chunk_end
+        ):
+            self._force_disable_teleop_for_all_envs(reason="chunk_end")
+
         if self.pad_interrupted_chunks and valid_steps < chunk_size:
             pad_count = chunk_size - valid_steps
             last_obs = latest_obs if latest_obs is not None else obs_list[-1]
@@ -525,6 +601,11 @@ class RealWorldEnv(gym.Env):
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
+        if past_terminations.any() and self.force_disable_teleop_on_terminal:
+            self._force_disable_teleop_for_all_envs(reason="terminal_chunk")
+        if past_truncations.any() and self.force_disable_teleop_on_timeout:
+            self._force_disable_teleop_for_all_envs(reason="timeout_chunk")
+
         infos_last = infos_list[-1] if infos_list else {}
         infos_last["intervene_action"] = torch.stack(
             raw_chunk_intervene_actions, dim=1
@@ -540,13 +621,27 @@ class RealWorldEnv(gym.Env):
         infos_last["raw_state_before_action"] = torch.stack(
             raw_chunk_raw_states_before, dim=1
         )
-        infos_last["chunk_interrupted"] = to_tensor(np.asarray([interrupted] * self.num_envs, dtype=bool))
-        infos_last["executed_steps"] = to_tensor(np.asarray([valid_steps] * self.num_envs, dtype=np.int64))
+        infos_last["chunk_interrupted"] = to_tensor(
+            np.asarray([interrupted] * self.num_envs, dtype=bool)
+        )
+        infos_last["intervention_latched"] = to_tensor(
+            np.asarray([intervention_latched] * self.num_envs, dtype=bool)
+        )
+        infos_last["intervention_start_step"] = to_tensor(
+            np.asarray([
+                -1 if intervention_start_step is None else int(intervention_start_step)
+            ] * self.num_envs, dtype=np.int64)
+        )
+        infos_last["executed_steps"] = to_tensor(
+            np.asarray([valid_steps] * self.num_envs, dtype=np.int64)
+        )
         infos_list[-1] = infos_last
 
         if self.debug_intervention_chunks and interrupted:
             print(
                 "[RealWorldEnv INTERVENTION] "
+                f"mode={'latch_to_chunk_end' if self.latch_intervention_until_chunk_end else 'legacy'}, "
+                f"start_step={intervention_start_step}, "
                 f"valid_steps={valid_steps}/{chunk_size}, "
                 f"intervene_flags={infos_last['intervene_flag'].cpu().numpy().astype(int).tolist()}, "
                 f"valid_mask={infos_last['action_valid_mask'].cpu().numpy().astype(int).tolist()}",

@@ -24,7 +24,7 @@ python collect_embodied_agent_gigawa.py \
 
 train
 
-source switch_env gigaworld
+
 
 cd /home/ubuntu/users/angen.ye/gwp/RLinf
 export PYTHONPATH=$PWD:$PYTHONPATH
@@ -106,6 +106,7 @@ xhost +local:
 
 启动docker
   sudo docker start -ai piper
+  source switch_env gigaworld
 
 重新docker
   sudo docker exec -it piper /bin/bash

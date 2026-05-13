@@ -179,6 +179,14 @@ class EnvWorker(Worker):
         raw_states = raw_states_before_action.float().to(device=device)
         if raw_states.dim() == 2:
             raw_states = raw_states[:, None, :].expand(batch, chunk, raw_states.shape[-1])
+        elif raw_states.dim() == 3 and bool(
+            self.cfg.env.train.get("latch_intervention_until_chunk_end", False)
+        ):
+            # GigaWA chunk targets are defined relative to the observation/state
+            # that generated the whole chunk.  Therefore human suffix actions in a
+            # mixed chunk must be converted using the chunk-start raw qpos, not the
+            # per-step qpos.
+            raw_states = raw_states[:, :1, :].expand(batch, chunk, raw_states.shape[-1])
         if raw_states.shape[-1] < action_dim:
             pad = torch.zeros(*raw_states.shape[:-1], action_dim - raw_states.shape[-1], device=device)
             raw_states = torch.cat([raw_states, pad], dim=-1)
