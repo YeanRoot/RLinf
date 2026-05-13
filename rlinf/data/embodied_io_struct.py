@@ -876,7 +876,7 @@ class EmbodiedRolloutResult:
             batch_size = len(all_trajectory.sample_infos)
 
         if batch_size > 0:
-            index_chunks = torch.chunk(torch.arange(batch_size), split_size, dim=0)
+            index_chunks = torch.tensor_split(torch.arange(batch_size), split_size, dim=0)
             split_ranges = [
                 (int(chunk[0].item()), int(chunk[-1].item()) + 1)
                 if chunk.numel() > 0
@@ -930,7 +930,7 @@ class EmbodiedRolloutResult:
                     setattr(splited_trajectories[i], field_name, value)
                 continue
             elif isinstance(value, torch.Tensor):
-                chunks = torch.chunk(value, split_size, dim=1)
+                chunks = torch.tensor_split(value, split_size, dim=1)
                 for i in range(split_size):
                     setattr(splited_trajectories[i], field_name, chunks[i].contiguous())
             else:

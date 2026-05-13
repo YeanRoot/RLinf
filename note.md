@@ -78,3 +78,14 @@ CUDA_VISIBLE_DEVICES=3 python analyze_gigawa_pt_qsa.py \
   --checkpoint /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_7800 \
   --output-dir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/qsa_debug_rl_429_online_cup_step_0.9836_4 \
   --device cuda
+
+
+CUDA_VISIBLE_DEVICES=3 python analyze_gigawa_pt_qsa_dense.py \
+  --config /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment/config/analysis.yaml \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_cup_dense_reextract_513_2/offline_collection/rank_0/all/rank0_0.pt \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_cup_dense_reextract_513_2/offline_collection/rank_0/all/rank0_6.pt\
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_cup_dense_reextract_513_2/offline_collection/rank_0/all/rank0_12.pt \
+  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_cup_dense_reextract_513_2/offline_collection/rank_0/all/rank0_12.pt \
+  --checkpoint /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_7800 \
+  --output-dir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/qsa_debug_rl_429_online_cup_step_0.9836_dense2 \
+  --device cuda

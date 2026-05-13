@@ -2038,8 +2038,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     ) -> tuple[int | None, int | None, str]:
         term = traj.terminations[:, 0] if traj.terminations is not None else None
         done = traj.dones[:, 0] if traj.dones is not None else None
-        rew = traj.rewards[:, 0] if traj.rewards is not None else None
 
+        # Dense rewards are a shaping/training signal and can be non-zero long
+        # before task success.  Never use reward magnitude to decide the episode
+        # boundary here; otherwise dense trajectories get truncated at the first
+        # progress reward and actor/critic targets become wrong.
         if term is not None:
             pos = torch.nonzero(term.to(torch.bool), as_tuple=False)
             if pos.numel() > 0:
@@ -2048,14 +2051,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             pos = torch.nonzero(done.to(torch.bool), as_tuple=False)
             if pos.numel() > 0:
                 return int(pos[0, 0].item()), int(pos[0, 1].item()), "done"
-        if rew is not None:
-            pos = torch.nonzero(rew != 0, as_tuple=False)
-            if pos.numel() > 0:
-                return int(pos[0, 0].item()), int(pos[0, 1].item()), "reward"
         return None, None, "none"
 
     def _sanitize_single_sample_trajectory(self, traj: Trajectory) -> Trajectory:
-        tc, ts, _ = self._find_first_terminal_position(traj)
+        tc, ts, reason = self._find_first_terminal_position(traj)
         if tc is None or ts is None:
             return traj
 
@@ -2102,15 +2101,31 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             repaired.rewards = repaired.rewards.clone()
             if ts + 1 < action_chunk:
                 repaired.rewards[tc, 0, ts + 1 :] = 0
+        if repaired.action_valid_mask is not None:
+            repaired.action_valid_mask = repaired.action_valid_mask.to(torch.bool).clone()
+            if repaired.action_valid_mask.dim() == 3 and ts + 1 < repaired.action_valid_mask.shape[-1]:
+                repaired.action_valid_mask[tc, 0, ts + 1 :] = False
+        else:
+            repaired.action_valid_mask = torch.ones_like(repaired.rewards, dtype=torch.bool) if repaired.rewards is not None else None
+            if repaired.action_valid_mask is not None and ts + 1 < action_chunk:
+                repaired.action_valid_mask[tc, 0, ts + 1 :] = False
         if repaired.dones is not None:
             repaired.dones = repaired.dones.to(torch.bool).clone()
-            repaired.dones[tc, 0, ts:] = True
+            repaired.dones[tc, 0, :] = False
+            repaired.dones[tc, 0, ts] = True
         if repaired.terminations is not None:
             repaired.terminations = repaired.terminations.to(torch.bool).clone()
-            repaired.terminations[tc, 0, ts:] = True
+            repaired.terminations[tc, 0, :] = False
+            if reason == "termination":
+                repaired.terminations[tc, 0, ts] = True
         if repaired.truncations is not None:
             repaired.truncations = repaired.truncations.to(torch.bool).clone()
-            repaired.truncations[tc, 0, ts:] = False
+            repaired.truncations[tc, 0, :] = False
+            if reason == "done" and (repaired.terminations is None or not bool(repaired.terminations[tc, 0, ts].item())):
+                repaired.truncations[tc, 0, ts] = True
+
+        if repaired.forward_inputs and repaired.action_valid_mask is not None:
+            repaired.forward_inputs["action_valid_mask"] = repaired.action_valid_mask.cpu().contiguous()
 
         return repaired
 
@@ -2649,8 +2664,20 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         rewards = batch["rewards"]
         terminations = batch["terminations"]
 
+        # Padded primitive actions after an early terminal inside a chunk are
+        # stored with action_valid_mask=False.  They must not contribute reward
+        # or terminal flags to the chunk-level critic target.
+        action_valid_mask = batch.get("action_valid_mask", None)
+        if action_valid_mask is not None:
+            valid_mask = action_valid_mask.to(device=rewards.device, dtype=torch.bool)
+            if valid_mask.dim() == 3 and valid_mask.shape[1] == 1:
+                valid_mask = valid_mask.squeeze(1)
+            if valid_mask.shape == rewards.shape:
+                rewards = rewards * valid_mask.to(dtype=rewards.dtype)
+                terminations = terminations.to(torch.bool) & valid_mask
+
         rewards_for_bootstrap = rewards.sum(dim=-1, keepdim=True).to(self.torch_dtype)
-        done_mask = terminations.any(dim=-1, keepdim=True).to(self.torch_dtype)
+        done_mask = terminations.to(torch.bool).any(dim=-1, keepdim=True).to(self.torch_dtype)
 
         with torch.no_grad():
             curr_visual_feat = self._build_visual_feat_for_actor(curr_obs["visual_latent"])

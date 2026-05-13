@@ -18,7 +18,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_cup_dense_reextract_513"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_cup_dense_reextract_513_2"
     project_name: rlinf
     experiment_name: "robotwin_collect_gigawa_offline"
     logger_backends: ["tensorboard"]

@@ -173,6 +173,58 @@ class RoboTwinEnv(gym.Env):
             image = center_crop_image(image)
         return np.array(image)
 
+    def _clone_obs_dict(self, obs):
+        if obs is None:
+            return None
+        cloned = {}
+        for key, value in obs.items():
+            if isinstance(value, torch.Tensor):
+                cloned[key] = value.clone()
+            elif isinstance(value, dict):
+                cloned[key] = self._clone_obs_dict(value)
+            elif isinstance(value, list):
+                cloned[key] = list(value)
+            else:
+                cloned[key] = value
+        return cloned
+
+    def _pad_chunk_step_outputs(
+        self,
+        obs_list,
+        infos_list,
+        chunk_rewards,
+        raw_chunk_terminations,
+        raw_chunk_truncations,
+        action_valid_mask,
+        target_chunk_step: int,
+    ):
+        """Pad a stopped sequential chunk without creating fake training targets.
+
+        When a terminal/truncated transition happens inside an action chunk, the
+        remaining primitive actions are not executed. We still return tensors with
+        the configured chunk length, but mark the tail invalid and keep rewards /
+        terminal flags at zero so actor and critic losses only see the executed
+        prefix.
+        """
+        if not chunk_rewards:
+            raise RuntimeError("RoboTwinEnv.chunk_step produced no environment steps.")
+
+        while len(chunk_rewards) < target_chunk_step:
+            chunk_rewards.append(torch.zeros_like(chunk_rewards[-1]))
+            raw_chunk_terminations.append(torch.zeros_like(raw_chunk_terminations[-1], dtype=torch.bool))
+            raw_chunk_truncations.append(torch.zeros_like(raw_chunk_truncations[-1], dtype=torch.bool))
+            obs_list.append(self._clone_obs_dict(obs_list[-1]))
+            infos_list.append(dict(infos_list[-1]))
+
+        return (
+            obs_list,
+            infos_list,
+            torch.stack(chunk_rewards, dim=1),
+            torch.stack(raw_chunk_terminations, dim=1).to(torch.bool),
+            torch.stack(raw_chunk_truncations, dim=1).to(torch.bool),
+            action_valid_mask.to(torch.bool),
+        )
+
     def _extract_obs_image(self, raw_obs):
         batch_images = []
         batch_wrist_images = []
@@ -357,7 +409,16 @@ class RoboTwinEnv(gym.Env):
             chunk_rewards = []
             raw_chunk_terminations = []
             raw_chunk_truncations = []
+            action_valid_mask = torch.zeros(
+                (num_envs, chunk_step), dtype=torch.bool, device=self.device
+            )
 
+            # Execute only the valid prefix.  If any environment reaches a
+            # terminal/truncated state inside this chunk, stop the whole vector
+            # chunk and pad the tail.  This is conservative, but it keeps the
+            # trajectory semantics correct for actor/critic training and avoids
+            # repeated terminal flags from continuing to step an already-finished
+            # Robotwin episode.
             for i in range(chunk_step):
                 actions = chunk_actions[:, i]
                 extracted_obs, step_reward, terminations, truncations, infos = self.step(
@@ -366,12 +427,30 @@ class RoboTwinEnv(gym.Env):
                 obs_list.append(extracted_obs)
                 infos_list.append(infos)
                 chunk_rewards.append(step_reward)
-                raw_chunk_terminations.append(terminations)
-                raw_chunk_truncations.append(truncations)
+                raw_chunk_terminations.append(terminations.to(torch.bool))
+                raw_chunk_truncations.append(truncations.to(torch.bool))
+                action_valid_mask[:, i] = True
 
-            chunk_rewards = torch.stack(chunk_rewards, dim=1)
-            raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
-            raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+                step_dones = torch.logical_or(terminations.to(torch.bool), truncations.to(torch.bool))
+                if step_dones.any():
+                    break
+
+            (
+                obs_list,
+                infos_list,
+                chunk_rewards,
+                raw_chunk_terminations,
+                raw_chunk_truncations,
+                action_valid_mask,
+            ) = self._pad_chunk_step_outputs(
+                obs_list,
+                infos_list,
+                chunk_rewards,
+                raw_chunk_terminations,
+                raw_chunk_truncations,
+                action_valid_mask,
+                target_chunk_step=chunk_step,
+            )
 
             past_terminations = raw_chunk_terminations.any(dim=1)
             past_truncations = raw_chunk_truncations.any(dim=1)
@@ -391,6 +470,13 @@ class RoboTwinEnv(gym.Env):
             else:
                 chunk_terminations = raw_chunk_terminations.clone()
                 chunk_truncations = raw_chunk_truncations.clone()
+
+            # Propagate the mask through EnvOutput -> Trajectory so invalid
+            # padded tail actions do not train the actor, and so critic targets
+            # can ignore padded rewards/terminals.
+            if infos_list:
+                infos_list[-1] = dict(infos_list[-1])
+                infos_list[-1]["action_valid_mask"] = action_valid_mask.detach().cpu()
 
             return (
                 obs_list,
