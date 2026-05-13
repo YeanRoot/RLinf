@@ -16,26 +16,26 @@ export PYTHONPATH=$ROBOTWIN_PATH:$REPO_PATH:$PYTHONPATH
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
 
 conda activate pi-rl-h20
-export ROBOTWIN_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-main
+
+export REPO_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RLinf
+export ROBOTWIN_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-densereward
+export ASSETS_PATH=$ROBOTWIN_PATH
+export PYTHONPATH=$ROBOTWIN_PATH:$REPO_PATH:$PYTHONPATH
+
 
 python collect_embodied_agent_gigawa.py \
   --config-path ./config \
   --config-name collect_bell_data_fix
 
 train
-
-source switch_env gigaworld
-
-cd /home/ubuntu/users/angen.ye/gwp/RLinf
-export PYTHONPATH=$PWD:$PYTHONPATH
-
-cd /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment
-python train_embodied_agent_gigawa.py   --config-path ./config   --config-name online_rl_piper_gigawa
+cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
+python train_embodied_agent_gigawa.py   --config-path ./config   --config-name online_rl_cup
 
 eval:
-python eval_embodied_agent.py \
+python train_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name eval_piper_gigawa_wa_only
+  --config-name cup_eval \
+  ++actor.fsdp_config.use_orig_params=true
 
 # original all sliding 
 python reshard_offline_collection.py \
@@ -78,81 +78,3 @@ CUDA_VISIBLE_DEVICES=3 python analyze_gigawa_pt_qsa.py \
   --checkpoint /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_7800 \
   --output-dir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/qsa_debug_rl_429_online_cup_step_0.9836_4 \
   --device cuda
-
-sudo chmod -R a+rwX /home/ubuntu/users/angen.ye/gwp/RLinf
-
-sudo docker run -it \
-  --name gwp_piper \
-  -v /home/ubuntu/users/angen.ye:/home/ubuntu/users/angen.ye \
-  -w /home/ubuntu/users/angen.ye \
-  --entrypoint /bin/bash \
-  giga-rlinf:gwp_piper
-
-#在宿主机的终端中
-export DISPLAY=:1
-xhost +local:
-#启动docker容器
- sudo docker run -it --gpus all \
-    --privileged \
-    --network host \
-    --shm-size="24g" \
-    -v /home/ubuntu/users/angen.ye:/home/ubuntu/users/angen.ye \
-    -e DISPLAY=$DISPLAY \
-    -v /tmp/.X11-unix:/tmp/.X11-unix \
-    -v /dev/input:/dev/input \
-    --device /dev/uinput \
-    --name piper \
-    giga-rlinf:gwp_piper /bin/bash
-
-启动docker
-  sudo docker start -ai piper
-
-重新docker
-  sudo docker exec -it piper /bin/bash
-
-容器外设置波特率
- cd ~/cobot_magic/Piper_ros_private-ros-noetic-interrupt/
- bash can_config-4arms.sh
-
-gpu报错用这个
- export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
- echo 'export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> ~/.bashrc
-
-
-启动ros节点
- export RLINF_SKIP_ROS_CLEANUP=1
-source /opt/ros/noetic/setup.bash
-source /opt/venv/piper_ws/setup_piper_ros.sh
-
-上使能
-roslaunch piper start_ms_piper_double_agilex_delta_qpose.launch auto_enable:=1
-
-启动相机
-roslaunch realsense2_camera multi_camera.launch
-
-git端口
-mkdir -p ~/.ssh
-
-cat > ~/.ssh/config <<'EOF'
-Host github.com
-  Hostname ssh.github.com
-  Port 443
-  User git
-EOF
-
-chmod 600 ~/.ssh/config
-
-按 c：
-  reward = +1
-  done / terminated = True
-  表示成功
-
-按 a：
-  reward = -1
-  done / terminated = True
-  表示失败
-
-按 b：
-  reward = 0
-  done / terminated = False
-  表示中性标记，不结束

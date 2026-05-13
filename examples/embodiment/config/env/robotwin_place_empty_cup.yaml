@@ -5,8 +5,13 @@ auto_reset: False
 ignore_terminations: False
 
 reward_coef: 1.0
+# sparse: Robotwin success-only reward; dense: Robotwin stage/progress reward.
+reward_mode: sparse
 use_custom_reward: True
 use_rel_reward: True
+# Dense reward should be stepped sequentially so each primitive action gets its
+# own action-level reward.
+chunk_step_mode: vectorized
 center_crop: True
 
 seed: 0

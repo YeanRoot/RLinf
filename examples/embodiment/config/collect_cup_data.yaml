@@ -13,7 +13,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor, env, rollout: 4-7
+    actor, env, rollout: 0-3
 
 runner:
   task_type: embodied
@@ -115,7 +115,7 @@ algorithm:
     save_all: true
     save_success: true
     save_failure: true
-    quality_mode: reward_max
+    quality_mode: env_success
     success_threshold: 0.5
     trajectory_format: pt
     enable_cache: false

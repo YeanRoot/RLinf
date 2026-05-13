@@ -505,7 +505,15 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         mode = self.offline_collection_quality_mode
         threshold = self.offline_collection_success_threshold
-        if mode == "reward_sum":
+        if mode in {"env_success", "termination", "terminal", "terminal_any"}:
+            # For dense rewards, reward magnitude is a training signal, not a
+            # success label. Robotwin sets termination=True only when the task
+            # is actually completed; time-limit failures should be truncation/done
+            # rather than termination.
+            is_success = terminal_any
+        elif mode in {"done", "done_any"}:
+            is_success = done_any
+        elif mode == "reward_sum":
             is_success = reward_sum >= threshold
         elif mode == "any_positive":
             is_success = reward_max > 0.0

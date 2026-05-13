@@ -47,6 +47,19 @@ class RoboTwinEnv(gym.Env):
         self.auto_reset = cfg.auto_reset
         self.use_rel_reward = cfg.use_rel_reward
         self.ignore_terminations = cfg.ignore_terminations
+        self.reward_mode = str(cfg.get("reward_mode", "sparse")).lower()
+        if self.reward_mode not in {"sparse", "dense"}:
+            raise ValueError(
+                f"Unsupported reward_mode={self.reward_mode!r}. "
+                "Expected 'sparse' or 'dense'."
+            )
+        if self.reward_mode == "dense":
+            chunk_step_mode = str(cfg.get("chunk_step_mode", "vectorized")).lower()
+            if chunk_step_mode != "sequential":
+                raise ValueError(
+                    "reward_mode=dense requires chunk_step_mode=sequential so "
+                    "Robotwin dense rewards are aligned with action-level GAE."
+                )
 
         self.group_size = cfg.group_size
         self.num_group = self.num_envs // self.group_size
@@ -82,9 +95,11 @@ class RoboTwinEnv(gym.Env):
         from robotwin.envs.vector_env import VectorEnv
 
         env_seeds = self.reset_state_ids.tolist()
+        task_config = OmegaConf.to_container(self.cfg.task_config, resolve=True)
+        task_config["reward_mode"] = self.reward_mode
 
         self.venv = VectorEnv(
-            task_config=OmegaConf.to_container(self.cfg.task_config, resolve=True),
+            task_config=task_config,
             n_envs=self.num_envs,
             env_seeds=env_seeds,
         )
@@ -203,16 +218,32 @@ class RoboTwinEnv(gym.Env):
 
         return extracted_obs
 
-    def _calc_step_reward(self, terminations):
-        reward = self.cfg.reward_coef * terminations
+    def _as_reward_tensor(self, reward):
+        if isinstance(reward, torch.Tensor):
+            return reward.to(device=self.device, dtype=torch.float32).reshape(-1)
+        return torch.as_tensor(
+            np.array(reward, dtype=np.float32).reshape(-1),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
-        reward_diff = reward - self.prev_step_reward
-        self.prev_step_reward = reward
+    def _process_step_reward(self, env_reward, terminations):
+        if self.reward_mode == "sparse" and self.use_custom_reward:
+            raw_reward = terminations.to(device=self.device, dtype=torch.float32).reshape(-1)
+        else:
+            raw_reward = self._as_reward_tensor(env_reward)
+
+        raw_reward = raw_reward * float(self.cfg.reward_coef)
 
         if self.use_rel_reward:
+            reward_diff = raw_reward - self.prev_step_reward
+            self.prev_step_reward = raw_reward
             return reward_diff
-        else:
-            return reward
+        return raw_reward
+
+    def _calc_step_reward(self, terminations):
+        # Backward-compatible wrapper for older sparse-reward code paths.
+        return self._process_step_reward(terminations.float(), terminations)
 
     def _cal_chunk_rewards(self, step_reward, chunk_step, terminations, infos):
         n_steps_to_run = infos.get(
@@ -288,14 +319,7 @@ class RoboTwinEnv(gym.Env):
                 np.array(truncations).reshape(-1), device=self.device
             )
 
-        if self.use_custom_reward:
-            step_reward = self._calc_step_reward(terminations)
-        else:
-            if isinstance(step_reward, list):
-                step_reward = torch.as_tensor(
-                    np.array(step_reward, dtype=np.float32).reshape(-1),
-                    device=self.device,
-                )
+        step_reward = self._process_step_reward(step_reward, terminations)
 
         self._elapsed_steps += actions.shape[1]
         truncated = self._elapsed_steps >= self.cfg.max_episode_steps
@@ -395,14 +419,7 @@ class RoboTwinEnv(gym.Env):
                 np.array(truncations).reshape(-1), device=self.device
             )
 
-        if self.use_custom_reward:
-            step_reward = self._calc_step_reward(terminations)
-        else:
-            if isinstance(step_reward, list):
-                step_reward = torch.as_tensor(
-                    np.array(step_reward, dtype=np.float32).reshape(-1),
-                    device=self.device,
-                )
+        step_reward = self._process_step_reward(step_reward, terminations)
 
         chunk_rewards = self._cal_chunk_rewards(
             step_reward, chunk_step, terminations, infos
@@ -427,11 +444,15 @@ class RoboTwinEnv(gym.Env):
                 past_dones, obs_list[-1], infos_list[-1]
             )
 
-        chunk_terminations = torch.zeros((num_envs, chunk_step))
-        chunk_terminations[:, -1] = terminations
+        chunk_terminations = torch.zeros(
+            (num_envs, chunk_step), dtype=torch.bool, device=self.device
+        )
+        chunk_terminations[:, -1] = terminations.bool()
 
-        chunk_truncations = torch.zeros((num_envs, chunk_step))
-        chunk_truncations[:, -1] = truncations
+        chunk_truncations = torch.zeros(
+            (num_envs, chunk_step), dtype=torch.bool, device=self.device
+        )
+        chunk_truncations[:, -1] = truncations.bool()
 
         return (
             obs_list,
