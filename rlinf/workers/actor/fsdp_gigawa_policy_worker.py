@@ -53,6 +53,9 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.update_step = 0
         self.actor_update_step = 0
         self.rollout_rl_head_enabled = False
+        self.rollout_rl_head_handoff_event = False
+        self.rollout_rl_head_handoff_update_step = -1
+        self.rollout_rl_head_handoff_actor_update_step = -1
         self.offline_collection_enable = False
         self.offline_collection_buffers = {}
         self.offline_collection_output_dir = None
@@ -333,15 +336,42 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.training_uses_replay = self.target_replay_batch_size > 0
 
         self.critic_actor_ratio = int(self.cfg.algorithm.get("critic_actor_ratio", 2))
-        self.discount = float(self.cfg.algorithm.gamma) ** int(
+        self.discount_num_action_chunks = int(
             self.cfg.actor.model.get("num_action_chunks", 1)
         )
+        # Treat one action chunk as one abstract RL action.  Therefore gamma is
+        # applied once per chunk, not once per primitive control step.
+        self.discount = float(self.cfg.algorithm.gamma)
         self.bc_coef = float(self.cfg.algorithm.get("bc_coef", 1.0))
+        adaptive_bc_cfg = self.cfg.algorithm.get("adaptive_bc", None) or {}
+        self.adaptive_bc_enable = bool(adaptive_bc_cfg.get("enable", False))
+        self.adaptive_bc_min_coef = float(adaptive_bc_cfg.get("min_coef", 2.0))
+        self.adaptive_bc_max_coef = float(adaptive_bc_cfg.get("max_coef", self.bc_coef))
+        self.adaptive_bc_q_gap_target = float(adaptive_bc_cfg.get("q_gap_target", 0.3))
+        self.adaptive_bc_q_gap_ema_beta = float(adaptive_bc_cfg.get("q_gap_ema_beta", 0.98))
+        self.adaptive_bc_min_valid_updates = int(adaptive_bc_cfg.get("min_valid_updates", 5))
+        self.adaptive_bc_q_success_ema = 0.0
+        self.adaptive_bc_q_failure_ema = 0.0
+        self.adaptive_bc_q_success_valid_updates = 0
+        self.adaptive_bc_q_failure_valid_updates = 0
+        self.adaptive_bc_q_gap_ema = 0.0
+        self.adaptive_bc_q_gap_valid_updates = 0
+        self.adaptive_bc_last_q_success = 0.0
+        self.adaptive_bc_last_q_failure = 0.0
+        self.adaptive_bc_last_q_gap = 0.0
+        self.adaptive_bc_last_separation_score = 0.0
+        self.adaptive_bc_last_coef = self.bc_coef
         self.target_update_freq = int(self.cfg.algorithm.get("target_update_freq", 1))
         self.target_tau = float(self.cfg.algorithm.get("tau", 0.005))
         self.ref_action_dropout_p = float(self.cfg.algorithm.get("ref_action_dropout_p", 0.5))
         self.target_policy_noise = float(self.cfg.algorithm.get("target_policy_noise", 0.2))
         self.target_noise_clip = float(self.cfg.algorithm.get("target_noise_clip", 0.5))
+        self.log_on_first_rank(
+            "[GigaWA] Using chunk-level discount: "
+            f"gamma={self.discount:.6f}, "
+            f"num_action_chunks={self.discount_num_action_chunks}. "
+            "Each action chunk is treated as one abstract RL action."
+        )
 
         policy_head_cfg = self.cfg.actor.model.giga_world_policy
         self.enable_critic_q_upper_bound = bool(
@@ -1736,6 +1766,17 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         policy = self._unwrap_policy(self.model)
         policy.set_use_rl_head_for_rollout(True)
         self.rollout_rl_head_enabled = True
+        self.rollout_rl_head_handoff_event = True
+        self.rollout_rl_head_handoff_update_step = int(self.update_step)
+        self.rollout_rl_head_handoff_actor_update_step = int(self.actor_update_step)
+        self.log_on_first_rank(
+            "[rollout_handoff] Actor RL head is now enabled for rollout | "
+            f"update_step={self.update_step} | "
+            f"actor_update_step={self.actor_update_step} | "
+            f"replay_buffer_size={len(self.replay_buffer)} | "
+            f"warmup_steps={self.warmup_steps} | "
+            f"min_actor_updates={self.rollout_actor_min_actor_updates}"
+        )
 
     def _resolve_buffer_usage(self, replay_min_size: int, demo_min_size: int):
         replay_min_size = int(max(0, replay_min_size))
@@ -2165,6 +2206,14 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         metadata.update(sample_info)
         metadata.setdefault("sliding_offset", 0)
         metadata.setdefault("is_sliding_window_augmented", False)
+        quality = self._compute_offline_collection_quality(traj)
+        trajectory_success = torch.full(
+            (traj_len, int(source_actions.shape[1])),
+            fill_value=bool(quality["is_success"]),
+            dtype=torch.bool,
+        )
+        forward_inputs = dict(traj.forward_inputs) if traj.forward_inputs else {}
+        forward_inputs["trajectory_success"] = trajectory_success.cpu().contiguous()
         return Trajectory(
             max_episode_length=traj.max_episode_length,
             model_weights_id=traj.model_weights_id,
@@ -2177,7 +2226,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             prev_logprobs=traj.prev_logprobs[:traj_len].cpu().contiguous() if traj.prev_logprobs is not None else None,
             prev_values=traj.prev_values[:traj_len].cpu().contiguous() if traj.prev_values is not None else None,
             versions=traj.versions[:traj_len].cpu().contiguous() if traj.versions is not None else None,
-            forward_inputs=traj.forward_inputs,
+            forward_inputs=forward_inputs,
             curr_obs={
                 "visual_latent": torch.stack(curr_visual_latents, dim=0),
                 "robot_state": torch.stack(curr_robot_states, dim=0),
@@ -2253,6 +2302,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         assert traj.curr_obs and traj.next_obs, "Trajectory must contain curr_obs and next_obs."
         traj_len = self._get_effective_traj_len(traj, source_actions)
         source_actions = source_actions[:traj_len].cpu().contiguous()
+        quality = self._compute_offline_collection_quality(traj)
         rewards = traj.rewards[:traj_len] if traj.rewards is not None else None
         terminations = traj.terminations[:traj_len] if traj.terminations is not None else None
         truncations = traj.truncations[:traj_len] if traj.truncations is not None else None
@@ -2439,6 +2489,13 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             metadata.update(sample_info)
             metadata["sliding_offset"] = int(offset)
             metadata["is_sliding_window_augmented"] = bool(offset != 0)
+            forward_inputs = {
+                "trajectory_success": torch.full(
+                    (len(window_actions), batch_size),
+                    fill_value=bool(quality["is_success"]),
+                    dtype=torch.bool,
+                ).cpu().contiguous(),
+            }
             converted_trajectories.append(
                 Trajectory(
                     max_episode_length=traj.max_episode_length,
@@ -2452,7 +2509,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     prev_logprobs=torch.stack(window_logprobs, dim=0) if window_logprobs is not None else None,
                     prev_values=value_source,
                     versions=version_source,
-                    forward_inputs={},
+                    forward_inputs=forward_inputs,
                     curr_obs={
                         "visual_latent": torch.stack(curr_visual_latents, dim=0),
                         "robot_state": torch.stack(curr_robot_states, dim=0),
@@ -2566,6 +2623,25 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         return y.contiguous()
 
+    def _get_batch_trajectory_success_mask(
+        self, batch, device: torch.device | None = None
+    ) -> torch.Tensor:
+        device = device or self.device
+        forward_inputs = batch.get("forward_inputs", {})
+        if isinstance(forward_inputs, dict) and "trajectory_success" in forward_inputs:
+            success = forward_inputs["trajectory_success"]
+            if isinstance(success, torch.Tensor):
+                return success.to(device=device, dtype=torch.bool).view(-1)
+
+        # Backward-compatible fallback for old replay buffers that do not contain
+        # trajectory-level success flags.  This only marks chunks that themselves
+        # contain positive reward, so new buffers should prefer trajectory_success.
+        rewards = batch.get("rewards", None)
+        if isinstance(rewards, torch.Tensor):
+            return (rewards.sum(dim=-1) > 0).to(device=device).view(-1)
+
+        return torch.zeros(0, dtype=torch.bool, device=device)
+
     def _compute_critic_outputs(self, batch):
         policy = self._unwrap_policy(self.model)
 
@@ -2665,6 +2741,54 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
         critic_loss, q1, q2, target_q_values, critic_aux = self._compute_critic_outputs(batch)
+
+        q_data = torch.minimum(q1, q2).detach().float().view(-1)
+        success_mask = self._get_batch_trajectory_success_mask(batch, device=q_data.device)
+        mask_shape_valid = success_mask.numel() == q_data.numel()
+        success_present = mask_shape_valid and bool(success_mask.any().item())
+        failure_present = mask_shape_valid and bool((~success_mask).any().item())
+        beta = float(self.adaptive_bc_q_gap_ema_beta)
+
+        if success_present:
+            q_success = q_data[success_mask].mean()
+            self.adaptive_bc_last_q_success = float(q_success.item())
+            if self.adaptive_bc_q_success_valid_updates == 0:
+                self.adaptive_bc_q_success_ema = self.adaptive_bc_last_q_success
+            else:
+                self.adaptive_bc_q_success_ema = (
+                    beta * float(self.adaptive_bc_q_success_ema)
+                    + (1.0 - beta) * self.adaptive_bc_last_q_success
+                )
+            self.adaptive_bc_q_success_valid_updates += 1
+
+        if failure_present:
+            q_failure = q_data[~success_mask].mean()
+            self.adaptive_bc_last_q_failure = float(q_failure.item())
+            if self.adaptive_bc_q_failure_valid_updates == 0:
+                self.adaptive_bc_q_failure_ema = self.adaptive_bc_last_q_failure
+            else:
+                self.adaptive_bc_q_failure_ema = (
+                    beta * float(self.adaptive_bc_q_failure_ema)
+                    + (1.0 - beta) * self.adaptive_bc_last_q_failure
+                )
+            self.adaptive_bc_q_failure_valid_updates += 1
+
+        q_gap_valid = (
+            self.adaptive_bc_q_success_valid_updates > 0
+            and self.adaptive_bc_q_failure_valid_updates > 0
+        )
+        if q_gap_valid:
+            q_gap = float(self.adaptive_bc_q_success_ema) - float(self.adaptive_bc_q_failure_ema)
+            self.adaptive_bc_last_q_gap = q_gap
+            if self.adaptive_bc_q_gap_valid_updates == 0:
+                self.adaptive_bc_q_gap_ema = q_gap
+            else:
+                self.adaptive_bc_q_gap_ema = (
+                    beta * float(self.adaptive_bc_q_gap_ema)
+                    + (1.0 - beta) * q_gap
+                )
+            self.adaptive_bc_q_gap_valid_updates += 1
+
         return critic_loss, {
             "q1_data": q1.mean().item(),
             "q2_data": q2.mean().item(),
@@ -2673,12 +2797,56 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "q1_overshoot": critic_aux["q1_overshoot"],
             "q2_overshoot": critic_aux["q2_overshoot"],
             "q_upper_bound": critic_aux["q_upper_bound"],
+            "q_success_mean": self.adaptive_bc_last_q_success,
+            "q_failure_mean": self.adaptive_bc_last_q_failure,
+            "q_success_failure_gap": self.adaptive_bc_last_q_gap,
+            "q_success_failure_gap_ema": float(self.adaptive_bc_q_gap_ema),
+            "q_success_ema": float(self.adaptive_bc_q_success_ema),
+            "q_failure_ema": float(self.adaptive_bc_q_failure_ema),
+            "q_success_valid_updates": float(self.adaptive_bc_q_success_valid_updates),
+            "q_failure_valid_updates": float(self.adaptive_bc_q_failure_valid_updates),
+            "q_gap_valid": float(q_gap_valid),
+            "q_gap_valid_updates": float(self.adaptive_bc_q_gap_valid_updates),
+        }
+
+    def _get_adaptive_bc_coef(self) -> tuple[float, dict[str, float]]:
+        if not self.adaptive_bc_enable:
+            coef = float(self.bc_coef)
+            self.adaptive_bc_last_coef = coef
+            self.adaptive_bc_last_separation_score = 0.0
+            return coef, {
+                "adaptive_bc_enabled": 0.0,
+                "adaptive_bc_separation_score": 0.0,
+                "adaptive_bc_q_gap_ema": float(self.adaptive_bc_q_gap_ema),
+                "adaptive_bc_q_gap_target": float(self.adaptive_bc_q_gap_target),
+                "adaptive_bc_valid_updates": float(self.adaptive_bc_q_gap_valid_updates),
+            }
+
+        if self.adaptive_bc_q_gap_valid_updates < self.adaptive_bc_min_valid_updates:
+            score = 0.0
+            coef = float(self.adaptive_bc_max_coef)
+        else:
+            gap = max(0.0, float(self.adaptive_bc_q_gap_ema))
+            target = max(1e-6, float(self.adaptive_bc_q_gap_target))
+            score = min(1.0, gap / target)
+            coef = self.adaptive_bc_min_coef + (
+                self.adaptive_bc_max_coef - self.adaptive_bc_min_coef
+            ) * (1.0 - score)
+
+        self.adaptive_bc_last_separation_score = float(score)
+        self.adaptive_bc_last_coef = float(coef)
+        return float(coef), {
+            "adaptive_bc_enabled": 1.0,
+            "adaptive_bc_separation_score": float(score),
+            "adaptive_bc_q_gap_ema": float(self.adaptive_bc_q_gap_ema),
+            "adaptive_bc_q_gap_target": float(self.adaptive_bc_q_gap_target),
+            "adaptive_bc_valid_updates": float(self.adaptive_bc_q_gap_valid_updates),
         }
 
     def _compose_actor_loss(self, q_pi: torch.Tensor | None, bc_loss: torch.Tensor):
         q_term = bc_loss.new_zeros(())
         q_weight = 1.0
-        effective_bc_coef = float(self.bc_coef)
+        effective_bc_coef, adaptive_bc_metrics = self._get_adaptive_bc_coef()
         hard_penalty = bc_loss.new_zeros(())
         guard_active = 0.0
         q_pi_for_loss = None
@@ -2720,6 +2888,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "bc_guard_active": guard_active,
             "q_weight": q_weight,
         }
+        metrics.update(adaptive_bc_metrics)
         return actor_loss, metrics
 
     @torch.no_grad()
@@ -3010,6 +3179,32 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 f"demo_buffer/{key}": value for key, value in demo_buffer_stats.items()
             }
             append_to_dict(metrics, demo_buffer_stats)
+
+        append_to_dict(
+            metrics,
+            {
+                "rollout/use_actor_head": float(self.rollout_rl_head_enabled),
+                "rollout/actor_handoff_event": float(self.rollout_rl_head_handoff_event),
+                "rollout/actor_handoff_update_step": float(self.rollout_rl_head_handoff_update_step),
+                "rollout/actor_handoff_actor_update_step": float(
+                    self.rollout_rl_head_handoff_actor_update_step
+                ),
+                "rollout/update_step": float(self.update_step),
+                "rollout/actor_update_step": float(self.actor_update_step),
+                "rollout/replay_buffer_size": float(len(self.replay_buffer)),
+                "rollout/warmup_steps": float(self.warmup_steps),
+                "rollout/min_actor_updates": float(self.rollout_actor_min_actor_updates),
+                "rollout/warmup_ready": float(len(self.replay_buffer) >= self.warmup_steps),
+                "rollout/actor_update_ready": float(
+                    self.actor_update_step >= self.rollout_actor_min_actor_updates
+                ),
+                "rollout/rollout_actor_after_warmup": float(self.rollout_actor_after_warmup),
+                "rollout/allow_actor_handoff": float(self.allow_rollout_actor_handoff),
+                "rollout/chunk_level_gamma": float(self.discount),
+                "rollout/num_action_chunks": float(self.discount_num_action_chunks),
+            },
+        )
+        self.rollout_rl_head_handoff_event = False
 
         append_to_dict(
             metrics,
