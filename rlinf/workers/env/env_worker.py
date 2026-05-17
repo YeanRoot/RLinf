@@ -474,6 +474,34 @@ class EnvWorker(Worker):
             if self.enable_offload and hasattr(self.env_list[i], "offload"):
                 self.env_list[i].offload()
 
+    def reset_train_envs(self, reason: str = "manual_terminal_between_chunks"):
+        """Force-reset train envs after collector-side chunk-between c/a.
+
+        In episode-level real-world collection, c/a can be pressed after a chunk
+        finishes but before the next env.step().  The collector patches that
+        terminal event into the saved episode; however the EnvWorker itself has
+        not observed a done=True step, so its auto-reset path has not run.  This
+        method lets the collector reset the real robot/scene gate before starting
+        the next episode.
+        """
+        if self.only_eval:
+            return True
+        for stage_id, env in enumerate(self.env_list):
+            # Best-effort release of teleop before reset.
+            fn = getattr(env, "_force_disable_teleop_for_all_envs", None)
+            if callable(fn):
+                fn(reason=reason)
+            extracted_obs, _ = env.reset()
+            if stage_id < len(self.last_obs_list):
+                self.last_obs_list[stage_id] = extracted_obs
+            else:
+                self.last_obs_list.append(extracted_obs)
+            if stage_id < len(self.last_intervened_info_list):
+                self.last_intervened_info_list[stage_id] = (None, None)
+            else:
+                self.last_intervened_info_list.append((None, None))
+        return True
+
     def _augment_curr_obs_with_chunk_step_seq(
         self,
         curr_obs: dict[str, Any],

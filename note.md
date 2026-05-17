@@ -1,26 +1,7 @@
-apt-get update
-
-apt-get install -y \
-    libvulkan1 \
-    vulkan-tools \
-    mesa-vulkan-drivers \
-    mesa-utils
-
-source /mnt/pfs/users/angen.ye/myconda/conda/etc/profile.d/conda.sh
-conda activate pi-rl
-cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf
-export REPO_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RLinf
-export ROBOTWIN_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-RLinf_support
-export PYTHONPATH=$ROBOTWIN_PATH:$REPO_PATH:$PYTHONPATH
-
-cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
-
-conda activate pi-rl-h20
-export ROBOTWIN_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RoboTwin-main
 
 python collect_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name collect_bell_data_fix
+  --config-name collect_piper_gigawa_realworld
 
 train
 
@@ -31,6 +12,10 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 
 cd /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment
 python train_embodied_agent_gigawa.py   --config-path ./config   --config-name online_rl_piper_gigawa
+
+python analyze_realworld_pt.py \
+  /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_wa_only/offline_collection_raw/rank_0/all \
+  --action-dim 14
 
 eval:
 python eval_embodied_agent.py \
@@ -66,6 +51,7 @@ tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf
   --port 6006
 
 python repair_pre_earlystop_buffer.py   --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect4_12chunk_fix/mergeall2   --output-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/gigawa_offline_collect4_12chunk_fix/mergeall_repaired3
+
 
 
 
@@ -105,15 +91,19 @@ xhost +local:
     giga-rlinf:gwp_piper /bin/bash
 
 启动docker
-  sudo docker start -ai piper
-  source switch_env gigaworld
+docker start -ai piper
+source switch_env gigaworld
 
 重新docker
-  sudo docker exec -it piper /bin/bash
+docker exec -it piper /bin/bash
+source switch_env gigaworld
 
 容器外设置波特率
  cd ~/cobot_magic/Piper_ros_private-ros-noetic-interrupt/
  bash can_config-4arms.sh
+
+export DISPLAY=:1
+xhost +local:
 
 gpu报错用这个
  export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
@@ -157,3 +147,10 @@ chmod 600 ~/.ssh/config
   reward = 0
   done / terminated = False
   表示中性标记，不结束
+
+清理gpu
+apt-get install -y psmisc
+fuser -k -9 /dev/nvidia*
+
+清理ros节点
+rosnode kill -a

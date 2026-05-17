@@ -23,6 +23,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional video export dependency
+    cv2 = None
 import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
@@ -62,6 +67,20 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.offline_collection_summary_flush_every = 100
         self.offline_collection_summary_buffer = []
         self.offline_collection_num_received = 0
+        self.offline_collection_split_by_episode = False
+        self.offline_collection_save_partial_episodes = False
+        self.offline_collection_slim_trajectories = False
+        self.offline_collection_save_inference_frame_video = False
+        self.offline_collection_video_dir = None
+        self.offline_collection_video_fps = 5
+        self.offline_collection_drop_obs_image_keys = (
+            "main_images",
+            "wrist_images",
+            "extra_view_images",
+            "_chunk_step_main_images_seq",
+            "_chunk_step_wrist_images_seq",
+            "_chunk_step_extra_view_images_seq",
+        )
         self.offline_bc_pretrain_enable = False
         self.offline_bc_train_buffer = None
         self.offline_bc_val_buffer = None
@@ -463,6 +482,24 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.offline_collection_success_threshold = float(collect_cfg.get("success_threshold", 0.5))
         self.offline_collection_summary_flush_every = int(collect_cfg.get("summary_flush_every", 100))
         self.offline_collection_summary_path = self.offline_collection_output_dir / "trajectory_summaries.jsonl"
+        self.offline_collection_split_by_episode = bool(collect_cfg.get("split_by_episode", False))
+        self.offline_collection_save_partial_episodes = bool(collect_cfg.get("save_partial_episodes", False))
+        self.offline_collection_slim_trajectories = bool(collect_cfg.get("slim_trajectories", False))
+        self.offline_collection_save_inference_frame_video = bool(
+            collect_cfg.get("save_inference_frame_video", False)
+        )
+        self.offline_collection_video_fps = int(collect_cfg.get("inference_frame_video_fps", 5))
+        video_dir = collect_cfg.get("inference_frame_video_dir", None)
+        if video_dir is None:
+            video_dir = str(Path(base_dir) / "inference_frame_videos")
+        self.offline_collection_video_dir = Path(video_dir)
+        if self.offline_collection_save_inference_frame_video:
+            self.offline_collection_video_dir.mkdir(parents=True, exist_ok=True)
+            if cv2 is None:
+                self.logger.warning(
+                    "offline_collection.save_inference_frame_video=True but cv2 import failed; "
+                    "videos will not be written."
+                )
 
         buffer_common = {
             "seed": seed,
@@ -534,40 +571,345 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         self.offline_collection_summary_buffer.clear()
 
+    def _infer_traj_length_and_batch(self, traj: Trajectory) -> tuple[int, int]:
+        for field_name in ("actions", "rewards", "dones", "terminations", "truncations"):
+            value = getattr(traj, field_name, None)
+            if isinstance(value, torch.Tensor) and value.dim() >= 2:
+                return int(value.shape[0]), int(value.shape[1])
+        for container in (traj.curr_obs, traj.next_obs, traj.forward_inputs):
+            if isinstance(container, dict):
+                for value in container.values():
+                    if isinstance(value, torch.Tensor) and value.dim() >= 2:
+                        return int(value.shape[0]), int(value.shape[1])
+        return 0, 0
+
+    def _slice_nested_time_env(self, value: Any, start: int, end: int, env_idx: int, T: int, B: int) -> Any:
+        if isinstance(value, torch.Tensor):
+            if value.dim() >= 2 and value.shape[0] == T and value.shape[1] == B:
+                return value[start:end, env_idx : env_idx + 1].cpu().contiguous()
+            if value.dim() >= 1 and value.shape[0] == T:
+                return value[start:end].cpu().contiguous()
+            return value.cpu().contiguous()
+        if isinstance(value, dict):
+            return {
+                key: self._slice_nested_time_env(val, start, end, env_idx, T, B)
+                for key, val in value.items()
+            }
+        if isinstance(value, list):
+            return [self._slice_nested_time_env(val, start, end, env_idx, T, B) for val in value]
+        if isinstance(value, tuple):
+            return tuple(self._slice_nested_time_env(val, start, end, env_idx, T, B) for val in value)
+        return copy.deepcopy(value)
+
+    def _slice_trajectory_episode(
+        self,
+        traj: Trajectory,
+        start: int,
+        end: int,
+        env_idx: int,
+        *,
+        episode_index: int,
+        is_terminal: bool,
+        terminal_chunk_index: int | None,
+    ) -> Trajectory | None:
+        T, B = self._infer_traj_length_and_batch(traj)
+        if T == 0 or B == 0 or end <= start:
+            return None
+
+        episode = Trajectory(
+            max_episode_length=traj.max_episode_length,
+            model_weights_id=traj.model_weights_id,
+        )
+        for field_name in traj.__dataclass_fields__.keys():
+            if field_name in {"max_episode_length", "model_weights_id", "metadata"}:
+                continue
+            value = getattr(traj, field_name, None)
+            if value is None:
+                continue
+            if field_name in {"curr_obs", "next_obs", "forward_inputs"}:
+                setattr(
+                    episode,
+                    field_name,
+                    self._slice_nested_time_env(value, start, end, env_idx, T, B),
+                )
+            elif field_name == "sample_infos":
+                if isinstance(value, list) and env_idx < len(value):
+                    episode.sample_infos = [copy.deepcopy(value[env_idx])]
+            elif isinstance(value, torch.Tensor):
+                if value.dim() >= 2 and value.shape[0] == T and value.shape[1] == B:
+                    setattr(episode, field_name, value[start:end, env_idx : env_idx + 1].cpu().contiguous())
+                elif value.dim() >= 1 and value.shape[0] == T:
+                    setattr(episode, field_name, value[start:end].cpu().contiguous())
+                else:
+                    setattr(episode, field_name, value.cpu().contiguous())
+            else:
+                setattr(episode, field_name, copy.deepcopy(value))
+
+        metadata = dict(traj.metadata) if isinstance(traj.metadata, dict) else {}
+        metadata.update(
+            {
+                "source_env_local_index": int(env_idx),
+                "source_start_chunk": int(start),
+                "source_end_chunk_exclusive": int(end),
+                "source_episode_index": int(episode_index),
+                "is_terminal_episode": bool(is_terminal),
+            }
+        )
+        if terminal_chunk_index is not None:
+            metadata["terminal_chunk_index"] = int(terminal_chunk_index)
+        episode.metadata = metadata
+        episode.contiguous_()
+        return episode
+
+    def _split_trajectory_by_episode(self, traj: Trajectory) -> list[Trajectory]:
+        if not self.offline_collection_split_by_episode:
+            return [traj]
+        T, B = self._infer_traj_length_and_batch(traj)
+        if T == 0 or B == 0:
+            return [traj]
+
+        done_tensor = None
+        if isinstance(traj.dones, torch.Tensor):
+            done_tensor = traj.dones.bool()
+        elif isinstance(traj.terminations, torch.Tensor):
+            done_tensor = traj.terminations.bool()
+            if isinstance(traj.truncations, torch.Tensor) and traj.truncations.shape == done_tensor.shape:
+                done_tensor = done_tensor | traj.truncations.bool()
+
+        # No terminal tensor: keep old behavior unless partial episodes are disabled.
+        if done_tensor is None:
+            return [traj] if self.offline_collection_save_partial_episodes else []
+
+        episodes: list[Trajectory] = []
+        episode_counter = 0
+        for env_idx in range(B):
+            start = 0
+            if done_tensor.dim() >= 3:
+                per_chunk_terminal = done_tensor[:, env_idx].reshape(T, -1).any(dim=-1)
+            else:
+                per_chunk_terminal = done_tensor[:, env_idx].reshape(T)
+            terminal_chunks = torch.nonzero(per_chunk_terminal, as_tuple=False).flatten().tolist()
+            for terminal_chunk in terminal_chunks:
+                terminal_chunk = int(terminal_chunk)
+                if terminal_chunk < start:
+                    continue
+                episode = self._slice_trajectory_episode(
+                    traj,
+                    start,
+                    terminal_chunk + 1,
+                    env_idx,
+                    episode_index=episode_counter,
+                    is_terminal=True,
+                    terminal_chunk_index=terminal_chunk,
+                )
+                if episode is not None:
+                    episodes.append(episode)
+                    episode_counter += 1
+                start = terminal_chunk + 1
+            if self.offline_collection_save_partial_episodes and start < T:
+                episode = self._slice_trajectory_episode(
+                    traj,
+                    start,
+                    T,
+                    env_idx,
+                    episode_index=episode_counter,
+                    is_terminal=False,
+                    terminal_chunk_index=None,
+                )
+                if episode is not None:
+                    episodes.append(episode)
+                    episode_counter += 1
+        return episodes
+
+    def _to_uint8_hwc(self, value: torch.Tensor | np.ndarray) -> np.ndarray:
+        if isinstance(value, torch.Tensor):
+            arr = value.detach().cpu().numpy()
+        else:
+            arr = np.asarray(value)
+        if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+            arr = np.transpose(arr, (1, 2, 0))
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[..., None], 3, axis=-1)
+        if arr.shape[-1] == 1:
+            arr = np.repeat(arr, 3, axis=-1)
+        if arr.shape[-1] > 3:
+            arr = arr[..., :3]
+        return np.ascontiguousarray(arr)
+
+    def _select_obs_image(self, obs: dict[str, Any], key: str, t: int, env_idx: int, view_idx: int | None = None) -> np.ndarray | None:
+        value = obs.get(key, None) if isinstance(obs, dict) else None
+        if not isinstance(value, torch.Tensor):
+            return None
+        try:
+            if key == "main_images":
+                image = value[t, env_idx]
+            else:
+                if value.dim() >= 6:
+                    image = value[t, env_idx, 0 if view_idx is None else view_idx]
+                elif value.dim() >= 5:
+                    image = value[t, env_idx]
+                else:
+                    return None
+            return self._to_uint8_hwc(image)
+        except Exception:
+            return None
+
+    def _build_inference_video_frame(self, traj: Trajectory, t: int, env_idx: int) -> np.ndarray | None:
+        obs = traj.curr_obs if isinstance(traj.curr_obs, dict) else {}
+        panels = []
+        main = self._select_obs_image(obs, "main_images", t, env_idx)
+        if main is not None:
+            panels.append(main)
+        wrist = obs.get("wrist_images", None)
+        if isinstance(wrist, torch.Tensor):
+            num_views = int(wrist.shape[2]) if wrist.dim() >= 6 else 1
+            for view_idx in range(num_views):
+                img = self._select_obs_image(obs, "wrist_images", t, env_idx, view_idx)
+                if img is not None:
+                    panels.append(img)
+        elif isinstance(obs.get("extra_view_images", None), torch.Tensor):
+            extra = obs["extra_view_images"]
+            num_views = int(extra.shape[2]) if extra.dim() >= 6 else 1
+            for view_idx in range(num_views):
+                img = self._select_obs_image(obs, "extra_view_images", t, env_idx, view_idx)
+                if img is not None:
+                    panels.append(img)
+        if not panels:
+            return None
+        h = min(panel.shape[0] for panel in panels)
+        resized = []
+        for panel in panels:
+            if panel.shape[0] != h:
+                w = max(1, int(round(panel.shape[1] * h / panel.shape[0])))
+                panel = cv2.resize(panel, (w, h), interpolation=cv2.INTER_AREA) if cv2 is not None else panel[:h]
+            resized.append(panel)
+        return np.concatenate(resized, axis=1)
+
+    def _write_inference_frame_video(self, traj: Trajectory, collection_index: int) -> str | None:
+        if not self.offline_collection_save_inference_frame_video or cv2 is None:
+            return None
+        T, B = self._infer_traj_length_and_batch(traj)
+        if T == 0 or B == 0:
+            return None
+        env_idx = 0
+        frames = []
+        valid_chunks = None
+        if isinstance(traj.action_valid_mask, torch.Tensor) and traj.action_valid_mask.dim() >= 3:
+            valid_chunks = traj.action_valid_mask[:, env_idx].bool().any(dim=-1)
+        for t in range(T):
+            if valid_chunks is not None and not bool(valid_chunks[t].item()):
+                continue
+            frame = self._build_inference_video_frame(traj, t, env_idx)
+            if frame is not None:
+                frames.append(frame)
+        if not frames:
+            return None
+        path = self.offline_collection_video_dir / f"episode_{collection_index:06d}.mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        h, w = frames[0].shape[:2]
+        writer = cv2.VideoWriter(
+            str(path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            max(1, self.offline_collection_video_fps),
+            (w, h),
+        )
+        try:
+            for idx, frame in enumerate(frames):
+                if frame.shape[:2] != (h, w):
+                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+                # cv2 expects BGR.
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        finally:
+            writer.release()
+        return str(path)
+
+    def _drop_image_tensors_from_obs(self, obs: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(obs, dict):
+            return {}
+        out = {}
+        drop_keys = set(self.offline_collection_drop_obs_image_keys)
+        for key, value in obs.items():
+            if key in drop_keys:
+                continue
+            if "image" in str(key).lower() or "images" in str(key).lower():
+                continue
+            out[key] = value
+        return out
+
+    def _make_slim_offline_trajectory(self, traj: Trajectory) -> Trajectory:
+        if not self.offline_collection_slim_trajectories:
+            return traj
+        slim = copy.deepcopy(traj)
+        slim.curr_obs = self._drop_image_tensors_from_obs(slim.curr_obs)
+        slim.next_obs = self._drop_image_tensors_from_obs(slim.next_obs)
+        # Keep forward inputs because they contain robot_state/ref_action/action_exec/model_action,
+        # but drop accidental image tensors if future code adds them there.
+        if isinstance(slim.forward_inputs, dict):
+            slim.forward_inputs = self._drop_image_tensors_from_obs(slim.forward_inputs)
+        metadata = dict(slim.metadata) if isinstance(slim.metadata, dict) else {}
+        metadata["slim_trajectory"] = True
+        metadata["dropped_raw_images_from_pt"] = True
+        slim.metadata = metadata
+        slim.contiguous_()
+        return slim
+
     def _store_offline_collection_trajectories(self, trajs: list[Trajectory]) -> None:
         if not self.offline_collection_enable or len(trajs) == 0:
             return
 
         grouped = {"all": [], "success": [], "failure": []}
         summary_rows = []
-        for traj in trajs:
-            quality = self._compute_offline_collection_quality(traj)
-            self.offline_collection_num_received += 1
-            row = {
-                "collection_index": int(self.offline_collection_num_received),
-                "rank": int(self._rank),
-                "model_weights_id": str(traj.model_weights_id),
-                **quality,
-            }
-            if getattr(traj, "metadata", None):
-                for key in [
-                    "source_episode_name",
-                    "source_rank",
-                    "source_episode_index",
-                    "source_env_local_index",
-                    "source_video_path",
-                    "source_video_env_local_index",
-                    "sliding_offset",
-                    "is_sliding_window_augmented",
-                ]:
-                    if key in traj.metadata:
-                        row[key] = traj.metadata[key]
-            summary_rows.append(row)
-            if "all" in self.offline_collection_buffers:
-                grouped["all"].append(traj)
-            key = "success" if quality["is_success"] else "failure"
-            if key in self.offline_collection_buffers:
-                grouped[key].append(traj)
+        for source_traj in trajs:
+            episode_trajs = self._split_trajectory_by_episode(source_traj)
+            for traj in episode_trajs:
+                # Reserve a collection index before optional video writing so pt/mp4 names match.
+                self.offline_collection_num_received += 1
+                collection_index = int(self.offline_collection_num_received)
+                quality = self._compute_offline_collection_quality(traj)
+
+                video_path = self._write_inference_frame_video(traj, collection_index)
+                save_traj = self._make_slim_offline_trajectory(traj)
+                metadata = dict(save_traj.metadata) if isinstance(save_traj.metadata, dict) else {}
+                metadata["collection_index"] = collection_index
+                if video_path is not None:
+                    metadata["inference_frame_video_path"] = video_path
+                metadata["save_unit"] = "episode" if self.offline_collection_split_by_episode else "rollout"
+                save_traj.metadata = metadata
+
+                row = {
+                    "collection_index": collection_index,
+                    "rank": int(self._rank),
+                    "model_weights_id": str(save_traj.model_weights_id),
+                    **quality,
+                }
+                if video_path is not None:
+                    row["inference_frame_video_path"] = video_path
+                if getattr(save_traj, "metadata", None):
+                    for key in [
+                        "source_episode_name",
+                        "source_rank",
+                        "source_episode_index",
+                        "source_env_local_index",
+                        "source_video_path",
+                        "source_video_env_local_index",
+                        "sliding_offset",
+                        "is_sliding_window_augmented",
+                        "source_start_chunk",
+                        "source_end_chunk_exclusive",
+                        "terminal_chunk_index",
+                        "save_unit",
+                        "slim_trajectory",
+                    ]:
+                        if key in save_traj.metadata:
+                            row[key] = save_traj.metadata[key]
+                summary_rows.append(row)
+                if "all" in self.offline_collection_buffers:
+                    grouped["all"].append(save_traj)
+                key = "success" if quality["is_success"] else "failure"
+                if key in self.offline_collection_buffers:
+                    grouped[key].append(save_traj)
 
         for key, group in grouped.items():
             if key in self.offline_collection_buffers and len(group) > 0:

@@ -375,27 +375,73 @@ class PiperEnv(gym.Env):
         except Exception:
             return False
 
-    def force_disable_teleop(self, reason: str = "") -> None:
-        """Force ROS teleoperation off so policy/reset can regain control.
+    def _fake_page_down_key(self) -> bool:
+        """Send one synthetic PageDown key event to toggle the external teleop node.
 
-        The master/slave teleop node uses ``/enable_message_publish`` to decide
-        whether slave arms should follow the master arms.  When a chunk-level
-        intervention ends, or when success/failure/timeout terminates an episode,
-        we must clear this flag; otherwise reset/policy commands can keep fighting
-        the teleop node.
+        This is intentionally a minimal temporary bridge for the existing teleop
+        implementation, whose real enabled/disabled state is controlled by its
+        PageDown keyboard toggle rather than only by ``/enable_message_publish``.
+        """
+        try:
+            from pynput.keyboard import Controller, Key
+
+            keyboard = Controller()
+            keyboard.press(Key.page_down)
+            time.sleep(0.08)
+            keyboard.release(Key.page_down)
+            return True
+        except Exception as exc:
+            self._logger.warning("Failed to fake PageDown for teleop disable: %s", exc)
+            return False
+
+    def force_disable_teleop(self, reason: str = "") -> None:
+        """Disable external teleoperation if it is currently active.
+
+        Important: PageDown is a toggle in the external ROS teleop node.  Therefore
+        we only fake PageDown when ``/enable_message_publish`` is currently True.
+        If the param is already False, we do nothing, so we never accidentally
+        toggle teleop back on.
         """
         if self.config.is_dummy:
             return
         try:
-            was_active = bool(rospy.get_param("/enable_message_publish", False))
-            rospy.set_param("/enable_message_publish", False)
-            if was_active:
-                self._logger.info("Teleop disabled automatically. reason=%s", reason)
+            before = bool(rospy.get_param("/enable_message_publish", False))
         except Exception as exc:
             self._logger.warning(
-                "Failed to disable teleop automatically. reason=%s error=%s",
+                "Failed to read /enable_message_publish before disabling teleop. reason=%s error=%s",
                 reason,
                 exc,
+            )
+            return
+
+        if not before:
+            self._logger.info(
+                "Skip fake PageDown because teleop is already disabled. reason=%s",
+                reason,
+            )
+            return
+
+        ok = self._fake_page_down_key()
+        time.sleep(0.20)
+        try:
+            after = bool(rospy.get_param("/enable_message_publish", False))
+        except Exception:
+            after = None
+
+        if ok and after is False:
+            self._logger.warning(
+                "Teleop disabled by fake PageDown. reason=%s before=%s after=%s",
+                reason,
+                before,
+                after,
+            )
+        else:
+            self._logger.warning(
+                "Fake PageDown sent but teleop may still be active. reason=%s ok=%s before=%s after=%s",
+                reason,
+                ok,
+                before,
+                after,
             )
 
     def _wait_for_teleop_release_before_reset(self) -> None:
@@ -695,6 +741,9 @@ class PiperEnv(gym.Env):
             observation = self._get_observation()
             return observation, {}
 
+        # Safety fallback: if teleop is still active before reset, toggle it off
+        # with the same PageDown mechanism used by the external teleop node.
+        self.force_disable_teleop(reason="reset")
         self._wait_for_teleop_release_before_reset()
 
         # ---- Enable ----

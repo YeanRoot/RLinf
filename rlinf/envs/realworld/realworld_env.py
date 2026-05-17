@@ -654,11 +654,17 @@ class RealWorldEnv(gym.Env):
             )
 
         if self.auto_reset or self.ignore_terminations:
+            # Keep terminal/truncation on the last *valid* primitive step.
+            # Earlier versions collapsed it to ``-1`` of a padded chunk, and
+            # collection-time padding cleanup then removed the terminal flag.
+            # That made failure episodes (reward=0, done=True) indistinguishable
+            # from normal unfinished chunks.
+            terminal_step_idx = max(0, min(valid_steps, chunk_size) - 1)
             chunk_terminations = torch.zeros_like(raw_chunk_terminations)
-            chunk_terminations[:, -1] = past_terminations
+            chunk_terminations[:, terminal_step_idx] = past_terminations
 
             chunk_truncations = torch.zeros_like(raw_chunk_truncations)
-            chunk_truncations[:, -1] = past_truncations
+            chunk_truncations[:, terminal_step_idx] = past_truncations
         else:
             chunk_terminations = raw_chunk_terminations.clone()
             chunk_truncations = raw_chunk_truncations.clone()

@@ -1,0 +1,322 @@
+defaults:
+  - env/realworld_piper_gigawa@env.train
+  - env/realworld_piper_gigawa@env.eval
+  - model/giga_world_policy@actor.model
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 1
+
+  component_placement:
+    actor: 0
+    rollout: 0
+    env:
+      node_group: node
+      placement: 0
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention"
+    project_name: rlinf
+    experiment_name: "collect_piper_gigawa_intervention"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1
+  max_steps: -1
+  async_rollout_training: false
+  async_disable_inline_eval: true
+  replay_channel_maxsize: 8
+  weight_sync_interval: 20
+  only_eval: false
+  val_check_interval: -1
+  save_interval: 200
+  resume_dir: null
+  ckpt_path: null
+  resume_load_optimizer_and_scheduler_state: false
+
+algorithm:
+  normalize_advantages: False
+  kl_penalty: kl
+  group_size: 1
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  reward_type: action_level
+  logprob_type: token_level
+  entropy_type: token_level
+  adv_type: gae
+  loss_type: embodied_gigawa
+  loss_agg_func: "token-mean"
+  kl_beta: 0.0
+  entropy_bonus: 0.0
+  clip_ratio_high: 0.28
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+  gamma: 0.9836
+  gae_lambda: 0.95
+  reward_coef: 1
+  filter_rewards: False
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 5.0
+  training_stage: full_rl
+  update_epoch: 1
+  utd_ratio: 5
+  staleness_threshold: 2
+  critic_actor_ratio: 2
+  tau: 0.005
+  target_update_freq: 1
+  target_policy_noise: 0.0
+  target_noise_clip: 0.0
+  bc_coef: 50
+  ref_action_dropout_p: 0
+  actor_bc_target: batch_action
+  use_action_valid_mask: true
+
+  # Keep this false for episode collection: we only need one inference-frame obs per chunk.
+  gigawa_sliding_window:
+    enable: false
+    offset_stride: 12
+    max_offsets: 1
+    augment_mode: preserve_ref_action
+
+  offline_collection:
+    enable: true
+    save_unit: episode
+    # One c/a/timeout terminal event produces one episode_XXXXXX.pt and one mp4.
+    output_dir: ${runner.logger.log_path}/offline_collection
+    target_num_trajectories: 20
+    max_collection_steps: 100000000
+    log_interval: 1
+    success_threshold: 0.5
+    save_partial_on_exit: false
+    # Capture c/a that are pressed after a 12-step chunk has ended but before
+    # the next env.step(). Without this, the terminal marker lands at the next
+    # chunk's step 0.
+    poll_keyboard_between_chunks: true
+    inference_frame_video:
+      enable: true
+      fps: 5
+
+  warmup_steps: 64
+  train_actor_steps: 0
+  rollout_actor_after_warmup: true
+  rollout_actor_min_actor_updates: 500
+  freeze_critic_updates: false
+  freeze_actor_updates: false
+  freeze_visual_layers: false
+  actor_bc_guard:
+    mode: none
+  sampling_params:
+    do_sample: False
+    temperature_train: -1
+    temperature_eval: -1
+    top_k: -1
+    top_p: 1.0
+    repetition_penalty: 1.0
+  length_params:
+    max_new_token: null
+    max_length: 512
+    min_length: 1
+
+  replay_buffer:
+    enable_cache: False
+    cache_size: 1
+    sample_window_size: 1
+    min_buffer_size: 1
+    auto_save: False
+    auto_save_path: null
+    trajectory_format: pt
+    enable_preload: False
+    prefetch_size: 1
+  demo_buffer:
+    enable: False
+    enable_cache: False
+    cache_size: 1
+    sample_window_size: 1
+    min_buffer_size: 0
+    train_actor_steps: 0
+    auto_save: False
+    auto_save_path: null
+    trajectory_format: pt
+    load_path: null
+    sample_ratio: 0.0
+    allow_train_on_demo_only: true
+    allow_demo_only_fallback: true
+    allow_replay_only_fallback: true
+    store_online_interventions: true
+
+env:
+  group_name: "EnvGroup"
+  enable_offload: False
+
+  train:
+    total_num_envs: 1
+    reward_coef: ${algorithm.reward_coef}
+    max_episode_steps: 960
+    # IMPORTANT: collector also forces this to num_action_chunks=12 in Python.
+    # This prevents Ray ChannelWorker from carrying 80 chunks of raw images at once.
+    max_steps_per_rollout_epoch: 12
+    group_size: 1
+    break_chunk_on_intervention: true
+    latch_intervention_until_chunk_end: true
+    collect_intervention_until_release: false
+    pad_interrupted_chunks: true
+    intervention_max_steps: 960
+    force_disable_teleop_on_chunk_end: true
+    force_disable_teleop_on_terminal: true
+    force_disable_teleop_on_timeout: true
+    debug_intervention_chunks: true
+    auto_reset: True
+    ignore_terminations: False
+    override_cfg:
+      is_dummy: false
+      joint_action_mode: absolute
+      enable_human_intervention: true
+      wait_user_ready_after_reset: true
+      reset_ready_key: b
+      reset_ready_timeout_sec: null
+      post_reset_settle_sec: 0.5
+      camera_names:
+        - cam_high
+        - cam_left_wrist
+        - cam_right_wrist
+      img_topics:
+        - /camera_f/color/image_raw
+        - /camera_l/color/image_raw
+        - /camera_r/color/image_raw
+      obs_img_resolution: [480, 640]
+
+  eval:
+    total_num_envs: 1
+    auto_reset: False
+    ignore_terminations: False
+    max_episode_steps: 960
+    reward_coef: ${algorithm.reward_coef}
+    max_steps_per_rollout_epoch: 12
+    group_size: 1
+    use_fixed_reset_state_ids: False
+    override_cfg:
+      is_dummy: true
+      joint_action_mode: absolute
+      enable_human_intervention: false
+      camera_names:
+        - cam_high
+        - cam_left_wrist
+        - cam_right_wrist
+      img_topics:
+        - /camera_f/color/image_raw
+        - /camera_l/color/image_raw
+        - /camera_r/color/image_raw
+      obs_img_resolution: [480, 640]
+    video_cfg:
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+  collect_transitions: True
+  collect_prev_infos: False
+  model:
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 4
+  global_batch_size: 64
+  seed: 1234
+  enable_offload: False
+  recv_queue_maxsize: 8
+  recv_drain_max_trajectories: 32
+  sync_weight_no_wait: false
+  async_skip_sleep_s: 0.2
+  async_skip_log_interval_s: 10.0
+  critic_optim:
+    lr: 3.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 200
+    lr_warmup_steps: 0
+    lr_scheduler: constant
+    num_cycles: 0.5
+    min_lr: 2.5e-06
+
+  model:
+    model_path: "/home/ubuntu/users/angen.ye/gwp/checkpoints/checkpoint_epoch_72_step_60000/transformer"
+    num_action_chunks: 12
+    action_dim: 14
+    precision: bf16
+    giga_world_policy:
+      wa_root: "/home/ubuntu/users/angen.ye/gwp/wan-casual-cj"
+      base_model_dir: "/home/ubuntu/users/angen.ye/gwp/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers"
+      norm_json: "/home/ubuntu/users/angen.ye/gwp/norm_stats_delta.json"
+      diffusers_src: null
+      robotype: "aloha"
+      actor_robot_state_mode: normalized
+      keep_raw_robot_state: true
+      num_inference_steps: 10
+      guidance_scale: 0.0
+      num_frames: 5
+      single_view_width: 256
+      single_view_height: 192
+      prompt: null
+      prompt_embeds_path: "/home/ubuntu/users/angen.ye/gwp/T5/episode_000000.pt"
+      prompt_embeds_max_length: 64
+      use_safetensors: False
+      use_rl_head_for_rollout: false
+      visual_feature_dim: 2048
+      bc_coef: 50
+      ref_action_dropout_p: 0
+      target_tau: 0.005
+      enable_latent_debug: False
+      latent_debug_dir: "${runner.logger.log_path}/latent_debug"
+      actor_output_mode: "learned"
+      visual_input_mode: "normal"
+      robot_state_input_mode: "normal"
+      ref_action_input_mode: "normal"
+      wa_num_action_chunks: 48
+
+  optim:
+    lr: 2.5e-5
+    value_lr: 1.55e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1e-10
+    clip_grad: 1.0
+    total_training_steps: 200
+    lr_warmup_steps: 0
+    lr_scheduler: "constant"
+    num_cycles: 0.5
+    min_lr: 2.5e-6
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: true
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

@@ -380,8 +380,11 @@ class TrajectoryReplayBuffer:
                 "trajectory_counter": self._trajectory_counter,
                 "seed": self.seed,
             }
-            with open(self._get_metadata_path(save_path), "w") as f:
+            metadata_path = self._get_metadata_path(save_path)
+            tmp_path = f"{metadata_path}.tmp"
+            with open(tmp_path, "w") as f:
                 json.dump(metadata, f)
+            os.replace(tmp_path, metadata_path)
 
     def _save_trajectory_index(self, save_path: Optional[str] = None):
         """Save trajectory index to disk."""
@@ -390,8 +393,11 @@ class TrajectoryReplayBuffer:
                 "trajectory_index": copy.deepcopy(self._trajectory_index),
                 "trajectory_id_list": list(self._trajectory_id_list),
             }
-            with open(self._get_trajectory_index_path(save_path), "w") as f:
+            index_path = self._get_trajectory_index_path(save_path)
+            tmp_path = f"{index_path}.tmp"
+            with open(tmp_path, "w") as f:
                 json.dump(index_data, f)
+            os.replace(tmp_path, index_path)
 
     def _save_trajectory(
         self,
@@ -413,11 +419,13 @@ class TrajectoryReplayBuffer:
             if value is not None:
                 trajectory_dict[field_name] = clone_dict_of_tensors(value)
 
+        tmp_path = f"{trajectory_path}.tmp"
         if self.trajectory_format == "pt":
-            torch.save(trajectory_dict, trajectory_path)
+            torch.save(trajectory_dict, tmp_path)
         else:
-            with open(trajectory_path, "wb") as f:
+            with open(tmp_path, "wb") as f:
                 pkl.dump(trajectory_dict, f)
+        os.replace(tmp_path, trajectory_path)
 
     def _load_trajectory(self, trajectory_id: int, model_weights_id: str) -> Trajectory:
         """Load a trajectory from disk and reconstruct Trajectory object."""

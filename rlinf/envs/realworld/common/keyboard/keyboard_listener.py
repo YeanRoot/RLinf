@@ -37,6 +37,12 @@ class KeyboardListener:
         self.state_lock = threading.Lock()
         self.latest_data = {"key": None}
         self._pressed_keys: set[str] = set()
+        # One-shot event buffer.  _pressed_keys only tells us what is currently
+        # held; it loses short presses that happen between polling cycles.
+        # _pending_presses records key-down events until consume_press() drains
+        # them, which is critical for chunk-level real-robot collection where
+        # c/a may be pressed between two env.step() calls.
+        self._pending_presses: list[str] = []
         self.device = self._open_keyboard_device()
 
         self.listener = threading.Thread(
@@ -137,6 +143,11 @@ class KeyboardListener:
                     with self.state_lock:
                         self.latest_data["key"] = key
                         self._pressed_keys.add(key)
+                        # Only key-down creates a one-shot event.  Auto-repeat
+                        # (value=2) should not enqueue unlimited duplicated
+                        # success/failure events while the operator holds c/a.
+                        if event.value == 1:
+                            self._pending_presses.append(key)
                 elif event.value == 0:
                     with self.state_lock:
                         self._pressed_keys.discard(key)
@@ -146,6 +157,7 @@ class KeyboardListener:
             with self.state_lock:
                 self.latest_data["key"] = None
                 self._pressed_keys.clear()
+                self._pending_presses.clear()
             self.device.close()
 
     def _event_to_key(self, key_code: int) -> str | None:
@@ -170,11 +182,40 @@ class KeyboardListener:
     def consume_press(self, key: str) -> bool:
         """Returns True if key was pressed since last call, then clears it.
 
-        Use this instead of get_key() for toggle keys to avoid missing
-        short presses between polling cycles.
+        This uses the pending key-down event queue rather than the currently-held
+        state.  Therefore a short press that happens between two polling cycles
+        is still observed exactly once.
         """
         with self.state_lock:
-            if key in self._pressed_keys:
-                self._pressed_keys.discard(key)
-                return True
+            for i, pending_key in enumerate(self._pending_presses):
+                if pending_key == key:
+                    del self._pending_presses[i]
+                    return True
             return False
+
+    def consume_first_press(self, keys: tuple[str, ...] | list[str]) -> str | None:
+        """Consume and return the oldest pending key among ``keys``.
+
+        The order is chronological, not the order in ``keys``.  This is useful
+        for detecting whether the operator pressed a/c between chunks.
+        """
+        key_set = set(keys)
+        with self.state_lock:
+            for i, pending_key in enumerate(self._pending_presses):
+                if pending_key in key_set:
+                    del self._pending_presses[i]
+                    return pending_key
+            return None
+
+    def clear_presses(self, keys: tuple[str, ...] | list[str] | None = None) -> None:
+        """Clear queued one-shot events.
+
+        Used after an episode has been finalized so a held c/a key cannot be
+        consumed again by the next episode.
+        """
+        with self.state_lock:
+            if keys is None:
+                self._pending_presses.clear()
+            else:
+                key_set = set(keys)
+                self._pending_presses = [k for k in self._pending_presses if k not in key_set]

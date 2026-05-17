@@ -50,6 +50,7 @@ class BaseKeyboardRewardDoneWrapper(gym.Wrapper):
             info["manual_terminal"] = True
             info["manual_success"] = bool(updated_reward == 1)
             info["manual_failure"] = bool(updated_reward == 0)
+            info["manual_outcome"] = "success" if updated_reward == 1 else "failure"
             self._force_disable_teleop_if_available("keyboard_terminal")
         return observation, reward, updated_terminated, truncated, info
 

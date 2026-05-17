@@ -74,7 +74,13 @@ class RecordVideo(gym.Wrapper):
 
         self.video_cfg = video_cfg
         self.render_images: list[np.ndarray] = []
+        # A lightweight companion video containing only observations used for
+        # policy/WA inference.  For chunked rollout this is the initial reset
+        # observation and the last observation of every executed chunk, i.e. the
+        # observation that will be sent to the next rollout call.
+        self.inference_images: list[np.ndarray] = []
         self.video_cnt = 0
+        self.inference_video_cnt = 0
         self._num_envs = getattr(env, "num_envs", 1)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._save_futures: list[Future] = []
@@ -220,8 +226,50 @@ class RecordVideo(gym.Wrapper):
         return np.array(value)
 
     def _get_image_from_dict(self, obs: dict) -> Optional[Any]:
-        """Pick the best image field from an observation dict."""
-        for key in ("main_images", "images", "rgb", "full_image", "main_image"):
+        """Pick/build the best video image field from an observation dict.
+
+        Real-world GigaWA observations carry one main camera plus two wrist
+        cameras.  For debugging, it is much more useful to save the same
+        multi-view image that the WA policy sees, so when ``wrist_images`` is
+        available we concatenate
+
+            [main | left_wrist | right_wrist]
+
+        along the width dimension for every vector-env element.  If wrist views
+        are not present, fall back to the legacy single-image keys.
+        """
+        if obs.get("main_images", None) is not None:
+            main = self._to_numpy(obs["main_images"])
+            if main.ndim == 3:
+                main_b = main[None]
+            elif main.ndim == 4:
+                main_b = main
+            else:
+                main_b = None
+
+            wrist = obs.get("wrist_images", None)
+            if main_b is not None and wrist is not None:
+                wrist_np = self._to_numpy(wrist)
+                # Expected layouts: [B, V, H, W, C] for real-world envs, or
+                # [V, H, W, C] for a single unbatched observation.
+                if wrist_np.ndim == 4:
+                    wrist_np = wrist_np[None]
+                if wrist_np.ndim == 5 and wrist_np.shape[0] == main_b.shape[0]:
+                    per_env = []
+                    for env_id in range(main_b.shape[0]):
+                        views = [main_b[env_id]]
+                        views.extend([wrist_np[env_id, view_id] for view_id in range(wrist_np.shape[1])])
+                        try:
+                            per_env.append(np.concatenate(views, axis=1))
+                        except Exception:
+                            # If resolutions unexpectedly differ, keep the main
+                            # view rather than failing video recording.
+                            per_env.append(main_b[env_id])
+                    merged = np.stack(per_env, axis=0)
+                    return merged if main.ndim == 4 else merged[0]
+            return obs["main_images"]
+
+        for key in ("images", "rgb", "full_image", "main_image"):
             if key in obs and obs[key] is not None:
                 return obs[key]
         return None
@@ -414,27 +462,34 @@ class RecordVideo(gym.Wrapper):
         rewards: Optional[Any],
         terminations: Optional[Any],
         time_idx: Optional[int] = None,
+        *,
+        inference_frame: bool = False,
+        inference_only: bool = False,
     ) -> None:
         """Overlay info (optional) and append a tiled frame."""
         if not images:
             return
         if self.video_cfg.get("info_on_video", True):
-            images = [
-                put_info_on_image(
-                    img,
-                    self._merge_overlay_info(
-                        self._build_info_item(infos, rewards, terminations, env_id, time_idx),
-                        env_id,
-                    ),
+            overlaid_images = []
+            for env_id, img in enumerate(images):
+                info = self._merge_overlay_info(
+                    self._build_info_item(infos, rewards, terminations, env_id, time_idx),
+                    env_id,
                 )
-                for env_id, img in enumerate(images)
-            ]
+                if inference_frame:
+                    info["INFER_FRAME"] = 1
+                overlaid_images.append(put_info_on_image(img, info))
+            images = overlaid_images
         if len(images) > 1:
             nrows = int(np.sqrt(len(images)))
             full_image = tile_images(images, nrows=nrows)
-            self.render_images.append(full_image)
         else:
-            self.render_images.append(images[0])
+            full_image = images[0]
+
+        if inference_frame and self.video_cfg.get("save_inference_video", False):
+            self.inference_images.append(full_image)
+        if not inference_only:
+            self.render_images.append(full_image)
 
     def add_new_frames(
         self,
@@ -442,6 +497,9 @@ class RecordVideo(gym.Wrapper):
         infos: Optional[Any] = None,
         rewards: Optional[Any] = None,
         terminations: Optional[Any] = None,
+        *,
+        inference_frame_indices: Optional[set[int]] = None,
+        inference_only: bool = False,
     ):
         """Extract frames from obs and append to the buffer."""
         frames = self._extract_frame_batches(obs)
@@ -452,20 +510,38 @@ class RecordVideo(gym.Wrapper):
             )
             return
 
+        inference_frame_indices = inference_frame_indices or set()
         if isinstance(infos, (list, tuple)):
             for time_idx, images in enumerate(frames):
                 step_info = infos[time_idx] if len(infos) > time_idx else None
-                self._append_frame(images, step_info, rewards, terminations, time_idx)
+                self._append_frame(
+                    images,
+                    step_info,
+                    rewards,
+                    terminations,
+                    time_idx,
+                    inference_frame=time_idx in inference_frame_indices,
+                    inference_only=inference_only,
+                )
             return
 
         for time_idx, images in enumerate(frames):
-            self._append_frame(images, infos, rewards, terminations, time_idx)
+            self._append_frame(
+                images,
+                infos,
+                rewards,
+                terminations,
+                time_idx,
+                inference_frame=time_idx in inference_frame_indices,
+                inference_only=inference_only,
+            )
 
     def reset(self, *args, **kwargs):
         """Reset env and record the initial frame."""
         obs, info = self.env.reset(*args, **kwargs)
         self._start_new_episode()
-        self.add_new_frames(obs, info)
+        # The reset observation is the first policy/WA inference observation.
+        self.add_new_frames(obs, info, inference_frame_indices={0})
         return obs, info
 
     def step(self, action):
@@ -512,31 +588,54 @@ class RecordVideo(gym.Wrapper):
                     if isinstance(infos_list, (list, tuple))
                     else infos_list
                 )
+                # The last observation before reset is the terminal frame; the
+                # reset observation is the first inference frame for the next
+                # episode.
                 self.add_new_frames(obs_main, infos_main, rewards, terminations)
                 self._start_new_episode(done_mask)
-                self.add_new_frames(reset_obs, None)
+                self.add_new_frames(reset_obs, None, inference_frame_indices={0})
             else:
-                self.add_new_frames(obs_list, infos_list, rewards, terminations)
+                inference_indices = set()
+                if self.video_cfg.get("mark_inference_frames", True) and isinstance(obs_list, (list, tuple)) and len(obs_list) > 0:
+                    # The last observation of a chunk is the one that will be
+                    # sent to rollout for the next chunk. Mark it in the full
+                    # video and also mirror it to the inference-only video.
+                    inference_indices.add(len(obs_list) - 1)
+                self.add_new_frames(
+                    obs_list,
+                    infos_list,
+                    rewards,
+                    terminations,
+                    inference_frame_indices=inference_indices,
+                )
                 self._advance_chunk_indices(done_mask)
         return result
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
-        """Write buffered frames to an MP4 file (async)."""
-        if not self.render_images:
-            return
-
+        """Write buffered frames to MP4 files (async)."""
         output_dir = os.path.join(
             self.video_cfg.video_base_dir, f"seed_{self.env.seed}"
         )
         if video_sub_dir is not None:
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
-
         os.makedirs(output_dir, exist_ok=True)
-        mp4_path = os.path.join(output_dir, f"{self.video_cnt}.mp4")
-        frames = list(self.render_images)
-        self.render_images = []
-        self.video_cnt += 1
-        self._submit_save(frames, mp4_path)
+
+        if self.render_images:
+            mp4_path = os.path.join(output_dir, f"{self.video_cnt}.mp4")
+            frames = list(self.render_images)
+            self.render_images = []
+            self.video_cnt += 1
+            self._submit_save(frames, mp4_path)
+
+        if self.video_cfg.get("save_inference_video", False) and self.inference_images:
+            subdir = str(self.video_cfg.get("inference_video_subdir", "inference_frames"))
+            infer_dir = os.path.join(output_dir, subdir)
+            os.makedirs(infer_dir, exist_ok=True)
+            infer_path = os.path.join(infer_dir, f"{self.inference_video_cnt}.mp4")
+            infer_frames = list(self.inference_images)
+            self.inference_images = []
+            self.inference_video_cnt += 1
+            self._submit_save(infer_frames, infer_path)
 
     def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> None:
         """Submit a background job to save the video."""
