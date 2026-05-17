@@ -102,7 +102,27 @@ algorithm:
   target_update_freq: 1
   target_policy_noise: 0.0
   target_noise_clip: 0.0
-  bc_coef: 50
+  # AWRC actor objective: critic only provides per-sample imitation weights.
+  # Keep this small; the old bc_coef=50 made actor updates dominated by plain BC.
+  bc_coef: 1.0
+  actor_bc_target: batch_action
+  use_action_valid_mask: true
+  awrc:
+    enable: true
+    coef: 1.0
+    temperature: 0.3
+    min_weight: 0.05
+    max_weight: 10.0
+    normalize_weight: true
+    adv_clip: 20.0
+    clamp_q_to_upper_bound: true
+  adaptive_bc:
+    enable: false
+    min_coef: 2.0
+    max_coef: 50.0
+    q_gap_target: 0.3
+    q_gap_ema_beta: 0.98
+    min_valid_updates: 5
   ref_action_dropout_p: 0
   warmup_steps: 0
   train_actor_steps: 0
@@ -226,7 +246,7 @@ actor:
       use_safetensors: False
       use_rl_head_for_rollout: true
       visual_feature_dim: 2048
-      bc_coef: 50
+      bc_coef: 1.0
       ref_action_dropout_p: 0
       target_tau: 0.005
       enable_latent_debug: False

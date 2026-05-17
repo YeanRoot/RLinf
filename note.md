@@ -56,7 +56,7 @@ python train_embodied_agent_gigawa_offline_rl_fast.py \
   --config-path ./config \
   --config-name offline_rl_pretrain
 
-tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_cup_514_test/tensorboard\
+tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_cup_515_awrc/tensorboard\
   --host 0.0.0.0 \
   --port 6006
 

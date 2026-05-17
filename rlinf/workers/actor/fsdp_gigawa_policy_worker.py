@@ -343,6 +343,23 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         # applied once per chunk, not once per primitive control step.
         self.discount = float(self.cfg.algorithm.gamma)
         self.bc_coef = float(self.cfg.algorithm.get("bc_coef", 1.0))
+        self.actor_bc_target = str(self.cfg.algorithm.get("actor_bc_target", "batch_action")).lower()
+        self.use_action_valid_mask = bool(self.cfg.algorithm.get("use_action_valid_mask", True))
+
+        awrc_cfg = self.cfg.algorithm.get("awrc", None) or {}
+        self.awrc_enable = bool(awrc_cfg.get("enable", False))
+        self.awrc_coef = float(awrc_cfg.get("coef", 1.0))
+        self.awrc_temperature = max(1e-6, float(awrc_cfg.get("temperature", 0.3)))
+        self.awrc_min_weight = float(awrc_cfg.get("min_weight", 0.05))
+        self.awrc_max_weight = float(awrc_cfg.get("max_weight", 10.0))
+        if self.awrc_max_weight < self.awrc_min_weight:
+            self.awrc_max_weight = self.awrc_min_weight
+        self.awrc_normalize_weight = bool(awrc_cfg.get("normalize_weight", True))
+        self.awrc_adv_clip = float(awrc_cfg.get("adv_clip", 20.0))
+        self.awrc_clamp_q_to_upper_bound = bool(
+            awrc_cfg.get("clamp_q_to_upper_bound", True)
+        )
+
         adaptive_bc_cfg = self.cfg.algorithm.get("adaptive_bc", None) or {}
         self.adaptive_bc_enable = bool(adaptive_bc_cfg.get("enable", False))
         self.adaptive_bc_min_coef = float(adaptive_bc_cfg.get("min_coef", 2.0))
@@ -2867,6 +2884,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         actor_loss = q_weight * q_term + effective_bc_coef * bc_loss + hard_penalty
         metrics = {
+            "loss_mode": 0.0,  # 0=TD3+BC, 1=AWRC, 2=BC-only
             "bc_coef_effective": effective_bc_coef,
             "q_upper_bound_enabled": float(self.enable_critic_q_upper_bound),
             "q_upper_bound": float(self.critic_q_upper_bound),
@@ -2889,6 +2907,194 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "q_weight": q_weight,
         }
         metrics.update(adaptive_bc_metrics)
+        return actor_loss, metrics
+
+    def _get_actor_bc_target(
+        self,
+        batch: dict[str, torch.Tensor],
+        ref_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, str]:
+        """Return the action target used by BC/AWRC actor regression.
+
+        For real-world online RL, the executed action stored in ``batch["actions"]``
+        is the safer default target because it can contain human-corrected takeover
+        actions.  ``curr_obs.ref_action`` is still kept as actor/critic condition,
+        but it should not dominate the actor update unless explicitly requested.
+        """
+        target_mode = self.actor_bc_target
+        if target_mode in {"batch_action", "batch_actions", "action", "actions", "executed_action"}:
+            if "actions" in batch and isinstance(batch["actions"], torch.Tensor):
+                return (
+                    self._reshape_runtime_action_tensor(
+                        batch["actions"].to(self.device, dtype=self.torch_dtype),
+                        tensor_name="batch.actions",
+                    ),
+                    "batch_action",
+                )
+            # Keep old buffers runnable if they somehow do not carry actions.
+            return ref_action, "ref_action_fallback"
+
+        if target_mode in {"ref_action", "wa_ref_action", "reference_action"}:
+            return ref_action, "ref_action"
+
+        raise ValueError(
+            f"Unsupported algorithm.actor_bc_target={self.actor_bc_target!r}. "
+            "Use 'batch_action' or 'ref_action'."
+        )
+
+    def _get_action_valid_mask(
+        self,
+        batch: dict[str, torch.Tensor],
+        target_action: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self.use_action_valid_mask:
+            return None
+
+        mask = None
+        for key in ("action_valid_mask", "valid_action_mask", "valid_mask"):
+            value = batch.get(key, None)
+            if isinstance(value, torch.Tensor):
+                mask = value
+                break
+
+        forward_inputs = batch.get("forward_inputs", {})
+        if mask is None and isinstance(forward_inputs, dict):
+            for key in ("action_valid_mask", "valid_action_mask", "valid_mask"):
+                value = forward_inputs.get(key, None)
+                if isinstance(value, torch.Tensor):
+                    mask = value
+                    break
+
+        if mask is None:
+            return None
+
+        mask = mask.to(device=target_action.device, dtype=target_action.dtype)
+        if mask.ndim == 1:
+            mask = mask[:, None]
+        if mask.ndim == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
+        if mask.ndim > 2:
+            mask = mask.reshape(mask.shape[0], -1)
+
+        expected_chunk = int(target_action.shape[1])
+        if mask.shape[1] > expected_chunk:
+            mask = mask[:, :expected_chunk]
+        elif mask.shape[1] < expected_chunk:
+            pad_value = mask[:, -1:] if mask.shape[1] > 0 else torch.ones(
+                mask.shape[0], 1, device=mask.device, dtype=mask.dtype
+            )
+            mask = torch.cat(
+                [mask, pad_value.expand(mask.shape[0], expected_chunk - mask.shape[1])],
+                dim=1,
+            )
+        return mask.contiguous()
+
+    def _compute_per_sample_bc_loss(
+        self,
+        pred_action: torch.Tensor,
+        target_action: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        diff = (pred_action.float() - target_action.float()) ** 2
+        if valid_mask is None:
+            return diff.mean(dim=(1, 2))
+
+        mask = valid_mask.to(device=diff.device, dtype=diff.dtype)
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(-1)
+        weighted_diff = diff * mask
+        denom = mask.sum(dim=(1, 2)).clamp_min(1.0) * diff.shape[-1]
+        return weighted_diff.sum(dim=(1, 2)) / denom
+
+    def _compose_awrc_actor_loss(
+        self,
+        pred_action: torch.Tensor,
+        target_action: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+        q_data: torch.Tensor,
+        q_pi: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        q_data_for_weight = q_data.detach().float().view(-1)
+        q_pi_for_weight = q_pi.detach().float().view(-1)
+
+        if self.enable_critic_q_upper_bound and self.awrc_clamp_q_to_upper_bound:
+            q_data_for_weight = torch.clamp(q_data_for_weight, max=self.critic_q_upper_bound)
+            q_pi_for_weight = torch.clamp(q_pi_for_weight, max=self.critic_q_upper_bound)
+
+        advantage = q_data_for_weight - q_pi_for_weight
+        scaled_advantage = advantage / self.awrc_temperature
+        if self.awrc_adv_clip > 0:
+            scaled_advantage = torch.clamp(
+                scaled_advantage,
+                min=-float(self.awrc_adv_clip),
+                max=float(self.awrc_adv_clip),
+            )
+
+        weights = torch.exp(scaled_advantage)
+        weights = torch.clamp(
+            weights,
+            min=float(self.awrc_min_weight),
+            max=float(self.awrc_max_weight),
+        )
+        raw_weight_mean = weights.mean().detach()
+        if self.awrc_normalize_weight:
+            weights = weights / raw_weight_mean.clamp_min(1e-6)
+            weights = torch.clamp(
+                weights,
+                min=float(self.awrc_min_weight),
+                max=float(self.awrc_max_weight),
+            )
+
+        per_sample_bc = self._compute_per_sample_bc_loss(
+            pred_action=pred_action,
+            target_action=target_action,
+            valid_mask=valid_mask,
+        )
+        weighted_bc_loss = (weights.to(per_sample_bc.dtype) * per_sample_bc).mean()
+        actor_loss = float(self.awrc_coef) * weighted_bc_loss
+
+        metrics = {
+            "loss_mode": 1.0,  # 0=TD3+BC, 1=AWRC, 2=BC-only
+            "awrc_enabled": 1.0,
+            "awrc_coef": float(self.awrc_coef),
+            "awrc_temperature": float(self.awrc_temperature),
+            "awrc_min_weight": float(self.awrc_min_weight),
+            "awrc_max_weight": float(self.awrc_max_weight),
+            "awrc_normalize_weight": float(self.awrc_normalize_weight),
+            "awrc_adv_mean": float(advantage.mean().detach().item()),
+            "awrc_adv_max": float(advantage.max().detach().item()),
+            "awrc_adv_min": float(advantage.min().detach().item()),
+            "awrc_scaled_adv_mean": float(scaled_advantage.mean().detach().item()),
+            "awrc_weight_mean": float(weights.mean().detach().item()),
+            "awrc_weight_max": float(weights.max().detach().item()),
+            "awrc_weight_min": float(weights.min().detach().item()),
+            "awrc_raw_weight_mean": float(raw_weight_mean.item()),
+            "awrc_weighted_bc_loss": float(weighted_bc_loss.detach().item()),
+            "awrc_unweighted_bc_loss": float(per_sample_bc.mean().detach().item()),
+            "awrc_q_data_mean": float(q_data_for_weight.mean().detach().item()),
+            "awrc_q_pi_mean": float(q_pi_for_weight.mean().detach().item()),
+            "bc_coef_effective": float(self.awrc_coef),
+            "q_upper_bound_enabled": float(self.enable_critic_q_upper_bound),
+            "q_upper_bound": float(self.critic_q_upper_bound),
+            "q_loss_clamped": float(self.enable_critic_q_upper_bound and self.awrc_clamp_q_to_upper_bound),
+            "q_pi_used_for_loss": 0.0,
+            "q_weight": 0.0,
+            "adaptive_bc_enabled": 0.0,
+            "adaptive_bc_separation_score": 0.0,
+            "adaptive_bc_q_gap_ema": float(self.adaptive_bc_q_gap_ema),
+            "adaptive_bc_q_gap_target": float(self.adaptive_bc_q_gap_target),
+            "adaptive_bc_valid_updates": float(self.adaptive_bc_q_gap_valid_updates),
+            "bc_guard_mode": float(
+                0 if self.actor_bc_guard_mode == "none"
+                else 1 if self.actor_bc_guard_mode == "weighted"
+                else 2 if self.actor_bc_guard_mode == "hard_penalty"
+                else 3 if self.actor_bc_guard_mode == "trust_region"
+                else -1
+            ),
+            "bc_guard_threshold": float(self.actor_bc_guard_threshold),
+            "bc_guard_penalty": 0.0,
+            "bc_guard_active": 0.0,
+        }
         return actor_loss, metrics
 
     @torch.no_grad()
@@ -2914,7 +3120,9 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 ref_action_dropout_p=self.actor_bc_trust_region_eval_dropout_p,
                 use_target=False,
             )
-            bc_loss = policy.compute_bc_loss(pi, ref_action)
+            bc_target, _ = self._get_actor_bc_target(batch, ref_action)
+            valid_mask = self._get_action_valid_mask(batch, bc_target)
+            bc_loss = policy.compute_bc_loss(pi, bc_target, valid_mask=valid_mask)
             losses.append(float(bc_loss.item()))
         if was_training:
             self.model.train()
@@ -2952,10 +3160,21 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             use_target=False,
         )
 
-        bc_loss = policy.compute_bc_loss(pi, ref_action)
+        bc_target, bc_target_mode = self._get_actor_bc_target(batch, ref_action)
+        valid_mask = self._get_action_valid_mask(batch, bc_target)
+        bc_loss = policy.compute_bc_loss(pi, bc_target, valid_mask=valid_mask)
+        ref_bc_loss = policy.compute_bc_loss(pi, ref_action)
 
         metrics = {
             "bc_loss": bc_loss.item(),
+            "bc_loss_to_batch_action": bc_loss.item(),
+            "bc_loss_to_ref_action": ref_bc_loss.item(),
+            "bc_target_mode": float(
+                0 if bc_target_mode == "ref_action"
+                else 1 if bc_target_mode == "batch_action"
+                else 2
+            ),
+            "use_action_valid_mask": float(valid_mask is not None),
             "ref_action_dropout_p": self.ref_action_dropout_p,
             "training_stage": float(
                 0 if self.stage_actor_bc_only else 1 if self.stage_freeze_actor else 2
@@ -2981,11 +3200,63 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         if self.stage_actor_bc_only:
             actor_loss, guard_metrics = self._compose_actor_loss(q_pi=None, bc_loss=bc_loss)
+            guard_metrics["loss_mode"] = 2.0
             metrics.update(guard_metrics)
             metrics["q_pi"] = 0.0
+            metrics["q_data"] = 0.0
+            metrics["q_pi_clamped"] = 0.0
             return actor_loss, metrics, debug_bundle
 
         rl_state = actor_aux["rl_state"]
+
+        if self.awrc_enable:
+            # AWRC uses the critic only to compute a detached per-sample weight:
+            # w = exp((Q(s, a_data) - Q(s, pi)) / temperature).
+            # The actor gradient therefore comes from weighted BC toward the
+            # executed/corrected action, not from a noisy direct -Q(s, pi) term.
+            with torch.no_grad():
+                q1_pi, q2_pi = self.model(
+                    forward_type=ForwardType.DEFAULT,
+                    mode="critic",
+                    rl_state=rl_state,
+                    action=pi.detach(),
+                    use_target=False,
+                    critic_visual_tokens=actor_aux.get("critic_visual_tokens", None),
+                    critic_robot_state=actor_aux.get("critic_robot_state", None),
+                    critic_ref_action=actor_aux.get("critic_ref_action", None),
+                )
+                q_pi = torch.minimum(q1_pi, q2_pi)
+
+                q1_data, q2_data = self.model(
+                    forward_type=ForwardType.DEFAULT,
+                    mode="critic",
+                    rl_state=rl_state,
+                    action=bc_target,
+                    use_target=False,
+                    critic_visual_tokens=actor_aux.get("critic_visual_tokens", None),
+                    critic_robot_state=actor_aux.get("critic_robot_state", None),
+                    critic_ref_action=actor_aux.get("critic_ref_action", None),
+                )
+                q_data = torch.minimum(q1_data, q2_data)
+
+            actor_loss, awrc_metrics = self._compose_awrc_actor_loss(
+                pred_action=pi,
+                target_action=bc_target,
+                valid_mask=valid_mask,
+                q_data=q_data,
+                q_pi=q_pi,
+            )
+            metrics.update(awrc_metrics)
+            metrics["q_pi"] = q_pi.mean().item()
+            metrics["q_data"] = q_data.mean().item()
+            if self.enable_critic_q_upper_bound and self.awrc_clamp_q_to_upper_bound:
+                metrics["q_pi_clamped"] = torch.clamp(q_pi, max=self.critic_q_upper_bound).mean().item()
+                metrics["q_data_clamped"] = torch.clamp(q_data, max=self.critic_q_upper_bound).mean().item()
+            else:
+                metrics["q_pi_clamped"] = q_pi.mean().item()
+                metrics["q_data_clamped"] = q_data.mean().item()
+            return actor_loss, metrics, debug_bundle
+
         q1_pi, q2_pi = self.model(
             forward_type=ForwardType.DEFAULT,
             mode="critic",
@@ -3001,6 +3272,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         actor_loss, guard_metrics = self._compose_actor_loss(q_pi=q_pi, bc_loss=bc_loss)
         metrics.update(guard_metrics)
         metrics["q_pi"] = q_pi.mean().item()
+        metrics["q_data"] = 0.0
         if self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound:
             metrics["q_pi_clamped"] = torch.clamp(q_pi, max=self.critic_q_upper_bound).mean().item()
         else:
