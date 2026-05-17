@@ -1,4 +1,4 @@
-
+cd /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment
 python collect_embodied_agent_gigawa.py \
   --config-path ./config \
   --config-name collect_piper_gigawa_realworld
@@ -99,8 +99,8 @@ docker exec -it piper /bin/bash
 source switch_env gigaworld
 
 容器外设置波特率
- cd ~/cobot_magic/Piper_ros_private-ros-noetic-interrupt/
- bash can_config-4arms.sh
+cd ~/cobot_magic/Piper_ros_private-ros-noetic-interrupt/
+bash can_config-4arms.sh
 
 export DISPLAY=:1
 xhost +local:
@@ -154,3 +154,4 @@ fuser -k -9 /dev/nvidia*
 
 清理ros节点
 rosnode kill -a
+rostopic list 

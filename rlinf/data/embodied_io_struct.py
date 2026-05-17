@@ -62,6 +62,7 @@ class EnvOutput:
     policy_actions_exec: Optional[torch.Tensor] = None  # original policy env-space abs action, [B, C*A]
     policy_actions_model: Optional[torch.Tensor] = None  # original policy model-space action, [B, C*A]
     action_valid_mask: Optional[torch.Tensor] = None  # [B, C], false for padding after chunk interruption
+    action_source: Optional[torch.Tensor] = None  # [B, C], 0 policy / 1 human / 2 replan / 3 padding
     raw_states_before_action: Optional[torch.Tensor] = None  # [B, C, state_dim]
 
     # Optional list of per-substep observations returned by env.chunk_step().
@@ -108,6 +109,7 @@ class EnvOutput:
             "policy_actions_exec",
             "policy_actions_model",
             "action_valid_mask",
+            "action_source",
             "raw_states_before_action",
         ):
             _value = getattr(self, _field_name)
@@ -270,6 +272,9 @@ class EnvOutput:
         merged_action_valid_mask = _merge_optional_tensor_field(
             "action_valid_mask", allow_partial_none=True, fill_value=False
         )
+        merged_action_source = _merge_optional_tensor_field(
+            "action_source", allow_partial_none=True, fill_value=0
+        )
         merged_raw_states_before_action = _merge_optional_tensor_field(
             "raw_states_before_action", allow_partial_none=True, fill_value=0.0
         )
@@ -288,6 +293,7 @@ class EnvOutput:
             policy_actions_exec=merged_policy_actions_exec,
             policy_actions_model=merged_policy_actions_model,
             action_valid_mask=merged_action_valid_mask,
+            action_source=merged_action_source,
             raw_states_before_action=merged_raw_states_before_action,
         ).to_dict()
 
@@ -311,6 +317,7 @@ class EnvOutput:
         env_output_dict["policy_actions_exec"] = self.policy_actions_exec
         env_output_dict["policy_actions_model"] = self.policy_actions_model
         env_output_dict["action_valid_mask"] = self.action_valid_mask
+        env_output_dict["action_source"] = self.action_source
         env_output_dict["raw_states_before_action"] = self.raw_states_before_action
 
         return env_output_dict

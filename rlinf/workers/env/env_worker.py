@@ -179,13 +179,11 @@ class EnvWorker(Worker):
         raw_states = raw_states_before_action.float().to(device=device)
         if raw_states.dim() == 2:
             raw_states = raw_states[:, None, :].expand(batch, chunk, raw_states.shape[-1])
-        elif raw_states.dim() == 3 and bool(
-            self.cfg.env.train.get("latch_intervention_until_chunk_end", False)
-        ):
+        elif raw_states.dim() == 3:
             # GigaWA chunk targets are defined relative to the observation/state
-            # that generated the whole chunk.  Therefore human suffix actions in a
-            # mixed chunk must be converted using the chunk-start raw qpos, not the
-            # per-step qpos.
+            # that generated the whole chunk. Therefore human-prefix and
+            # release-replan suffix actions in a mixed chunk must both be converted
+            # using the chunk-start raw qpos, not the per-step qpos.
             raw_states = raw_states[:, :1, :].expand(batch, chunk, raw_states.shape[-1])
         if raw_states.shape[-1] < action_dim:
             pad = torch.zeros(*raw_states.shape[:-1], action_dim - raw_states.shape[-1], device=device)
@@ -241,18 +239,31 @@ class EnvWorker(Worker):
             if valid_mask.dim() == 3:
                 valid_mask = valid_mask.any(dim=-1)
 
+        action_source = getattr(env_output, "action_source", None)
+        if action_source is not None:
+            action_source = action_source.to(device=device, dtype=torch.long)
+            if action_source.dim() == 1:
+                action_source = action_source[:, None]
+            if action_source.dim() == 3:
+                action_source = action_source[..., 0]
+
         executed_model = policy_model.clone()
         if env_output.raw_states_before_action is not None and executed_exec is not None:
-            human_model = self._exec_action_to_model_action(
+            exec_model = self._exec_action_to_model_action(
                 executed_exec.to(device=device),
                 env_output.raw_states_before_action.to(device=device),
             )
             action_dim = int(self.cfg.actor.model.get("action_dim", 14))
             chunk = policy_model.shape[-1] // action_dim
-            flags_view = (flags & valid_mask).view(policy_model.shape[0], chunk, 1)
+            replace_mask = flags & valid_mask
+            if action_source is not None:
+                # Human steps and release-time replan suffix steps must replace
+                # the original stale chunk actions. Padding remains masked out.
+                replace_mask = valid_mask & (replace_mask | (action_source == 2))
+            replace_view = replace_mask.view(policy_model.shape[0], chunk, 1)
             executed_model_view = executed_model.view(policy_model.shape[0], chunk, action_dim)
-            human_model_view = human_model.view(policy_model.shape[0], chunk, action_dim)
-            executed_model_view = torch.where(flags_view, human_model_view, executed_model_view)
+            exec_model_view = exec_model.view(policy_model.shape[0], chunk, action_dim)
+            executed_model_view = torch.where(replace_view, exec_model_view, executed_model_view)
             executed_model = executed_model_view.reshape(policy_model.shape[0], -1).contiguous()
 
         return executed_model.cpu().contiguous(), (
@@ -542,7 +553,11 @@ class EnvWorker(Worker):
 
     @Worker.timer("env_interact_step")
     def env_interact_step(
-        self, chunk_actions: torch.Tensor, stage_id: int
+        self,
+        chunk_actions: torch.Tensor,
+        stage_id: int,
+        input_channel: Channel | None = None,
+        output_channel: Channel | None = None,
     ) -> tuple[EnvOutput, dict[str, Any]]:
         """
         This function is used to interact with the environment.
@@ -558,8 +573,35 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
+        def _request_replan_suffix(release_obs, remaining_steps: int, release_step: int):
+            if input_channel is None or output_channel is None:
+                raise RuntimeError(
+                    "Intervention release requires input/output channels for replan inference, "
+                    "but env_interact_step was called without them."
+                )
+            release_batch = EnvOutput(obs=release_obs).to_dict()
+            self.send_replan_env_batch(
+                output_channel,
+                {"obs": release_batch["obs"], "final_obs": None},
+                mode="train",
+            )
+            replan_rollout = self.recv_replan_rollout_results(input_channel, mode="train")
+            replan_actions = prepare_actions(
+                raw_chunk_actions=replan_rollout.actions,
+                env_type=self.cfg.env.train.env_type,
+                model_type=self.cfg.actor.model.model_type,
+                num_action_chunks=self.cfg.actor.model.num_action_chunks,
+                action_dim=self.cfg.actor.model.action_dim,
+                policy=self.cfg.actor.model.get("policy_setup", None),
+                wm_env_type=self.cfg.env.train.get("wm_env_type", None),
+            )
+            return replan_actions[:, :remaining_steps]
+
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
-            self.env_list[stage_id].chunk_step(chunk_actions)
+            self.env_list[stage_id].chunk_step(
+                chunk_actions,
+                replan_fn=_request_replan_suffix,
+            )
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -590,6 +632,7 @@ class EnvWorker(Worker):
         executed_actions_exec = infos.get("executed_action_abs", None)
         policy_actions_exec = infos.get("policy_action_abs", None)
         action_valid_mask = infos.get("action_valid_mask", None)
+        action_source = infos.get("action_source", None)
         raw_states_before_action = infos.get("raw_state_before_action", None)
         if self.cfg.env.train.auto_reset and chunk_dones.any():
             if "intervene_action" in infos["final_info"]:
@@ -598,6 +641,7 @@ class EnvWorker(Worker):
                 executed_actions_exec = infos["final_info"].get("executed_action_abs", executed_actions_exec)
                 policy_actions_exec = infos["final_info"].get("policy_action_abs", policy_actions_exec)
                 action_valid_mask = infos["final_info"].get("action_valid_mask", action_valid_mask)
+                action_source = infos["final_info"].get("action_source", action_source)
                 raw_states_before_action = infos["final_info"].get("raw_state_before_action", raw_states_before_action)
 
         env_output = EnvOutput(
@@ -614,6 +658,7 @@ class EnvWorker(Worker):
             executed_actions_exec=executed_actions_exec,
             policy_actions_exec=policy_actions_exec,
             action_valid_mask=action_valid_mask,
+            action_source=action_source,
             raw_states_before_action=raw_states_before_action,
             chunk_step_obs_list=obs_list if isinstance(obs_list, (list, tuple)) else None,
         )
@@ -884,6 +929,65 @@ class EnvWorker(Worker):
                 key=CommMapper.build_channel_key(self._rank, rank, extra=f"{mode}_obs"),
             )
 
+    def send_replan_env_batch(
+        self,
+        output_channel: Channel,
+        env_batch: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+    ) -> None:
+        """Send an intervention-release replan observation without consuming a normal rollout step."""
+        assert mode == "train", "release-time replan is only used during train interaction"
+        dst_ranks_and_sizes = self.dst_ranks[mode]
+        split_sizes = [size for _, size in dst_ranks_and_sizes]
+        env_batches = self.split_env_batch(env_batch, split_sizes, mode)
+        for (rank, _), env_batch_i in zip(dst_ranks_and_sizes, env_batches):
+            output_channel.put(
+                item=env_batch_i,
+                key=CommMapper.build_channel_key(
+                    self._rank, rank, extra=f"{mode}_replan_obs"
+                ),
+            )
+
+    def recv_replan_rollout_results(
+        self, input_channel: Channel, mode="train"
+    ) -> RolloutResult:
+        """Receive rollout results for an intervention-release replan request."""
+        assert mode == "train", "release-time replan is only used during train interaction"
+        src_ranks_and_sizes = self.src_ranks[mode]
+        rollout_results: list[RolloutResult] = []
+
+        def _infer_rollout_batch_size(rollout_result: RolloutResult) -> int:
+            for field_name in (
+                "actions",
+                "prev_logprobs",
+                "prev_values",
+                "bootstrap_values",
+                "versions",
+            ):
+                value = getattr(rollout_result, field_name, None)
+                if isinstance(value, torch.Tensor):
+                    return value.shape[0]
+            if rollout_result.forward_inputs:
+                first_tensor = next(iter(rollout_result.forward_inputs.values()))
+                if isinstance(first_tensor, torch.Tensor):
+                    return first_tensor.shape[0]
+            raise ValueError("Cannot infer replan rollout result batch size.")
+
+        for src_rank, expected_size in src_ranks_and_sizes:
+            rollout_result = input_channel.get(
+                key=CommMapper.build_channel_key(
+                    src_rank, self._rank, extra=f"{mode}_replan_rollout_results"
+                ),
+            )
+            actual_size = _infer_rollout_batch_size(rollout_result)
+            assert actual_size == expected_size, (
+                f"Expected replan rollout result size {expected_size} from rollout rank {src_rank}, "
+                f"got batch size {actual_size}."
+            )
+            rollout_results.append(rollout_result)
+
+        return RolloutResult.merge_rollout_results(rollout_results)
+
     def bootstrap_step(self) -> list[EnvOutput]:
         def get_zero_dones() -> torch.Tensor:
             return (
@@ -994,6 +1098,8 @@ class EnvWorker(Worker):
             forward_inputs["policy_action_model"] = rollout_result.forward_inputs["model_action"].cpu().contiguous()
         if valid_mask is not None:
             forward_inputs["action_valid_mask"] = valid_mask
+        if env_output.action_source is not None:
+            forward_inputs["action_source"] = env_output.action_source.cpu().contiguous()
         if executed_flags is not None:
             forward_inputs["intervene_flags"] = executed_flags
         if env_output.raw_states_before_action is not None:
@@ -1096,7 +1202,10 @@ class EnvWorker(Worker):
                         )
 
                     next_env_output, env_info = self.env_interact_step(
-                        rollout_result.actions, stage_id
+                        rollout_result.actions,
+                        stage_id,
+                        input_channel=input_channel,
+                        output_channel=output_channel,
                     )
                     env_batch = next_env_output.to_dict()
                     self.send_env_batch(

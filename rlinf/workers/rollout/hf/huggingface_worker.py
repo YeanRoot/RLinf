@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import copy
 import gc
 from typing import Any, Literal
@@ -365,12 +366,138 @@ class MultiStepRolloutWorker(Worker):
         gc.collect()
         self.torch_platform.empty_cache()
 
+    def _normal_obs_ready(self, input_channel: Channel, mode: str = "train") -> bool:
+        for src_rank, _ in self.src_ranks[mode]:
+            key = CommMapper.build_channel_key(src_rank, self._rank, extra=f"{mode}_obs")
+            if input_channel.empty(key=key):
+                return False
+        return True
+
+    def _available_replan_sources(
+        self, input_channel: Channel, mode: str = "train"
+    ) -> list[tuple[int, int]]:
+        ready: list[tuple[int, int]] = []
+        for src_rank, expected_size in self.src_ranks[mode]:
+            key = CommMapper.build_channel_key(
+                src_rank, self._rank, extra=f"{mode}_replan_obs"
+            )
+            if not input_channel.empty(key=key):
+                ready.append((src_rank, expected_size))
+        return ready
+
+    async def _recv_replan_env_outputs(
+        self,
+        input_channel: Channel,
+        ready_sources: list[tuple[int, int]],
+        mode: str = "train",
+    ) -> list[tuple[int, int, dict[str, Any]]]:
+        outputs: list[tuple[int, int, dict[str, Any]]] = []
+        for src_rank, expected_size in ready_sources:
+            obs_batch = await input_channel.get(
+                key=CommMapper.build_channel_key(
+                    src_rank, self._rank, extra=f"{mode}_replan_obs"
+                ),
+                async_op=True,
+            ).async_wait()
+            actual_size = self._infer_env_batch_size(obs_batch)
+            assert actual_size == expected_size, (
+                f"Expected replan env output batch size {expected_size} from env rank {src_rank}, "
+                f"got {actual_size}."
+            )
+            outputs.append((src_rank, expected_size, obs_batch))
+        return outputs
+
+    def _send_replan_rollout_result(
+        self,
+        output_channel: Channel,
+        rollout_result: RolloutResult,
+        dst_ranks_and_sizes: list[tuple[int, int]],
+        mode: str = "train",
+    ) -> None:
+        split_sizes = [size for _, size in dst_ranks_and_sizes]
+        split_rollout_results = self._split_rollout_result(rollout_result, split_sizes)
+        for (dst_rank, _), rollout_result_i in zip(
+            dst_ranks_and_sizes, split_rollout_results
+        ):
+            output_channel.put(
+                rollout_result_i,
+                key=CommMapper.build_channel_key(
+                    self._rank, dst_rank, extra=f"{mode}_replan_rollout_results"
+                ),
+                async_op=True,
+            )
+
+    async def _serve_replan_requests_until_normal_ready(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        *,
+        mode: str = "train",
+    ) -> dict[str, Any]:
+        """Serve release-time replan requests without consuming normal rollout slots.
+
+        The env worker can ask for a fresh suffix while it is still inside a
+        physical chunk. This helper waits until the next normal observation is
+        ready, but services any pending ``*_replan_obs`` first so the env never
+        deadlocks while waiting for the suffix actions.
+        """
+        assert mode == "train", "release-time replan is only used during train generation"
+        while True:
+            ready_replan_sources = self._available_replan_sources(input_channel, mode=mode)
+            if ready_replan_sources:
+                replan_items = await self._recv_replan_env_outputs(
+                    input_channel, ready_replan_sources, mode=mode
+                )
+                merged_replan_obs = self._merge_obs_batches(
+                    [obs_batch for _, _, obs_batch in replan_items]
+                )
+                actions, result = self.predict(merged_replan_obs["obs"])
+                save_flags = None
+                if result.get("expert_label_flag", False):
+                    save_flags = torch.full(
+                        (actions.shape[0], self.cfg.actor.model.num_action_chunks),
+                        True,
+                        dtype=torch.bool,
+                        device=actions.device,
+                    )
+                rollout_result = RolloutResult(
+                    actions=actions,
+                    prev_logprobs=result["prev_logprobs"]
+                    if self.collect_prev_infos
+                    else None,
+                    prev_values=result["prev_values"]
+                    if self.collect_prev_infos
+                    else None,
+                    bootstrap_values=None,
+                    save_flags=save_flags,
+                    forward_inputs=result["forward_inputs"],
+                    versions=torch.full_like(
+                        result["prev_logprobs"],
+                        float(self.version),
+                        dtype=torch.float32,
+                    ) if result.get("prev_logprobs", None) is not None else None,
+                )
+                self._send_replan_rollout_result(
+                    output_channel,
+                    rollout_result,
+                    [(src_rank, expected_size) for src_rank, expected_size, _ in replan_items],
+                    mode=mode,
+                )
+                continue
+
+            if self._normal_obs_ready(input_channel, mode=mode):
+                return await self.recv_env_output(input_channel, mode=mode)
+
+            await asyncio.sleep(0.01)
+
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
-                env_output = await self.recv_env_output(input_channel)
+                env_output = await self._serve_replan_requests_until_normal_ready(
+                    input_channel, output_channel, mode="train"
+                )
                 actions, result = self.predict(env_output["obs"])
 
                 save_flags = None
@@ -402,7 +529,9 @@ class MultiStepRolloutWorker(Worker):
                 )
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
         for _ in range(self.num_pipeline_stages):
-            env_output = await self.recv_env_output(input_channel)
+            env_output = await self._serve_replan_requests_until_normal_ready(
+                input_channel, output_channel, mode="train"
+            )
             actions, result = self.predict(env_output["obs"])
 
             rollout_result = RolloutResult(
