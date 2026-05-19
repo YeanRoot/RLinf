@@ -460,6 +460,69 @@ def _quality(traj: Trajectory, threshold: float) -> dict[str, Any]:
     }
 
 
+def _num_chunks(traj: Trajectory) -> int:
+    """Return episode length in chunk units."""
+    actions = getattr(traj, "actions", None)
+    if torch.is_tensor(actions) and actions.ndim >= 1:
+        return int(actions.shape[0])
+    rewards = getattr(traj, "rewards", None)
+    if torch.is_tensor(rewards) and rewards.ndim >= 1:
+        return int(rewards.shape[0])
+    return 0
+
+
+def _episode_filter_reason(
+    episode: Trajectory,
+    *,
+    success_threshold: float,
+    min_chunks: int,
+    min_valid_steps: int,
+) -> str | None:
+    """Return a reason string when an episode should be dropped before saving.
+
+    This guards real-robot collection against stale keyboard events leaking across
+    reset boundaries.  Such leaks can create very short fake episodes, for
+    example pressing b to start and immediately consuming a stale c/a.
+    """
+    q = _quality(episode, success_threshold)
+    num_chunks = _num_chunks(episode)
+    valid_steps = int(q.get("valid_steps", 0))
+    if int(min_chunks) > 0 and num_chunks < int(min_chunks):
+        return f"too_few_chunks:{num_chunks}<{int(min_chunks)}"
+    if int(min_valid_steps) > 0 and valid_steps < int(min_valid_steps):
+        return f"too_few_valid_steps:{valid_steps}<{int(min_valid_steps)}"
+    return None
+
+
+def _record_skipped_episode(
+    episode: Trajectory,
+    *,
+    rank_dir: Path,
+    episode_idx: int,
+    success_threshold: float,
+    reason: str,
+) -> dict[str, Any]:
+    q = _quality(episode, success_threshold)
+    metadata = dict(episode.metadata or {})
+    row = {
+        "episode_index": int(episode_idx),
+        "skipped": True,
+        "skip_reason": str(reason),
+        "num_chunks": _num_chunks(episode),
+        **metadata,
+        **q,
+    }
+    _append_jsonl(rank_dir / "skipped_trajectory_summaries.jsonl", row)
+    print(
+        f"[collect-episode][SKIP_SHORT_EPISODE] episode={episode_idx:06d} "
+        f"reason={reason} outcome={q.get('episode_outcome')} "
+        f"chunks={row.get('num_chunks')} valid_steps={q.get('valid_steps')} "
+        f"reward_sum={q.get('reward_sum'):.3f} done_any={q.get('done_any')}",
+        flush=True,
+    )
+    return row
+
+
 def _chunk_has_terminal(traj: Trajectory, threshold: float) -> bool:
     q = _quality(traj, threshold)
     return bool(q["done_any"] or q["reward_max"] >= threshold)
@@ -681,6 +744,8 @@ def main(cfg) -> None:
     save_video = bool(collect_cfg.get("inference_frame_video", {}).get("enable", True))
     video_fps = _as_int(collect_cfg.get("inference_frame_video", {}).get("fps", 5), 5)
     save_partial_on_exit = bool(collect_cfg.get("save_partial_on_exit", False))
+    min_episode_chunks_to_save = max(0, _as_int(collect_cfg.get("min_episode_chunks_to_save", 1), 1))
+    min_valid_steps_to_save = max(0, _as_int(collect_cfg.get("min_valid_steps_to_save", 0), 0))
 
     manual_key_listener = None
     if bool(collect_cfg.get("poll_keyboard_between_chunks", True)) and KeyboardListener is not None:
@@ -754,32 +819,49 @@ def main(cfg) -> None:
                     "save_reason": save_reason,
                 }
                 episode = _concat_episode(episode_parts, metadata)
-                row = _save_episode(
+                filter_reason = _episode_filter_reason(
                     episode,
-                    episode_frames,
-                    rank_dir=rank_dir,
-                    episode_idx=episode_idx,
                     success_threshold=success_threshold,
-                    video_fps=video_fps,
-                    save_video=save_video,
+                    min_chunks=min_episode_chunks_to_save,
+                    min_valid_steps=min_valid_steps_to_save,
                 )
-                collected += 1
-                total_samples += int(row.get("num_samples", 0))
-                if row.get("is_success", False):
-                    success += 1
+                if filter_reason is not None:
+                    row = _record_skipped_episode(
+                        episode,
+                        rank_dir=rank_dir,
+                        episode_idx=episode_idx,
+                        success_threshold=success_threshold,
+                        reason=filter_reason,
+                    )
+                    # Do not increment collected/success/failure: this was a
+                    # keyboard-leak/too-short episode, not training data.
                 else:
-                    failure += 1
+                    row = _save_episode(
+                        episode,
+                        episode_frames,
+                        rank_dir=rank_dir,
+                        episode_idx=episode_idx,
+                        success_threshold=success_threshold,
+                        video_fps=video_fps,
+                        save_video=save_video,
+                    )
+                    collected += 1
+                    total_samples += int(row.get("num_samples", 0))
+                    if row.get("is_success", False):
+                        success += 1
+                    else:
+                        failure += 1
+                    print(
+                        f"[collect-episode] saved episode={episode_idx} split={row['split']} "
+                        f"outcome={row.get('episode_outcome')} chunks={row.get('num_chunks')} "
+                        f"samples={row.get('num_samples')} reward_sum={row.get('reward_sum'):.3f} "
+                        f"done_any={row.get('done_any')} valid_steps={row.get('valid_steps')} "
+                        f"reason={save_reason} path={row['path']}",
+                        flush=True,
+                    )
                 episode_parts = []
                 episode_frames = []
                 _write_metadata(rank_dir, collected, total_samples, success, failure)
-                print(
-                    f"[collect-episode] saved episode={episode_idx} split={row['split']} "
-                    f"outcome={row.get('episode_outcome')} chunks={row.get('num_chunks')} "
-                    f"samples={row.get('num_samples')} reward_sum={row.get('reward_sum'):.3f} "
-                    f"done_any={row.get('done_any')} valid_steps={row.get('valid_steps')} "
-                    f"reason={save_reason} path={row['path']}",
-                    flush=True,
-                )
                 _clear_terminal_keys(manual_key_listener)
 
                 if between_chunk_key in {"a", "c"}:

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from typing import Any, SupportsFloat
+import time
 
 import gymnasium as gym
 from gymnasium.core import ActType, ObsType
@@ -27,6 +28,41 @@ class BaseKeyboardRewardDoneWrapper(gym.Wrapper):
         self.listener = KeyboardListener()
         self.reward_mode = reward_mode
         assert self.reward_mode in ["always_replace"]
+
+    def _clear_control_key_buffer(self) -> None:
+        """Drop stale keyboard events that should not leak across episodes.
+
+        PiperEnv uses its own keyboard listener to wait for ``b`` during reset,
+        while this wrapper uses another listener to assign a/c terminal rewards.
+        Therefore a double ``c`` or the reset ``b`` can remain queued here after
+        the previous episode has already ended.  If not drained, the next episode
+        can consume stale ``b`` on step 0 and stale ``c`` on step 1, producing a
+        bogus two-step success trajectory.
+        """
+        clear = getattr(self.listener, "clear_presses", None)
+        if callable(clear):
+            clear(("a", "b", "c", "q"))
+
+    def _wait_for_terminal_keys_released(self, timeout_sec: float = 2.0) -> None:
+        """Avoid carrying a physically held a/c key into the next episode."""
+        get_key = getattr(self.listener, "get_key", None)
+        if not callable(get_key):
+            return
+        start = time.time()
+        while get_key() in {"a", "c"}:
+            if timeout_sec is not None and timeout_sec > 0:
+                if time.time() - start >= timeout_sec:
+                    break
+            time.sleep(0.02)
+
+    def reset(self, *, seed=None, options=None):
+        # Clear any stale terminal/ready key before the wrapped env enters its
+        # reset wait, then clear again after the operator has pressed b.
+        self._clear_control_key_buffer()
+        obs_info = super().reset(seed=seed, options=options)
+        self._wait_for_terminal_keys_released()
+        self._clear_control_key_buffer()
+        return obs_info
 
     def _check_keypress(self) -> tuple[bool, bool, float]:
         raise NotImplementedError
@@ -52,6 +88,9 @@ class BaseKeyboardRewardDoneWrapper(gym.Wrapper):
             info["manual_failure"] = bool(updated_reward == 0)
             info["manual_outcome"] = "success" if updated_reward == 1 else "failure"
             self._force_disable_teleop_if_available("keyboard_terminal")
+            # Defensive drain: if the operator double-clicked c/a, do not let the
+            # second key-down survive into reset / the next episode.
+            self._clear_control_key_buffer()
         return observation, reward, updated_terminated, truncated, info
 
     def reward_terminated(
@@ -66,15 +105,13 @@ class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
         last_intervened = False
         done = False
         reward = 0
-        key = None
-        # Use one-shot key consumption so a held success/failure key cannot
-        # immediately terminate the next episode after reset.
-        for candidate in ("a", "b", "c"):
-            if self.listener.consume_press(candidate):
-                key = candidate
-                break
+        # ``b`` is reserved for reset-ready in PiperEnv.  Do not treat it as a
+        # reward key here; otherwise the wrapper can consume stale reset-ready
+        # presses at the beginning of an episode.
+        self.listener.clear_presses(("b",))
+        key = self.listener.consume_first_press(("a", "c"))
         print(f"Key pressed: {key}")
-        if key not in ["a", "b", "c"]:
+        if key not in ["a", "c"]:
             return last_intervened, done, reward
 
         last_intervened = True
@@ -84,9 +121,6 @@ class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
             # success=1, failure/timeout/unfinished=0.
             reward = 0
             done = True
-            last_intervened = True
-        elif key == "b":
-            reward = 0
             last_intervened = True
         elif key == "c":
             reward = 1

@@ -491,12 +491,23 @@ class PiperEnv(gym.Env):
         start = time.time()
         last_log = 0.0
 
+        # Drop stale a/c/b key-down events before arming the next episode.  A
+        # double-clicked c from the previous episode must not be seen after reset.
+        self._keyboard.clear_presses(("a", "b", "c"))
+
         # Wait until any success/failure key held from the previous episode is released.
         while self._keyboard.get_key() in {"a", "c"}:
             time.sleep(poll)
 
+        # Clear once more after release, because a key-up does not remove queued
+        # key-down events that already happened before this wait loop.
+        self._keyboard.clear_presses(("a", "b", "c"))
+
         while True:
             if self._keyboard.consume_press(ready_key):
+                # If the operator double-clicks b, or accidentally presses c while
+                # confirming readiness, do not carry those events into episode step 0.
+                self._keyboard.clear_presses(("a", "b", "c"))
                 self._logger.info("reset: operator ready key '%s' received; starting next episode.", ready_key)
                 return
 

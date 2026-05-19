@@ -155,3 +155,21 @@ fuser -k -9 /dev/nvidia*
 清理ros节点
 rosnode kill -a
 rostopic list 
+
+
+python convert_lerobot_piper_to_gigawa_buffer.py \
+  --project-root /home/ubuntu/users/angen.ye/gwp/RLinf \
+  --dataset-root /home/ubuntu/users/angen.ye/gwp/260423160824_7c5a \
+  --output-root /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/lerobot_actor_warmup_buffer \
+  --config-path ./config \
+  --config-name online_rl_piper_gigawa \
+  --chunk-size 12 \
+  --stride 12 \
+  --use-episode-t5 \
+  --skip-missing \
+  --video-backend ffmpeg
+
+
+  python train_embodied_agent_gigawa_offline_bc.py \
+  --config-path ./config \
+  --config-name offline_piper_actor_bc_warmup
