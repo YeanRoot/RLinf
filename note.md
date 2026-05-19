@@ -1,11 +1,9 @@
 cd /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment
 python collect_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name collect_piper_gigawa_realworld
+  --config-name collect_piper_gigawa_realworld_actor
 
 train
-
-
 
 cd /home/ubuntu/users/angen.ye/gwp/RLinf
 export PYTHONPATH=$PWD:$PYTHONPATH
@@ -55,14 +53,14 @@ python repair_pre_earlystop_buffer.py   --input-root /shared_disk/users/angen.ye
 
 
 
-CUDA_VISIBLE_DEVICES=3 python analyze_gigawa_pt_qsa.py \
-  --config /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment/config/analysis.yaml \
-  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_5000/actor/gigawa_components/replay_buffer/rank_0/trajectory_4999_cc920c6d-71ca-5a14-9155-db0fecdeb1b8.pt \
-  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_5000/actor/gigawa_components/replay_buffer/rank_0/trajectory_4993_5f777bbb-7da3-5139-a443-bb9f6d81d830.pt\
-  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_5000/actor/gigawa_components/replay_buffer/rank_0/trajectory_4981_0dd6a234-530b-5dc4-95a7-70c3a592d9a6.pt \
-  --pt /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_5000/actor/gigawa_components/replay_buffer/rank_0/trajectory_4979_b913acad-78da-5e31-a86d-9329e7d3080e.pt \
-  --checkpoint /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_425_cup_pick/robotwin_train_giga_world_policy/checkpoints/global_step_7800 \
-  --output-dir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/qsa_debug_rl_429_online_cup_step_0.9836_4 \
+python analyze_gigawa_pt_qsa.py \
+  --config /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment/config/analysis.yaml \
+  --pt /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_warmup/piper_lerobot_actor_bc_warmup/checkpoints/global_step_200/actor/gigawa_components/demo_buffer/rank_0/trajectory_0_lerobot_piper_bc.pt \
+  --pt /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_warmup/piper_lerobot_actor_bc_warmup/checkpoints/global_step_200/actor/gigawa_components/demo_buffer/rank_0/trajectory_1_lerobot_piper_bc.pt \
+  --pt /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_warmup/piper_lerobot_actor_bc_warmup/checkpoints/global_step_200/actor/gigawa_components/demo_buffer/rank_0/trajectory_3_lerobot_piper_bc.pt \
+  --pt /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_warmup/piper_lerobot_actor_bc_warmup/checkpoints/global_step_200/actor/gigawa_components/demo_buffer/rank_0/trajectory_7_lerobot_piper_bc.pt \
+  --checkpoint /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_warmup/piper_lerobot_actor_bc_warmup/checkpoints/global_step_200 \
+  --output-dir /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_warmup/piper_lerobot_actor_bc_warmup/checkpoints/global_step_200 \
   --device cuda
 
 sudo chmod -R a+rwX /home/ubuntu/users/angen.ye/gwp/RLinf
@@ -170,6 +168,38 @@ python convert_lerobot_piper_to_gigawa_buffer.py \
   --video-backend ffmpeg
 
 
-  python train_embodied_agent_gigawa_offline_bc.py \
+python train_embodied_agent_gigawa_offline_bc.py \
+--config-path ./config \
+--config-name offline_piper_actor_bc_warmup
+
+
+
+
+
+cd /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment
+
+export HYDRA_FULL_ERROR=1
+export TQDM_DISABLE=1
+export HF_HUB_DISABLE_PROGRESS_BARS=1
+
+python collect_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name offline_piper_actor_bc_warmup
+  --config-name collect_piper_gigawa_realworld \
+  runner.resume_dir=/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_warmup/piper_lerobot_actor_bc_warmup/checkpoints/global_step_200 \
+  runner.resume_load_optimizer_and_scheduler_state=false \
+  runner.logger.log_path=/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_actor_warmup_test \
+  runner.logger.experiment_name=collect_piper_actor_warmup_test \
+  actor.model.giga_world_policy.use_rl_head_for_rollout=true \
+  algorithm.warmup_steps=0 \
+  algorithm.rollout_actor_after_warmup=true \
+  algorithm.rollout_actor_min_actor_updates=0 \
+  algorithm.offline_collection.target_num_trajectories=5 \
+  env.train.break_chunk_on_intervention=true \
+  env.train.latch_intervention_until_chunk_end=false \
+  env.train.collect_intervention_until_release=true \
+  env.train.replan_on_intervention_release=true \
+  env.train.pad_interrupted_chunks=true \
+  env.train.force_disable_teleop_on_chunk_end=false \
+  env.train.force_disable_teleop_on_terminal=true \
+  env.train.force_disable_teleop_on_timeout=true \
+  env.train.debug_intervention_chunks=true

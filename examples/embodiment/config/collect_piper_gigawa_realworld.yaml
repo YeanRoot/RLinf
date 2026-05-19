@@ -23,7 +23,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention"
+    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention100"
     project_name: rlinf
     experiment_name: "collect_piper_gigawa_intervention"
     logger_backends: ["tensorboard"]
@@ -175,7 +175,7 @@ env:
     collect_intervention_until_release: false
     pad_interrupted_chunks: true
     intervention_max_steps: 960
-    force_disable_teleop_on_chunk_end: true
+    force_disable_teleop_on_chunk_end: false
     force_disable_teleop_on_terminal: true
     force_disable_teleop_on_timeout: true
     debug_intervention_chunks: true

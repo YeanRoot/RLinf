@@ -376,8 +376,21 @@ def _analyze_single_trajectory(
 
     curr_visual_latent = traj['curr_obs']['visual_latent'].to(device)
     curr_robot_state = traj['curr_obs']['robot_state'].to(device)
-    curr_ref_action = traj['curr_obs']['ref_action'].to(device)
-    true_action = _reshape_action_tensor(traj['actions'].to(device), action_chunk, action_dim)
+
+    # ref_action in collected/offline pt files may be stored as [B, C*A].
+    # The cross-attention actor expects [B, C, A], otherwise ref_action_proj
+    # receives 168 instead of 14 and crashes.
+    curr_ref_action = _reshape_action_tensor(
+        traj['curr_obs']['ref_action'].to(device),
+        action_chunk,
+        action_dim,
+    )
+
+    true_action = _reshape_action_tensor(
+        traj['actions'].to(device),
+        action_chunk,
+        action_dim,
+    )
     rewards = traj['rewards'].to(device).float()
     terminations = traj['terminations'].to(device).bool()
 
