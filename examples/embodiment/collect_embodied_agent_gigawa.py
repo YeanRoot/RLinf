@@ -416,6 +416,101 @@ def _atomic_torch_save(obj: Any, path: Path) -> None:
     os.replace(tmp, path)
 
 
+def _atomic_json_dump(obj: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _trajectory_shape_for_index(traj: Trajectory) -> tuple[int, ...]:
+    for name in ("rewards", "actions", "action_valid_mask"):
+        value = getattr(traj, name, None)
+        if torch.is_tensor(value):
+            return tuple(int(x) for x in value.shape)
+    return (0, 0)
+
+
+def _trajectory_num_samples_for_index(traj: Trajectory) -> int:
+    shape = _trajectory_shape_for_index(traj)
+    if len(shape) >= 2:
+        return int(shape[0]) * int(shape[1])
+    if len(shape) == 1:
+        return int(shape[0])
+    return 0
+
+
+def _update_replay_index_for_episode(
+    split_dir: Path,
+    *,
+    trajectory_id: int,
+    episode: Trajectory,
+    storage_name: str,
+    split: str,
+    seed: int,
+) -> None:
+    """Maintain TrajectoryReplayBuffer-compatible index files for a split dir.
+
+    The collector still writes human-readable episode_XXXXXX.pt files, but each
+    all/success/failure directory also becomes directly loadable via
+    TrajectoryReplayBuffer.load_checkpoint(load_path=that_directory).
+
+    We use ``storage_name`` so replay_buffer loads episode_XXXXXX.pt instead of
+    expecting trajectory_<id>_<model_weights_id>.pt.
+    """
+    split_dir.mkdir(parents=True, exist_ok=True)
+    index_path = split_dir / "trajectory_index.json"
+    if index_path.exists():
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+    else:
+        index_data = {"trajectory_index": {}, "trajectory_id_list": []}
+
+    trajectory_index = {
+        int(k): v for k, v in index_data.get("trajectory_index", {}).items()
+    }
+    trajectory_id_list = [int(x) for x in index_data.get("trajectory_id_list", [])]
+
+    metadata = dict(getattr(episode, "metadata", None) or {})
+    trajectory_shape = _trajectory_shape_for_index(episode)
+    row = {
+        "num_samples": _trajectory_num_samples_for_index(episode),
+        "trajectory_id": int(trajectory_id),
+        "max_episode_length": int(getattr(episode, "max_episode_length", 0) or 0),
+        "shape": list(trajectory_shape),
+        "model_weights_id": str(getattr(episode, "model_weights_id", "offline") or "offline"),
+        "storage_name": storage_name,
+        "split": split,
+    }
+    row.update(metadata)
+    trajectory_index[int(trajectory_id)] = row
+    if int(trajectory_id) not in trajectory_id_list:
+        trajectory_id_list.append(int(trajectory_id))
+    trajectory_id_list = sorted(trajectory_id_list)
+
+    total_samples = int(
+        sum(int(trajectory_index[int(tid)].get("num_samples", 0)) for tid in trajectory_id_list)
+    )
+    meta = {
+        "trajectory_format": "pt",
+        "size": len(trajectory_id_list),
+        "total_samples": total_samples,
+        "trajectory_counter": (max(trajectory_id_list) + 1) if trajectory_id_list else 0,
+        "seed": int(seed),
+        "save_unit": "episode",
+        "split": split,
+    }
+    _atomic_json_dump(meta, split_dir / "metadata.json")
+    _atomic_json_dump(
+        {
+            "trajectory_index": {str(k): trajectory_index[k] for k in trajectory_id_list},
+            "trajectory_id_list": trajectory_id_list,
+        },
+        index_path,
+    )
+
+
 def _quality(traj: Trajectory, threshold: float) -> dict[str, Any]:
     rewards = traj.rewards.float() if torch.is_tensor(traj.rewards) else torch.zeros(1)
     mask = traj.action_valid_mask.bool() if torch.is_tensor(traj.action_valid_mask) else None
@@ -623,6 +718,8 @@ def _save_episode(
     success_threshold: float,
     video_fps: int,
     save_video: bool,
+    write_replay_index: bool,
+    replay_index_seed: int,
 ) -> dict[str, Any]:
     q = _quality(episode, success_threshold)
     split = "success" if q["is_success"] else "failure"
@@ -636,6 +733,24 @@ def _save_episode(
     payload = _trajectory_to_dict(episode)
     _atomic_torch_save(payload, all_path)
     _atomic_torch_save(payload, split_path)
+    if write_replay_index:
+        storage_name = f"episode_{episode_idx:06d}"
+        _update_replay_index_for_episode(
+            rank_dir / "all",
+            trajectory_id=episode_idx,
+            episode=episode,
+            storage_name=storage_name,
+            split="all",
+            seed=replay_index_seed,
+        )
+        _update_replay_index_for_episode(
+            rank_dir / split,
+            trajectory_id=episode_idx,
+            episode=episode,
+            storage_name=storage_name,
+            split=split,
+            seed=replay_index_seed,
+        )
     all_size_mb = all_path.stat().st_size / (1024.0 * 1024.0)
     split_size_mb = split_path.stat().st_size / (1024.0 * 1024.0)
     print(
@@ -746,6 +861,8 @@ def main(cfg) -> None:
     save_partial_on_exit = bool(collect_cfg.get("save_partial_on_exit", False))
     min_episode_chunks_to_save = max(0, _as_int(collect_cfg.get("min_episode_chunks_to_save", 1), 1))
     min_valid_steps_to_save = max(0, _as_int(collect_cfg.get("min_valid_steps_to_save", 0), 0))
+    write_replay_index_per_split = bool(collect_cfg.get("write_replay_index_per_split", True))
+    replay_index_seed = _as_int(collect_cfg.get("replay_index_seed", getattr(cfg.actor, "seed", 1234)), 1234)
 
     manual_key_listener = None
     if bool(collect_cfg.get("poll_keyboard_between_chunks", True)) and KeyboardListener is not None:
@@ -844,6 +961,8 @@ def main(cfg) -> None:
                         success_threshold=success_threshold,
                         video_fps=video_fps,
                         save_video=save_video,
+                        write_replay_index=write_replay_index_per_split,
+                        replay_index_seed=replay_index_seed,
                     )
                     collected += 1
                     total_samples += int(row.get("num_samples", 0))
@@ -923,6 +1042,8 @@ def main(cfg) -> None:
                 success_threshold=success_threshold,
                 video_fps=video_fps,
                 save_video=save_video,
+                write_replay_index=write_replay_index_per_split,
+                replay_index_seed=replay_index_seed,
             )
             collected += 1
             total_samples += int(row.get("num_samples", 0))

@@ -23,7 +23,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention100"
+    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention_test"
     project_name: rlinf
     experiment_name: "collect_piper_gigawa_intervention"
     logger_backends: ["tensorboard"]
@@ -92,7 +92,7 @@ algorithm:
     save_unit: episode
     # One c/a/timeout terminal event produces one episode_XXXXXX.pt and one mp4.
     output_dir: ${runner.logger.log_path}/offline_collection
-    target_num_trajectories: 20
+    target_num_trajectories: 100
     max_collection_steps: 100000000
     log_interval: 1
     success_threshold: 0.5
@@ -102,6 +102,10 @@ algorithm:
     # keyboard leakage, so skip it instead of saving into all/success/failure.
     min_episode_chunks_to_save: 2
     min_valid_steps_to_save: 0
+    # Make all/, success/, and failure/ directly loadable by
+    # TrajectoryReplayBuffer.load_checkpoint(load_path=<that folder>).
+    write_replay_index_per_split: true
+    replay_index_seed: 1234
     # Capture c/a that are pressed after a 12-step chunk has ended but before
     # the next env.step(). Without this, the terminal marker lands at the next
     # chunk's step 0.

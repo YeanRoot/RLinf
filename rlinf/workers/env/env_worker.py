@@ -1074,6 +1074,36 @@ class EnvWorker(Worker):
                 trajectory.contiguous_()
             channel.put(trajectory, async_op=True)
 
+    def _feature_obs_from_rollout_result(
+        self, rollout_result: RolloutResult | None
+    ) -> dict[str, torch.Tensor]:
+        """Extract compact GigaWA actor/critic inputs from rollout forward_inputs.
+
+        These tensors are produced by GigaWorldPolicy.predict_action_batch and
+        are intentionally saved into curr_obs/next_obs for offline BC/RL.  Raw
+        camera images can still be stripped later by the collector.
+        """
+        if rollout_result is None or not rollout_result.forward_inputs:
+            return {}
+        out: dict[str, torch.Tensor] = {}
+        for key in ("visual_latent", "robot_state", "ref_action", "raw_robot_state"):
+            value = rollout_result.forward_inputs.get(key, None)
+            if isinstance(value, torch.Tensor):
+                out[key] = value.detach().cpu().contiguous()
+        return out
+
+    def _inject_feature_obs(
+        self, obs: dict[str, Any], rollout_result: RolloutResult | None
+    ) -> dict[str, Any]:
+        if not isinstance(obs, dict):
+            return obs
+        feature_obs = self._feature_obs_from_rollout_result(rollout_result)
+        if not feature_obs:
+            return obs
+        merged = dict(obs)
+        merged.update(feature_obs)
+        return merged
+
     def _append_completed_train_chunk_step(
         self,
         stage_id: int,
@@ -1081,6 +1111,7 @@ class EnvWorker(Worker):
         curr_obs: dict[str, Any],
         env_output: EnvOutput,
         bootstrap_values: torch.Tensor | None,
+        next_rollout_result: RolloutResult | None = None,
     ) -> None:
         rewards = self.compute_bootstrap_rewards(env_output, bootstrap_values)
         executed_model, executed_exec, executed_flags, valid_mask = self._build_executed_action_tensors(
@@ -1142,8 +1173,14 @@ class EnvWorker(Worker):
                 curr_obs,
                 env_output.chunk_step_obs_list,
             )
+            curr_obs_for_storage = self._inject_feature_obs(
+                curr_obs_for_storage, rollout_result
+            )
+            next_obs_for_storage = self._inject_feature_obs(
+                next_obs, next_rollout_result
+            )
             self.rollout_results[stage_id].append_transitions(
-                curr_obs_for_storage, next_obs
+                curr_obs_for_storage, next_obs_for_storage
             )
 
     async def _run_interact_once(
@@ -1199,6 +1236,7 @@ class EnvWorker(Worker):
                             pending_curr_obs[stage_id],
                             env_output,
                             rollout_result.bootstrap_values,
+                            next_rollout_result=rollout_result,
                         )
 
                     next_env_output, env_info = self.env_interact_step(
@@ -1231,6 +1269,7 @@ class EnvWorker(Worker):
                         pending_curr_obs[stage_id],
                         env_output,
                         rollout_result.bootstrap_values,
+                        next_rollout_result=rollout_result,
                     )
 
                 chunk_step_result = ChunkStepResult(

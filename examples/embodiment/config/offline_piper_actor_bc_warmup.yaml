@@ -22,13 +22,13 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_warmup_rollout"
+    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc2"
     project_name: rlinf
     experiment_name: "piper_lerobot_actor_bc_warmup"
     logger_backends: ["tensorboard"]
 
   # One epoch internally contains offline_bc_pretrain.steps_per_epoch actor updates.
-  max_epochs: 200
+  max_epochs: 20000
   max_steps: -1
   only_eval: false
   val_check_interval: -1
@@ -57,14 +57,14 @@ algorithm:
     enable: true
     enable_cache: true
     cache_size: 2000
-    sample_window_size: 8000
+    sample_window_size: 6000
     min_buffer_size: 2
     train_actor_steps: 32
     auto_save: false
     auto_save_path: null
     trajectory_format: pt
     # 注意：这里填 buffer 根目录，不要填 rank_0
-    load_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention20/offline_collection/rank_0/success"
+    load_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention100/offline_collection/rank_0/success"
     sample_ratio: 1.0
     allow_train_on_demo_only: true
     allow_demo_only_fallback: true

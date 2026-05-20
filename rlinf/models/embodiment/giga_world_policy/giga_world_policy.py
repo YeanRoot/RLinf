@@ -567,6 +567,13 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 f"expected one of {sorted(valid_actor_robot_state_modes)}"
             )
         self.keep_raw_robot_state = bool(policy_cfg.get("keep_raw_robot_state", True))
+        # When collecting real-world data for offline BC / critic training, do
+        # not save raw images, but do save the frozen-backbone training features
+        # needed by the actor/critic.  This keeps trajectories compact and still
+        # makes them directly usable offline.
+        self.save_backbone_features_for_offline = bool(
+            policy_cfg.get("save_backbone_features_for_offline", True)
+        )
         valid_robot_state_input_modes = {"normal", "zero", "remove"}
         if self.robot_state_input_mode not in valid_robot_state_input_modes:
             raise ValueError(
@@ -2237,11 +2244,18 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         actor_actions_model = None
         actor_actions_exec = None
 
-        if rollout_uses_actor or self.enable_action_compare_debug:
+        need_backbone_features = (
+            rollout_uses_actor
+            or self.enable_action_compare_debug
+            or self.save_backbone_features_for_offline
+        )
+
+        if need_backbone_features:
             backbone = self.extract_frozen_backbone_batch(env_obs)
             wa_actions_model = backbone["ref_action"].to(self.device_ref)
             wa_actions_exec = backbone["ref_action_exec"].to(self.device_ref)
 
+        if rollout_uses_actor or self.enable_action_compare_debug:
             visual_feat = self.encode_visual(backbone["visual_latent"])
             actor_actions_model, _ = self.actor_forward(
                 visual_feat=visual_feat,
@@ -2282,6 +2296,23 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 actions_model = wa_actions_model
                 actions_exec = wa_actions_exec
 
+        forward_inputs = {
+            "action": actions_exec.reshape(batch_size, -1).contiguous(),
+            "model_action": actions_model.reshape(batch_size, -1).contiguous(),
+        }
+        if backbone is not None and self.save_backbone_features_for_offline:
+            forward_inputs.update(
+                {
+                    # Direct offline actor/critic inputs.  These are compact
+                    # frozen features / normalized states, not raw images.
+                    "visual_latent": backbone["visual_latent"].detach().contiguous(),
+                    "robot_state": backbone["robot_state"].detach().contiguous(),
+                    "ref_action": backbone["ref_action"].detach().contiguous(),
+                }
+            )
+            if "raw_robot_state" in backbone:
+                forward_inputs["raw_robot_state"] = backbone["raw_robot_state"].detach().contiguous()
+
         result = {
             "prev_logprobs": torch.zeros(
                 batch_size,
@@ -2295,10 +2326,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 device=actions_exec.device,
                 dtype=torch.float32,
             ),
-            "forward_inputs": {
-                "action": actions_exec.reshape(batch_size, -1).contiguous(),
-                "model_action": actions_model.reshape(batch_size, -1).contiguous(),
-            },
+            "forward_inputs": forward_inputs,
         }
         return actions_exec, result
 
