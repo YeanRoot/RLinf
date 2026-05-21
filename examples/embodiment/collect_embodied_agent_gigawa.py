@@ -57,6 +57,17 @@ def _avg_env_metrics(metrics: dict) -> dict:
     return out
 
 
+def _collection_target_reached(stats: dict, target_num_trajectories: int, target_total_samples: int) -> bool:
+    all_stats = (stats or {}).get("all", {})
+    collected_traj = int(all_stats.get("num_trajectories", 0))
+    collected_samples = int(all_stats.get("total_samples", 0))
+    if target_num_trajectories > 0 and collected_traj >= target_num_trajectories:
+        return True
+    if target_total_samples > 0 and collected_samples >= target_total_samples:
+        return True
+    return False
+
+
 @hydra.main(
     version_base="1.1",
     config_path="config",
@@ -116,6 +127,22 @@ def main(cfg) -> None:
     target_total_samples = int(collect_cfg.get("target_total_samples", 0) or 0)
     log_interval = int(collect_cfg.get("log_interval", 10))
     max_collection_steps = int(collect_cfg.get("max_collection_steps", 10**9))
+    skip_if_enough = bool(collect_cfg.get("skip_if_enough", True))
+
+    initial_stats = _aggregate_collection_stats(
+        actor_group.get_offline_collection_stats().wait()
+    )
+    if skip_if_enough and _collection_target_reached(
+        initial_stats, target_num_trajectories, target_total_samples
+    ):
+        print("[collect] skip_if_enough=true and existing offline collection already satisfies the target:")
+        print(json.dumps(initial_stats, indent=2))
+        final_stats = _aggregate_collection_stats(
+            actor_group.finalize_offline_collection().wait()
+        )
+        print("[collect] finalized existing offline collection:")
+        print(json.dumps(final_stats, indent=2))
+        return
 
     start_time = time.time()
     last_log_time = start_time
