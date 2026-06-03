@@ -20,12 +20,17 @@ export ROBOTWIN_PATH=/shared_disk/users/angen.ye/code/world_module_rollout/RoboT
 
 python collect_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name collect_bell_data_fix
+  --config-name collect_robotwin_beat_block_hammer
+python collect_embodied_agent_gigawa.py \
+  --config-path ./config \
+  --config-name collect_robotwin_lift_pot
 
 train
 cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
-python train_embodied_agent_gigawa.py   --config-path ./config   --config-name online_rl_cup
+python train_embodied_agent_gigawa.py   --config-path ./config   --config-name online_rl_hammer_ansyc
 
+cd /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/embodiment
+python train_embodied_agent_gigawa.py   --config-path ./config   --config-name online_rl_bell_ansyc
 eval:
 python train_embodied_agent_gigawa.py \
   --config-path ./config \
@@ -34,18 +39,18 @@ python train_embodied_agent_gigawa.py \
 
 # original all sliding 
 python reshard_offline_collection.py \
-  --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_fix_422/offline_collection \
+  --input-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/collect_robotwin_beat_block_hammer/offline_collection \
   --bucket all \
-  --data-mode original \
-  --output-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_fix_422/mergeall_original \
-  --target-world-size 4 \
+  --data-mode all \
+  --output-root /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/collect_robotwin_beat_block_hammer/mergeall_original \
+  --target-world-size 1 \
   --shuffle \
   --source-cache-size 2048
 
 
 python train_embodied_agent_gigawa_offline_bc.py \
   --config-path ./config \
-  --config-name offline_bc_pretrain
+  --config-name offline_bc_pretrain_RLT
 
 
 python train_embodied_agent_gigawa_offline_critic_fast.py \
@@ -56,7 +61,7 @@ python train_embodied_agent_gigawa_offline_rl_fast.py \
   --config-path ./config \
   --config-name offline_rl_pretrain
 
-tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_cup_504_test/tensorboard \
+tensorboard --logdir /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_bell_paper_0.82_pretrain/tensorboard \
   --host 0.0.0.0 \
   --port 6006
 

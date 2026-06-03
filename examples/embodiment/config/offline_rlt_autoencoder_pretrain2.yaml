@@ -13,44 +13,34 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor: 4-5
-    rollout: 6
-    env: 7
+    actor, env, rollout: 0-3
 
 runner:
   task_type: embodied
   logger:
-    log_path:  "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_cup_504_test"
+    log_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_rlt_autoencoder_pretrain
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 20000 #test
+  max_epochs: 10000
   max_steps: -1
-
-  # When true, train_embodied_agent_gigawa.py uses AsyncEmbodiedRunner,
-  # AsyncEnvWorker, AsyncMultiStepRolloutWorker, and AsyncEmbodiedGigaWAFSDPPolicy.
-  # Rollout collection runs continuously while actor/critic training consumes
-  # newly collected trajectories from the replay buffer.
-  async_rollout_training: true
-  async_disable_inline_eval: true
-  replay_channel_maxsize: 8
-  weight_sync_interval: 20
-
   only_eval: False
-  val_check_interval: 200
-  save_interval: 200
+  val_check_interval: 1
+  save_interval: 20
 
   resume_dir: null
   ckpt_path: null
-  resume_load_optimizer_and_scheduler_state: false
+  per_worker_log_path: null
 
 algorithm:
   replay_buffer:
     enable_cache: True
     cache_size: 2000
-    sample_window_size: 8000
-    min_buffer_size: 2
+    sample_window_size: 5000
+    min_buffer_size: 0
+    require_for_training: false
+    store_online_data: false
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
@@ -58,21 +48,28 @@ algorithm:
     prefetch_size: 10
 
   demo_buffer:
-    enable: True
+    enable: true
     enable_cache: True
     cache_size: 2000
-    sample_window_size: 6000
-    min_buffer_size: 0
-    train_actor_steps: 2
+    sample_window_size: 5000
+    min_buffer_size: 32
+    train_actor_steps: 32
     auto_save: False
     auto_save_path: null
     trajectory_format: pt
-    load_path: null
-    sample_ratio: 0
+    load_path: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/data_bell_reextract_422/mergeall_original
+    sample_ratio: 1.0
     allow_train_on_demo_only: true
     allow_demo_only_fallback: true
     allow_replay_only_fallback: false
     store_online_interventions: false
+
+  offline_rlt_autoencoder_pretrain:
+    enable: true
+    val_ratio: 0.2
+    split_seed: 1234
+    steps_per_epoch: 60
+    val_steps_per_epoch: 15
 
   normalize_advantages: False
   kl_penalty: kl
@@ -96,42 +93,29 @@ algorithm:
   value_clip: 0.2
   huber_delta: 10.0
 
-  gamma: 0.9836
+  gamma: 0.99
   gae_lambda: 0.95
 
-  reward_coef: 1 #test
+  reward_coef: 1
   filter_rewards: False
   rewards_lower_bound: 0.0
   rewards_upper_bound: 5.0
 
-  training_stage: full_rl # bc_actor_pretrain / critic_warmup / full_rl
+  training_stage: bc_actor_pretrain
 
   update_epoch: 1
-  utd_ratio: 5 #test
-  # Must be >= replay_buffer.min_buffer_size for the initial async warmup if
-  # staleness is active.  The rollout code also bypasses staleness during
-  # WA-only warmup to avoid deadlock.
-  staleness_threshold: 2
+  utd_ratio: 1
   critic_actor_ratio: 2
   tau: 0.005
   target_update_freq: 1
   target_policy_noise: 0.0
   target_noise_clip: 0.0
-  bc_coef: 50
+  bc_coef: 1.0
   ref_action_dropout_p: 0
-  warmup_steps: 2
+  warmup_steps: 0
   train_actor_steps: 0
-  rollout_actor_after_warmup: true
-  rollout_actor_min_actor_updates: 500
-
-  freeze_critic_updates: false
-  freeze_actor_updates: false
-  freeze_visual_layers: false
-
-  actor_bc_guard:
-    mode: none
-    # threshold: 0.004
-    # weighted_bc_coef: 50.0
+  rollout_actor_after_warmup: false
+  rollout_actor_min_actor_updates: 100000000
 
   sampling_params:
     do_sample: False
@@ -151,10 +135,10 @@ env:
   enable_offload: False
 
   train:
-    total_num_envs: 8
+    total_num_envs: 4
     reward_coef: ${algorithm.reward_coef}
     max_episode_steps: 192
-    max_steps_per_rollout_epoch: 192
+    max_steps_per_rollout_epoch: 48
     group_size: 1
     auto_reset: False
     ignore_terminations: False
@@ -166,14 +150,13 @@ env:
       camera:
         collect_wrist_camera: true
 
-
   eval:
-    total_num_envs: 8
+    total_num_envs: 4
     auto_reset: True
     ignore_terminations: False
     max_episode_steps: 192
     reward_coef: ${algorithm.reward_coef}
-    max_steps_per_rollout_epoch: 192
+    max_steps_per_rollout_epoch: 48
     group_size: 1
     use_fixed_reset_state_ids: True
     is_eval: True
@@ -181,13 +164,12 @@ env:
     seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
     center_crop: False
     video_cfg:
-      save_video: True
+      save_video: False
       video_base_dir: ${runner.logger.log_path}/video/eval
     task_config:
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
-
 
 rollout:
   group_name: "RolloutGroup"
@@ -207,14 +189,6 @@ actor:
   global_batch_size: 64
   seed: 1234
   enable_offload: False
-
-  # Async GigaWA rollout receiver.  The queue is intentionally bounded so the
-  # rollout side is back-pressured instead of accumulating unlimited trajectories.
-  recv_queue_maxsize: 8
-  recv_drain_max_trajectories: 32
-  sync_weight_no_wait: false
-  async_skip_sleep_s: 0.5
-  async_skip_log_interval_s: 10.0
 
   critic_optim:
     lr: 3.0e-5
@@ -247,9 +221,20 @@ actor:
       single_view_height: 192
       prompt: null
       use_safetensors: False
-      use_rl_head_for_rollout: false
+      use_rl_head_for_rollout: False
+      feature_extractor: "rlt_like"
+      fusion_mode: ${.feature_extractor}
+      cross_attention_dim: 512
+      cross_attention_heads: 8
+      cross_attention_dropout: 0.0
+      cross_attention_time_reduce: "mean"
+      max_visual_tokens: 1024
+      rlt_num_tokens: 1
+      rlt_token_dim: 2048
+      rlt_freeze_tokenizer: False
+      rlt_freeze_visual_adapter: False
       visual_feature_dim: 2048
-      bc_coef: 50
+      bc_coef: 1
       ref_action_dropout_p: 0
       target_tau: 0.005
       enable_latent_debug: False

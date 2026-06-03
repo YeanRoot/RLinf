@@ -403,14 +403,266 @@ class CrossAttentionCritic(nn.Module):
         return q1, q2, fused_state
 
 
+class RLTLikeTokenAutoEncoder(nn.Module):
+    """
+    RL-Token-like bottleneck over WA/VAE latent tokens.
+
+    Stage 1 usage:
+        visual_tokens [B,N,Dv] -> encoder -> compact rl_tokens [B,K,Dr]
+        -> decoder -> reconstructed visual_tokens [B,N,Dv]
+
+    Stage 2 usage:
+        visual_tokens -> frozen encoder -> compact rl_tokens.
+
+    RLT uses a single 2048-dim RL token.  To keep this WA baseline faithful
+    while preserving the existing 512-dim actor/critic heads, this module uses
+    token_dim=2048 for the bottleneck token and reconstructs back to the visual
+    token dimension.
+    """
+
+    def __init__(
+        self,
+        visual_dim: int,
+        token_dim: int,
+        num_heads: int,
+        dropout: float,
+        num_tokens: int,
+        max_visual_tokens: int,
+    ):
+        super().__init__()
+        if num_tokens <= 0:
+            raise ValueError(f"rlt_num_tokens must be positive, got {num_tokens}.")
+        if token_dim % num_heads != 0:
+            raise ValueError(
+                f"rlt_token_dim ({token_dim}) must be divisible by cross_attention_heads ({num_heads})."
+            )
+        self.visual_dim = visual_dim
+        self.token_dim = token_dim
+        self.num_tokens = num_tokens
+        self.max_visual_tokens = max_visual_tokens
+
+        self.visual_to_token = nn.Sequential(
+            nn.LayerNorm(visual_dim),
+            nn.Linear(visual_dim, token_dim),
+        )
+        self.rl_query_embed = nn.Parameter(torch.zeros(1, num_tokens, token_dim))
+        self.encoder = CrossAttentionBlock(token_dim, num_heads, dropout)
+
+        self.recon_query_embed = nn.Parameter(torch.zeros(1, max_visual_tokens, token_dim))
+        self.decoder = CrossAttentionBlock(token_dim, num_heads, dropout)
+        self.recon_head = nn.Sequential(
+            nn.LayerNorm(token_dim),
+            nn.Linear(token_dim, visual_dim),
+        )
+
+        nn.init.normal_(self.rl_query_embed, mean=0.0, std=0.02)
+        nn.init.normal_(self.recon_query_embed, mean=0.0, std=0.02)
+
+    def encode(self, visual_tokens: torch.Tensor) -> torch.Tensor:
+        batch_size = visual_tokens.shape[0]
+        token_kv = self.visual_to_token(visual_tokens)
+        query = self.rl_query_embed.expand(batch_size, -1, -1).to(
+            device=token_kv.device, dtype=token_kv.dtype
+        )
+        return self.encoder(query, token_kv)
+
+    def decode(self, rl_tokens: torch.Tensor, num_visual_tokens: int) -> torch.Tensor:
+        if num_visual_tokens > self.max_visual_tokens:
+            raise RuntimeError(
+                f"num_visual_tokens={num_visual_tokens} exceeds max_visual_tokens={self.max_visual_tokens}."
+            )
+        batch_size = rl_tokens.shape[0]
+        query = self.recon_query_embed[:, :num_visual_tokens].expand(batch_size, -1, -1).to(
+            device=rl_tokens.device, dtype=rl_tokens.dtype
+        )
+        recon_tokens = self.decoder(query, rl_tokens)
+        return self.recon_head(recon_tokens)
+
+    def forward(
+        self,
+        visual_tokens: torch.Tensor,
+        return_reconstruction: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        rl_tokens = self.encode(visual_tokens)
+        if not return_reconstruction:
+            return rl_tokens
+        recon_tokens = self.decode(rl_tokens, visual_tokens.shape[1])
+        return rl_tokens, recon_tokens
+
+
+class RLTLikeActor(nn.Module):
+    """
+    Pure RL-token-like actor.
+
+    It follows the RLT-style interface more directly:
+        single compact RL token(s) + flattened WA reference action + robot state
+        -> MLP -> full action chunk.
+
+    No cross attention and no 2048->512 adapter-space projection are used in the
+    actor.  The MLP depth is kept comparable to the original action head:
+        input_dim -> 1024 -> 512 -> C*A.
+    """
+
+    def __init__(
+        self,
+        rlt_token_dim: int,
+        rlt_num_tokens: int,
+        robot_state_dim: int,
+        action_dim: int,
+        action_chunk: int,
+    ):
+        super().__init__()
+        self.rlt_token_dim = int(rlt_token_dim)
+        self.rlt_num_tokens = int(rlt_num_tokens)
+        self.robot_state_dim = int(robot_state_dim)
+        self.action_dim = int(action_dim)
+        self.action_chunk = int(action_chunk)
+        self.ref_action_flat_dim = self.action_chunk * self.action_dim
+        self.rlt_flat_dim = self.rlt_num_tokens * self.rlt_token_dim
+        self.input_dim = self.rlt_flat_dim + self.robot_state_dim + self.ref_action_flat_dim
+
+        self.output_head = MLP(
+            input_dim=self.input_dim,
+            hidden_dims=[1024, 512],
+            output_dim=self.ref_action_flat_dim,
+            activate_final=False,
+            layer_norm=False,
+        )
+
+    def _infer_batch_device_dtype(
+        self,
+        rl_tokens: Optional[torch.Tensor],
+        robot_state: Optional[torch.Tensor],
+        ref_action: Optional[torch.Tensor],
+    ) -> tuple[int, torch.device, torch.dtype]:
+        for tensor in (rl_tokens, robot_state, ref_action):
+            if tensor is not None:
+                return tensor.shape[0], tensor.device, tensor.dtype
+        raise RuntimeError(
+            "RLTLikeActor received no inputs. At least one of RL tokens / robot_state / ref_action must remain enabled."
+        )
+
+    def _flat_or_zeros(
+        self,
+        tensor: Optional[torch.Tensor],
+        batch_size: int,
+        flat_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if tensor is None:
+            return torch.zeros(batch_size, flat_dim, device=device, dtype=dtype)
+        return tensor.reshape(batch_size, -1).to(device=device, dtype=dtype)
+
+    def forward(
+        self,
+        rl_tokens: Optional[torch.Tensor],
+        robot_state: Optional[torch.Tensor],
+        ref_action: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, device, dtype = self._infer_batch_device_dtype(
+            rl_tokens, robot_state, ref_action
+        )
+
+        rl_flat = self._flat_or_zeros(
+            rl_tokens, batch_size, self.rlt_flat_dim, device, dtype
+        )
+        robot_flat = self._flat_or_zeros(
+            robot_state, batch_size, self.robot_state_dim, device, dtype
+        )
+        ref_flat = self._flat_or_zeros(
+            ref_action, batch_size, self.ref_action_flat_dim, device, dtype
+        )
+
+        actor_input = torch.cat([rl_flat, robot_flat, ref_flat], dim=-1)
+        action_flat = self.output_head(actor_input)
+        action = action_flat.view(batch_size, self.action_chunk, self.action_dim)
+        return action, actor_input
+
+
+class RLTLikeCritic(nn.Module):
+    """
+    Pure RL-token-like twin critic.
+
+    It consumes the same flat RLT-style state as the actor, plus the candidate
+    action chunk:
+        [RL token(s), robot state, WA ref action, candidate action] -> twin MLP Q.
+
+    No cross attention and no 2048->512 projection are used in the critic.
+    """
+
+    def __init__(
+        self,
+        rlt_token_dim: int,
+        rlt_num_tokens: int,
+        robot_state_dim: int,
+        action_dim: int,
+        action_chunk: int,
+    ):
+        super().__init__()
+        self.rlt_token_dim = int(rlt_token_dim)
+        self.rlt_num_tokens = int(rlt_num_tokens)
+        self.robot_state_dim = int(robot_state_dim)
+        self.action_dim = int(action_dim)
+        self.action_chunk = int(action_chunk)
+        self.ref_action_flat_dim = self.action_chunk * self.action_dim
+        self.action_flat_dim = self.ref_action_flat_dim
+        self.rlt_flat_dim = self.rlt_num_tokens * self.rlt_token_dim
+        self.input_dim = (
+            self.rlt_flat_dim
+            + self.robot_state_dim
+            + self.ref_action_flat_dim
+            + self.action_flat_dim
+        )
+        self.value_head = TwinCriticValue(input_dim=self.input_dim)
+
+    def _flat_or_zeros(
+        self,
+        tensor: Optional[torch.Tensor],
+        batch_size: int,
+        flat_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if tensor is None:
+            return torch.zeros(batch_size, flat_dim, device=device, dtype=dtype)
+        return tensor.reshape(batch_size, -1).to(device=device, dtype=dtype)
+
+    def forward(
+        self,
+        rl_tokens: Optional[torch.Tensor],
+        robot_state: Optional[torch.Tensor],
+        ref_action: Optional[torch.Tensor],
+        action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = action.shape[0]
+        device = action.device
+        dtype = action.dtype
+
+        rl_flat = self._flat_or_zeros(
+            rl_tokens, batch_size, self.rlt_flat_dim, device, dtype
+        )
+        robot_flat = self._flat_or_zeros(
+            robot_state, batch_size, self.robot_state_dim, device, dtype
+        )
+        ref_flat = self._flat_or_zeros(
+            ref_action, batch_size, self.ref_action_flat_dim, device, dtype
+        )
+        action_flat = action.reshape(batch_size, -1).to(device=device, dtype=dtype)
+
+        critic_input = torch.cat([rl_flat, robot_flat, ref_flat, action_flat], dim=-1)
+        q1, q2 = self.value_head(critic_input)
+        return q1, q2, critic_input
+
 class GigaWorldPolicy(BasePolicy, nn.Module):
     """
     RLinf Giga World Action policy wrapper.
 
     This version keeps the frozen WA backbone for reference-action generation
     and VAE-latent extraction, and adds trainable RL heads:
-      - visual compressor: latent -> 2048
-      - actor head: (visual feat + robot state + reference action) -> final action
+      - cross_attention: full visual tokens + action-conditioned attention
+      - rlt_like: one 2048-dim RL token + pure MLP actor/critic
+      - concat_mlp: legacy flattened visual feature + MLP
       - twin critics + target networks
     """
 
@@ -551,10 +803,16 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 f"expected one of {sorted(valid_robot_state_input_modes)}"
             )
 
-        self.fusion_mode = str(
-            policy_cfg.get("fusion_mode", "cross_attention")
+        self.feature_extractor = str(
+            policy_cfg.get(
+                "feature_extractor",
+                policy_cfg.get("fusion_mode", "cross_attention"),
+            )
         ).lower()
-        valid_fusion_modes = {"cross_attention", "concat_mlp"}
+        # Keep the older name as an alias because the rest of the worker code
+        # already branches on fusion_mode.
+        self.fusion_mode = self.feature_extractor
+        valid_fusion_modes = {"cross_attention", "rlt_like", "concat_mlp"}
         if self.fusion_mode not in valid_fusion_modes:
             raise ValueError(
                 f"Unsupported fusion_mode={self.fusion_mode}, "
@@ -579,6 +837,23 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 f"cross_attention_heads ({self.cross_attention_heads})."
             )
         self.max_visual_tokens = int(policy_cfg.get("max_visual_tokens", 1024))
+        self.rlt_num_tokens = int(
+            policy_cfg.get("rlt_num_tokens", policy_cfg.get("rl_token_num_tokens", 1))
+        )
+        self.rlt_token_dim = int(policy_cfg.get("rlt_token_dim", 2048))
+        self.rlt_freeze_tokenizer = bool(policy_cfg.get("rlt_freeze_tokenizer", False))
+        self.rlt_freeze_visual_adapter = bool(
+            policy_cfg.get("rlt_freeze_visual_adapter", self.rlt_freeze_tokenizer)
+        )
+        if self.rlt_num_tokens <= 0:
+            raise ValueError(f"rlt_num_tokens must be positive, got {self.rlt_num_tokens}.")
+        if self.rlt_token_dim <= 0:
+            raise ValueError(f"rlt_token_dim must be positive, got {self.rlt_token_dim}.")
+        if self.rlt_token_dim % self.cross_attention_heads != 0:
+            raise ValueError(
+                f"rlt_token_dim ({self.rlt_token_dim}) must be divisible by "
+                f"cross_attention_heads ({self.cross_attention_heads})."
+            )
 
         vae = AutoencoderKLWan.from_pretrained(
             base_model_dir,
@@ -683,7 +958,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             self.visual_cond_dim + self.robot_state_cond_dim + self.ref_action_cond_dim
         )
 
-        if self.fusion_mode == "cross_attention":
+        if self.fusion_mode in {"cross_attention", "rlt_like"}:
             self.visual_compressor = nn.Sequential(
                 nn.Linear(self.vae_z_dim, self.cross_attention_dim),
                 nn.GELU(),
@@ -694,22 +969,52 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             )
             nn.init.normal_(self.visual_pos_embed, mean=0.0, std=0.02)
 
-            self.actor_head = CrossAttentionActor(
-                hidden_dim=self.cross_attention_dim,
-                num_heads=self.cross_attention_heads,
-                dropout=self.cross_attention_dropout,
-                robot_state_dim=self.robot_state_dim,
-                action_dim=self.model_action_dim,
-                action_chunk=self.action_chunk,
+            if self.fusion_mode == "cross_attention":
+                self.actor_head = CrossAttentionActor(
+                    hidden_dim=self.cross_attention_dim,
+                    num_heads=self.cross_attention_heads,
+                    dropout=self.cross_attention_dropout,
+                    robot_state_dim=self.robot_state_dim,
+                    action_dim=self.model_action_dim,
+                    action_chunk=self.action_chunk,
+                )
+                self.critic = CrossAttentionCritic(
+                    hidden_dim=self.cross_attention_dim,
+                    num_heads=self.cross_attention_heads,
+                    dropout=self.cross_attention_dropout,
+                    robot_state_dim=self.robot_state_dim,
+                    action_dim=self.model_action_dim,
+                )
+            else:
+                self.rlt_tokenizer = RLTLikeTokenAutoEncoder(
+                    visual_dim=self.cross_attention_dim,
+                    token_dim=self.rlt_token_dim,
+                    num_heads=self.cross_attention_heads,
+                    dropout=self.cross_attention_dropout,
+                    num_tokens=self.rlt_num_tokens,
+                    max_visual_tokens=self.max_visual_tokens,
+                )
+                self.actor_head = RLTLikeActor(
+                    rlt_token_dim=self.rlt_token_dim,
+                    rlt_num_tokens=self.rlt_num_tokens,
+                    robot_state_dim=self.robot_state_dim,
+                    action_dim=self.model_action_dim,
+                    action_chunk=self.action_chunk,
+                )
+                self.critic = RLTLikeCritic(
+                    rlt_token_dim=self.rlt_token_dim,
+                    rlt_num_tokens=self.rlt_num_tokens,
+                    robot_state_dim=self.robot_state_dim,
+                    action_dim=self.model_action_dim,
+                    action_chunk=self.action_chunk,
+                )
+                if self.rlt_freeze_tokenizer:
+                    self.set_rlt_tokenizer_trainable(
+                        False, include_visual_adapter=self.rlt_freeze_visual_adapter
+                    )
+            self.rl_state_dim = (
+                self.rlt_token_dim if self.fusion_mode == "rlt_like" else self.cross_attention_dim
             )
-            self.critic = CrossAttentionCritic(
-                hidden_dim=self.cross_attention_dim,
-                num_heads=self.cross_attention_heads,
-                dropout=self.cross_attention_dropout,
-                robot_state_dim=self.robot_state_dim,
-                action_dim=self.model_action_dim,
-            )
-            self.rl_state_dim = self.cross_attention_dim
         else:
             self.visual_compressor = VisualCompressor2D(
                 in_channels=self.vae_z_dim,
@@ -764,6 +1069,23 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
     def set_visual_trainable(self, trainable: bool) -> None:
         self._set_requires_grad(self.visual_compressor, trainable)
+        if hasattr(self, "visual_pos_embed"):
+            self.visual_pos_embed.requires_grad = trainable
+        if hasattr(self, "rlt_tokenizer"):
+            self._set_requires_grad(self.rlt_tokenizer, trainable)
+
+    def set_rlt_tokenizer_trainable(
+        self,
+        trainable: bool,
+        include_visual_adapter: bool = True,
+    ) -> None:
+        if not hasattr(self, "rlt_tokenizer"):
+            return
+        self._set_requires_grad(self.rlt_tokenizer, trainable)
+        if include_visual_adapter:
+            self._set_requires_grad(self.visual_compressor, trainable)
+            if hasattr(self, "visual_pos_embed"):
+                self.visual_pos_embed.requires_grad = trainable
 
     def set_actor_head_trainable(self, trainable: bool) -> None:
         self._set_requires_grad(self.actor_head, trainable)
@@ -1348,12 +1670,44 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             "ref_action_exec": ref_action_exec,
         }
 
+    def _encode_visual_tokens_from_latent(self, visual_latent: torch.Tensor) -> torch.Tensor:
+        """
+        Shared WA/VAE latent tokenization used by both our cross-attention
+        method and the RL-token-like bottleneck baseline.
+
+        visual_latent [B, Z, T, H, W] -> visual_tokens [B, H*W, D]
+        """
+        if visual_latent.ndim != 5:
+            raise ValueError(f"Expected visual_latent [B,Z,T,H,W], got {tuple(visual_latent.shape)}")
+
+        comp_param = next(self.visual_compressor.parameters())
+        comp_device = comp_param.device
+        comp_dtype = comp_param.dtype
+
+        x = visual_latent.to(device=comp_device, dtype=comp_dtype)
+        if x.shape[2] == 1 or self.cross_attention_time_reduce == "first":
+            x = x[:, :, 0]
+        else:
+            x = x.mean(dim=2)
+
+        batch_size, _, height, width = x.shape
+        x = x.permute(0, 2, 3, 1).reshape(batch_size, height * width, self.vae_z_dim)
+        if x.shape[1] > self.max_visual_tokens:
+            raise RuntimeError(
+                f"visual token count {x.shape[1]} exceeds max_visual_tokens={self.max_visual_tokens}."
+            )
+        x = self.visual_compressor(x)
+        pos = self.visual_pos_embed[:, : x.shape[1]].to(device=comp_device, dtype=comp_dtype)
+        return x + pos
+
     def encode_visual(self, visual_latent: torch.Tensor) -> torch.Tensor:
         """
         concat_mlp mode:
             visual_latent [B, Z, T, H, W] -> [B, 2048]
         cross_attention mode:
-            visual_latent [B, Z, T, H, W] -> [B, H*W, D]
+            visual_latent [B, Z, T, H, W] -> full visual tokens [B, H*W, D]
+        rlt_like mode:
+            visual_latent [B, Z, T, H, W] -> compact RL tokens [B, K, Dr]
         """
         if visual_latent.ndim != 5:
             raise ValueError(f"Expected visual_latent [B,Z,T,H,W], got {tuple(visual_latent.shape)}")
@@ -1371,15 +1725,35 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         if self.fusion_mode == "concat_mlp":
             return self.visual_compressor(x)
 
-        batch_size, _, height, width = x.shape
-        x = x.permute(0, 2, 3, 1).reshape(batch_size, height * width, self.vae_z_dim)
-        if x.shape[1] > self.max_visual_tokens:
+        visual_tokens = self._encode_visual_tokens_from_latent(visual_latent)
+        if self.fusion_mode == "rlt_like":
+            return self.rlt_tokenizer.encode(visual_tokens)
+        return visual_tokens
+
+    def rlt_autoencoder_forward(self, visual_latent: torch.Tensor) -> dict[str, torch.Tensor]:
+        """
+        Stage-1 pretraining objective for the RL-token-like baseline.
+
+        It reconstructs the lightweight WA/VAE visual tokens through a compact
+        bottleneck. Use this in a separate pretraining run, save the checkpoint,
+        then set rlt_freeze_tokenizer=true for the actor-critic run.
+        """
+        if self.fusion_mode != "rlt_like":
             raise RuntimeError(
-                f"visual token count {x.shape[1]} exceeds max_visual_tokens={self.max_visual_tokens}."
+                f"rlt_autoencoder_forward is only available when fusion_mode='rlt_like', got {self.fusion_mode}."
             )
-        x = self.visual_compressor(x)
-        pos = self.visual_pos_embed[:, : x.shape[1]].to(device=comp_device, dtype=comp_dtype)
-        return x + pos
+        visual_tokens = self._encode_visual_tokens_from_latent(visual_latent)
+        rl_tokens, recon_tokens = self.rlt_tokenizer(
+            visual_tokens, return_reconstruction=True
+        )
+        recon_loss = F.mse_loss(recon_tokens.float(), visual_tokens.detach().float())
+        return {
+            "loss": recon_loss,
+            "recon_loss": recon_loss.detach(),
+            "visual_tokens": visual_tokens,
+            "rl_tokens": rl_tokens,
+            "reconstructed_visual_tokens": recon_tokens,
+        }
 
     def build_zero_visual_feat_from_latent(
         self,
@@ -1392,6 +1766,14 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             return torch.zeros(
                 batch_size,
                 int(self.visual_feature_dim),
+                device=device,
+                dtype=dtype,
+            )
+        if self.fusion_mode == "rlt_like":
+            return torch.zeros(
+                batch_size,
+                int(self.rlt_num_tokens),
+                int(self.rlt_token_dim),
                 device=device,
                 dtype=dtype,
             )
@@ -1458,14 +1840,14 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         Build actor/critic state from the selected conditioning sources.
 
         concat_mlp mode returns the original concatenated state.
-        cross_attention mode returns a compact debug/state summary vector so
-        legacy diagnostics that expect a tensor can keep working.
+        cross_attention / rlt_like modes return a compact debug/state summary
+        vector so legacy diagnostics that expect a tensor can keep working.
         """
         actor_param = next(self.actor_head.parameters())
         actor_device = actor_param.device
         actor_dtype = actor_param.dtype
 
-        if self.fusion_mode == "cross_attention":
+        if self.fusion_mode in {"cross_attention", "rlt_like"}:
             visual_tokens_for_state, visual_feat_for_state = self._condition_visual_for_attention(
                 visual_feat,
                 device=actor_device,
@@ -1621,7 +2003,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         actor_device = actor_param.device
         actor_dtype = actor_param.dtype
 
-        if self.fusion_mode == "cross_attention":
+        if self.fusion_mode in {"cross_attention", "rlt_like"}:
             visual_tokens, visual_feat_for_state = self._condition_visual_for_attention(
                 visual_feat,
                 device=actor_device,
@@ -1638,11 +2020,18 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 dtype=actor_dtype,
             )
 
-            learned_action, fused_state = head(
-                visual_tokens=visual_tokens,
-                robot_state=robot_state_for_state,
-                ref_action=ref_action_for_state,
-            )
+            if self.fusion_mode == "cross_attention":
+                learned_action, fused_state = head(
+                    visual_tokens=visual_tokens,
+                    robot_state=robot_state_for_state,
+                    ref_action=ref_action_for_state,
+                )
+            else:
+                learned_action, fused_state = head(
+                    rl_tokens=visual_tokens,
+                    robot_state=robot_state_for_state,
+                    ref_action=ref_action_for_state,
+                )
 
             if self.actor_output_mode == "hard_copy_ref_action":
                 action = ref_action.to(device=actor_device, dtype=actor_dtype) + 0.0 * learned_action
@@ -1735,25 +2124,35 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         )
         action_for_critic = action_for_critic.to(device=critic_device, dtype=critic_dtype)
 
-        if self.fusion_mode == "cross_attention":
-            if critic_visual_tokens is None:
+        if self.fusion_mode in {"cross_attention", "rlt_like"}:
+            if critic_visual_tokens is None and self.visual_input_mode != "remove":
                 raise RuntimeError(
-                    "cross_attention critic_forward requires critic_visual_tokens. "
+                    f"{self.fusion_mode} critic_forward requires critic_visual_tokens / RL tokens. "
                     "Pass actor_aux['critic_visual_tokens'] from actor_forward."
                 )
-            visual_tokens = critic_visual_tokens.to(device=critic_device, dtype=critic_dtype)
+            visual_tokens = None
+            if critic_visual_tokens is not None:
+                visual_tokens = critic_visual_tokens.to(device=critic_device, dtype=critic_dtype)
             robot_state = None
             if critic_robot_state is not None:
                 robot_state = critic_robot_state.to(device=critic_device, dtype=critic_dtype)
             ref_action = None
             if critic_ref_action is not None:
                 ref_action = critic_ref_action.to(device=critic_device, dtype=critic_dtype)
-            q1, q2, _ = critic(
-                visual_tokens=visual_tokens,
-                robot_state=robot_state,
-                ref_action=ref_action,
-                action=action_for_critic,
-            )
+            if self.fusion_mode == "cross_attention":
+                q1, q2, _ = critic(
+                    visual_tokens=visual_tokens,
+                    robot_state=robot_state,
+                    ref_action=ref_action,
+                    action=action_for_critic,
+                )
+            else:
+                q1, q2, _ = critic(
+                    rl_tokens=visual_tokens,
+                    robot_state=robot_state,
+                    ref_action=ref_action,
+                    action=action_for_critic,
+                )
             return q1, q2
 
         rl_state = rl_state.to(device=critic_device, dtype=critic_dtype)
@@ -1967,6 +2366,9 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
         if mode == "encode_visual":
             return self.encode_visual(kwargs["visual_latent"])
+
+        if mode == "rlt_autoencoder":
+            return self.rlt_autoencoder_forward(kwargs["visual_latent"])
 
         raise ValueError(f"Unsupported mode for default_forward: {mode}")
 

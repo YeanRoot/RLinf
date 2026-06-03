@@ -32,18 +32,38 @@ giga_world_policy:
 
   # route A: keep frozen WA backbone + latent compressor + small RL heads
   use_rl_head_for_rollout: False
-  fusion_mode: "cross_attention"
+
+  # Feature-extractor / fusion branch for ablation:
+  #   cross_attention: ours, full WA/VAE visual tokens + action-conditioned cross attention
+  #   rlt_like:       RL-Token-like baseline, one 2048-dim bottleneck token + pure flat MLP actor-critic
+  #   concat_mlp:     legacy CNN/concat MLP baseline
+  # feature_extractor is the preferred key; fusion_mode is kept as a backward-compatible alias.
+  feature_extractor: "cross_attention"
+  fusion_mode: ${.feature_extractor}
+
   visual_feature_dim: 2048
+  # Internal visual-token dim before the RLT encoder. In rlt_like mode, actor/critic
+  # consume the 2048-dim RL token directly; they do not project it back to this dim.
   cross_attention_dim: 512
   cross_attention_heads: 8
   cross_attention_dropout: 0.0
   cross_attention_time_reduce: "mean"
   max_visual_tokens: 1024
+
+  # RL-token-like baseline settings.
+  # Stage 1: set feature_extractor=rlt_like and rlt_freeze_tokenizer=False, train the
+  #          autoencoder objective exposed by mode="rlt_autoencoder".
+  # Stage 2: resume that checkpoint, keep feature_extractor=rlt_like, and set
+  #          rlt_freeze_tokenizer=True so only actor/critic heads are updated.
+  rlt_num_tokens: 1
+  rlt_token_dim: 2048
+  rlt_freeze_tokenizer: False
+  rlt_freeze_visual_adapter: True
   bc_coef: 1.0
   ref_action_dropout_p: 0.5
   target_tau: 0.005
   enable_critic_q_upper_bound: True
-  critic_q_upper_bound: 1.0
+  critic_q_upper_bound: 100.0
   actor_q_loss_clamp_to_upper_bound: True
   critic_target_clamp_to_upper_bound: True
   critic_overshoot_penalty_coef: 1.0
