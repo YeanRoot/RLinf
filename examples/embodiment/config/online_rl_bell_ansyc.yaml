@@ -20,7 +20,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path:  "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_bell_paper_0.82_pretrain"
+    log_path:  "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_bell_paper_0.82_new"
     project_name: rlinf
     experiment_name: "robotwin_train_giga_world_policy"
     logger_backends: ["tensorboard"]
@@ -38,7 +38,7 @@ runner:
   val_check_interval: 200
   save_interval: 200
 
-  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/offline_bc_pretrain_mergeall_bell_paper_100/robotwin_train_giga_world_policy/checkpoints/global_step_220
+  resume_dir: null
   ckpt_path: null
   resume_load_optimizer_and_scheduler_state: false
 
@@ -219,12 +219,14 @@ actor:
     min_lr: 2.5e-06
 
   model:
-    model_path: "/shared_disk/users/angen.ye/code/world_module_rollout/checkpoints/checkpoint_epoch_2_step_100000/transformer"
+    model_path: "/shared_disk/users/angen.ye/code/world_module_rollout/checkpoints/checkpoint_epoch_4_step_80000/transformer"
     num_action_chunks: 12
     action_dim: 14
     precision: bf16
     giga_world_policy:
       wa_root: "/shared_disk/users/angen.ye/code/world_module_rollout/wan-casual-cj"
+      wa_runtime: "giga_models"
+      giga_models_root: "/shared_disk/users/angen.ye/code/gwp05/giga-models"
       base_model_dir: "/shared_disk/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers"
       norm_json: "/shared_disk/users/angen.ye/code/world_module_rollout/norm_stats_delta.json"
       diffusers_src: null
@@ -232,8 +234,11 @@ actor:
       num_inference_steps: 10
       guidance_scale: 0.0
       num_frames: 5
-      single_view_width: 256
-      single_view_height: 192
+      view_layout: "tshape"
+      single_view_width: 320
+      single_view_height: 256
+      ref_image_width: 320
+      ref_image_height: 384
       prompt: null
       use_safetensors: False
       use_rl_head_for_rollout: true

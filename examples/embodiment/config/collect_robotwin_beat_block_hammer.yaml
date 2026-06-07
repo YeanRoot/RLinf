@@ -13,12 +13,12 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor, env, rollout: 0
+    actor, env, rollout: 1
 
 runner:
   task_type: embodied
   logger:
-    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/collect_robotwin_beat_block_hammer_test"
+    log_path: "/shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/collect_robotwin_beat_block_hammer_new"
     project_name: rlinf
     experiment_name: "robotwin_collect_gigawa_offline"
     logger_backends: ["tensorboard"]
@@ -30,7 +30,7 @@ runner:
   save_interval: -1
   weight_sync_interval: 1
 
-  resume_dir: /shared_disk/users/angen.ye/code/world_module_rollout/RLinf/examples/results/online_rl_hammer_paper_0.92/robotwin_train_giga_world_policy/checkpoints/global_step_5600
+  resume_dir: null
   ckpt_path: null
   per_worker_log_path: null
 
@@ -95,7 +95,7 @@ algorithm:
   ref_action_dropout_p: 0.0
   warmup_steps: 0
   train_actor_steps: 0
-  rollout_actor_after_warmup: true
+  rollout_actor_after_warmup: false
   rollout_actor_min_actor_updates: 0
 
   gigawa_sliding_window:
@@ -107,9 +107,9 @@ algorithm:
   offline_collection:
     enable: true
     output_dir: ${runner.logger.log_path}/offline_collection
-    target_num_trajectories: 200
+    target_num_trajectories: 1000
     target_total_samples: 0
-    max_collection_steps: 200
+    max_collection_steps: 1000
     log_interval: 10
     resume_existing: true
     save_all: true
@@ -211,12 +211,14 @@ actor:
     min_lr: 2.5e-06
 
   model:
-    model_path: "/shared_disk/users/angen.ye/code/world_module_rollout/checkpoints/checkpoint_epoch_2_step_100000/transformer"
+    model_path: "/shared_disk/users/angen.ye/code/world_module_rollout/checkpoints/checkpoint_epoch_4_step_80000/transformer"
     num_action_chunks: 12
     action_dim: 14
     precision: bf16
     giga_world_policy:
       wa_root: "/shared_disk/users/angen.ye/code/world_module_rollout/wan-casual-cj"
+      wa_runtime: "giga_models"
+      giga_models_root: "/shared_disk/users/angen.ye/code/gwp05/giga-models"
       base_model_dir: "/shared_disk/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers"
       norm_json: "/shared_disk/users/angen.ye/code/world_module_rollout/norm_stats_delta.json"
       diffusers_src: null
@@ -224,12 +226,15 @@ actor:
       num_inference_steps: 10
       guidance_scale: 0.0
       num_frames: 5
-      single_view_width: 256
-      single_view_height: 192
+      view_layout: "tshape"
+      single_view_width: 320
+      single_view_height: 256
+      ref_image_width: 320
+      ref_image_height: 384
       prompt: null
       use_safetensors: False
       wa_num_action_chunks: 48
-      use_rl_head_for_rollout: true
+      use_rl_head_for_rollout: false
       visual_feature_dim: 2048
       bc_coef: 1
       ref_action_dropout_p: 0

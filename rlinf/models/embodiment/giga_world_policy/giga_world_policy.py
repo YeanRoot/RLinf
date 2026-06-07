@@ -59,7 +59,56 @@ def _load_module_from_file(
     return module
 
 
-def _setup_wa_paths(wa_root: str, diffusers_src: Optional[str] = None):
+def _normalize_giga_models_root(path: str) -> str:
+    path = os.path.abspath(path)
+    if os.path.basename(path) == "giga_models":
+        path = os.path.dirname(path)
+    return path
+
+
+def _has_legacy_wa_runtime(wa_root: str) -> bool:
+    world_dir = os.path.join(
+        os.path.abspath(wa_root),
+        "giga-train",
+        "projects",
+        "diffusion",
+        "world_action_model",
+    )
+    return os.path.isfile(
+        os.path.join(world_dir, "wa", "transformer_wa_casual.py")
+    ) and os.path.isfile(
+        os.path.join(world_dir, "scripts", "inference_openloop_action_only.py")
+    )
+
+
+def _has_giga_models_runtime(giga_models_root: str) -> bool:
+    root = _normalize_giga_models_root(giga_models_root)
+    return os.path.isfile(
+        os.path.join(
+            root,
+            "giga_models",
+            "models",
+            "wam",
+            "giga_world_policy_0_5",
+            "transformer_wa_casual.py",
+        )
+    ) and os.path.isfile(
+        os.path.join(
+            root,
+            "projects",
+            "wam",
+            "giga-world-policy-0-5",
+            "scripts",
+            "inference_openloop_clean_desk_real_action_only.py",
+        )
+    )
+
+
+def _setup_wa_paths(
+    wa_root: str,
+    diffusers_src: Optional[str] = None,
+    giga_models_root: Optional[str] = None,
+):
     wa_root = os.path.abspath(wa_root)
     if diffusers_src:
         diffusers_src = os.path.abspath(diffusers_src)
@@ -73,13 +122,38 @@ def _setup_wa_paths(wa_root: str, diffusers_src: Optional[str] = None):
         os.path.join(wa_root, "giga-datasets"),
         os.path.join(wa_root, "giga-train"),
     ]
+    if giga_models_root:
+        gm_root = _normalize_giga_models_root(giga_models_root)
+        extra_paths.extend(
+            [
+                os.path.join(gm_root, "projects", "wam", "giga-world-policy-0-5"),
+                os.path.join(gm_root, "projects", "wam", "giga-world-policy-0-5", "scripts"),
+                gm_root,
+                os.path.join(gm_root, "giga-datasets"),
+                os.path.join(gm_root, "giga-train"),
+            ]
+        )
     for path in extra_paths:
         path = os.path.abspath(path)
-        if path not in sys.path:
+        if os.path.isdir(path) and path not in sys.path:
             sys.path.insert(0, path)
 
 
-def _preload_wa_runtime(wa_root: str):
+def _make_dummy_sockets_module():
+    sockets_mod = types.ModuleType("giga_models.sockets")
+
+    class _DummyRobotInferenceServer:
+        pass
+
+    class _DummyRobotInferenceClient:
+        pass
+
+    sockets_mod.RobotInferenceServer = _DummyRobotInferenceServer
+    sockets_mod.RobotInferenceClient = _DummyRobotInferenceClient
+    return sockets_mod
+
+
+def _preload_legacy_wa_runtime(wa_root: str):
     """Load only the inference-time WA modules without training-time imports."""
     wa_root = os.path.abspath(wa_root)
     world_dir = os.path.join(
@@ -112,17 +186,7 @@ def _preload_wa_runtime(wa_root: str):
         gm_pkg.__path__ = [os.path.join(wa_root, "giga-models", "giga_models")]
         sys.modules["giga_models"] = gm_pkg
     if "giga_models.sockets" not in sys.modules:
-        sockets_mod = types.ModuleType("giga_models.sockets")
-
-        class _DummyRobotInferenceServer:
-            pass
-
-        class _DummyRobotInferenceClient:
-            pass
-
-        sockets_mod.RobotInferenceServer = _DummyRobotInferenceServer
-        sockets_mod.RobotInferenceClient = _DummyRobotInferenceClient
-        sys.modules["giga_models.sockets"] = sockets_mod
+        sys.modules["giga_models.sockets"] = _make_dummy_sockets_module()
 
     infer_module_name = "wa_inference_openloop_action_only_min"
     if infer_module_name in sys.modules:
@@ -144,6 +208,167 @@ def _preload_wa_runtime(wa_root: str):
         exec(compile(infer_src, infer_file, "exec"), infer_mod.__dict__)
 
     return transformer_mod.CasualWorldActionTransformer, infer_mod.WAPipeline
+
+
+def _preload_giga_models_wa_runtime(
+    giga_models_root: str,
+    inference_script: Optional[str] = None,
+):
+    """Load the newer giga_world_policy_0_5 runtime without dataset-time imports."""
+    gm_root = _normalize_giga_models_root(giga_models_root)
+    gm_pkg_dir = os.path.join(gm_root, "giga_models")
+    wam_pkg_dir = os.path.join(
+        gm_pkg_dir, "models", "wam", "giga_world_policy_0_5"
+    )
+    project_dir = os.path.join(
+        gm_root, "projects", "wam", "giga-world-policy-0-5"
+    )
+    infer_file = inference_script or os.path.join(
+        project_dir,
+        "scripts",
+        "inference_openloop_clean_desk_real_action_only.py",
+    )
+
+    if not os.path.isdir(gm_pkg_dir):
+        raise FileNotFoundError(f"giga_models package dir not found: {gm_pkg_dir}")
+    if not os.path.isdir(wam_pkg_dir):
+        raise FileNotFoundError(f"new WA package dir not found: {wam_pkg_dir}")
+    if not os.path.isfile(infer_file):
+        raise FileNotFoundError(f"new WA inference script not found: {infer_file}")
+
+    if gm_root not in sys.path:
+        sys.path.insert(0, gm_root)
+    if project_dir not in sys.path:
+        sys.path.insert(0, project_dir)
+
+    package_paths = {
+        "giga_models": gm_pkg_dir,
+        "giga_models.models": os.path.join(gm_pkg_dir, "models"),
+        "giga_models.models.wam": os.path.join(gm_pkg_dir, "models", "wam"),
+        "giga_models.models.wam.giga_world_policy_0_5": wam_pkg_dir,
+    }
+    for package_name, package_dir in package_paths.items():
+        pkg = sys.modules.get(package_name)
+        if pkg is None:
+            pkg = types.ModuleType(package_name)
+            pkg.__path__ = [package_dir]
+            sys.modules[package_name] = pkg
+        elif hasattr(pkg, "__path__"):
+            paths = list(pkg.__path__)
+            if package_dir not in paths:
+                paths.insert(0, package_dir)
+                pkg.__path__ = paths
+
+    if "giga_models.sockets" not in sys.modules:
+        sys.modules["giga_models.sockets"] = _make_dummy_sockets_module()
+
+    _load_module_from_file(
+        "giga_models.models.wam.giga_world_policy_0_5.action_projectors",
+        os.path.join(wam_pkg_dir, "action_projectors.py"),
+    )
+    transformer_mod = _load_module_from_file(
+        "giga_models.models.wam.giga_world_policy_0_5.transformer_wa_casual",
+        os.path.join(wam_pkg_dir, "transformer_wa_casual.py"),
+    )
+    sys.modules[
+        "giga_models.models.wam.giga_world_policy_0_5"
+    ].CasualWorldActionTransformer = transformer_mod.CasualWorldActionTransformer
+
+    infer_module_name = "giga_models_wa_inference_openloop_action_only_min"
+    if infer_module_name in sys.modules:
+        infer_mod = sys.modules[infer_module_name]
+    else:
+        with open(infer_file, "r", encoding="utf-8") as f:
+            infer_src = f.read()
+        sentinel = "\nfrom giga_datasets import image_utils"
+        cut = infer_src.find(sentinel)
+        if cut == -1:
+            raise RuntimeError(
+                "Could not find dataset-import sentinel in new WA inference script"
+            )
+        infer_src = infer_src[:cut]
+        infer_src = infer_src.replace(
+            "return latents, torch.concat([mask_lat_size, latent_condition], dim=1)",
+            "return latents, torch.concat([mask_lat_size, latent_condition], dim=1), action",
+        )
+        infer_src = infer_src.replace(
+            "latents, condition = latents_outputs",
+            "latents, condition, action = latents_outputs",
+        )
+        infer_mod = types.ModuleType(infer_module_name)
+        infer_mod.__file__ = infer_file
+        infer_mod.__package__ = ""
+        sys.modules[infer_module_name] = infer_mod
+        exec(compile(infer_src, infer_file, "exec"), infer_mod.__dict__)
+
+    return transformer_mod.CasualWorldActionTransformer, infer_mod.WAPipeline
+
+
+def _resolve_wa_runtime(
+    wa_root: str,
+    transformer_ckpt: str,
+    requested_runtime: str,
+    giga_models_root: Optional[str],
+) -> tuple[str, Optional[str]]:
+    runtime = requested_runtime.lower()
+    aliases = {
+        "old": "legacy",
+        "wan": "legacy",
+        "wan-casual-cj": "legacy",
+        "new": "giga_models",
+        "giga": "giga_models",
+        "giga-models": "giga_models",
+        "giga_world_policy_0_5": "giga_models",
+    }
+    runtime = aliases.get(runtime, runtime)
+    if runtime not in {"auto", "legacy", "giga_models"}:
+        raise ValueError(
+            f"Unsupported wa_runtime={requested_runtime}; expected auto, legacy, or giga_models."
+        )
+
+    if giga_models_root:
+        gm_root = _normalize_giga_models_root(giga_models_root)
+    else:
+        gm_root = None
+        candidate_roots = [
+            wa_root,
+            os.path.join(os.path.dirname(os.path.abspath(wa_root)), "gwp05", "giga-models"),
+            "/shared_disk/users/angen.ye/code/gwp05/giga-models",
+        ]
+        for candidate in candidate_roots:
+            if candidate and _has_giga_models_runtime(candidate):
+                gm_root = _normalize_giga_models_root(candidate)
+                break
+
+    if runtime == "giga_models":
+        if gm_root is None or not _has_giga_models_runtime(gm_root):
+            raise FileNotFoundError(
+                "wa_runtime='giga_models' requested, but no valid giga_models_root was found."
+            )
+        return runtime, gm_root
+
+    if runtime == "legacy":
+        return runtime, None
+
+    ckpt_hint = os.path.abspath(str(transformer_ckpt))
+    if "checkpoint_epoch_4_step_80000" in ckpt_hint and gm_root is not None:
+        return "giga_models", gm_root
+    if not _has_legacy_wa_runtime(wa_root) and gm_root is not None:
+        return "giga_models", gm_root
+    return "legacy", None
+
+
+def _preload_wa_runtime(
+    wa_root: str,
+    runtime: str,
+    giga_models_root: Optional[str] = None,
+    inference_script: Optional[str] = None,
+):
+    if runtime == "giga_models":
+        if giga_models_root is None:
+            raise ValueError("giga_models_root is required for wa_runtime='giga_models'.")
+        return _preload_giga_models_wa_runtime(giga_models_root, inference_script)
+    return _preload_legacy_wa_runtime(wa_root)
 
 
 class MLP(nn.Module):
@@ -670,15 +895,26 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         super().__init__()
 
         policy_cfg = cfg.giga_world_policy
+        transformer_ckpt = cfg.model_path
+        self.wa_runtime, self.giga_models_root = _resolve_wa_runtime(
+            wa_root=policy_cfg.wa_root,
+            transformer_ckpt=transformer_ckpt,
+            requested_runtime=str(policy_cfg.get("wa_runtime", "auto")),
+            giga_models_root=policy_cfg.get("giga_models_root", None),
+        )
         _setup_wa_paths(
             wa_root=policy_cfg.wa_root,
             diffusers_src=policy_cfg.get("diffusers_src", None),
+            giga_models_root=self.giga_models_root,
         )
 
         from diffusers.models import AutoencoderKLWan
 
         CasualWorldActionTransformer, WAPipeline = _preload_wa_runtime(
-            policy_cfg.wa_root
+            policy_cfg.wa_root,
+            runtime=self.wa_runtime,
+            giga_models_root=self.giga_models_root,
+            inference_script=policy_cfg.get("wa_inference_script", None),
         )
 
         if torch_dtype is None:
@@ -698,17 +934,32 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self.num_frames = int(policy_cfg.get("num_frames", 5))
         self.prompt_override = policy_cfg.get("prompt", None)
         self.robotype = str(policy_cfg.robotype)
+        default_layout = "tshape" if self.wa_runtime == "giga_models" else "horizontal"
+        default_single_view_width = 320 if self.wa_runtime == "giga_models" else 256
+        default_single_view_height = 256 if self.wa_runtime == "giga_models" else 192
         self.single_view_size = (
-            int(policy_cfg.get("single_view_width", 256)),
-            int(policy_cfg.get("single_view_height", 192)),
+            int(policy_cfg.get("single_view_width", default_single_view_width)),
+            int(policy_cfg.get("single_view_height", default_single_view_height)),
         )
-        self.full_image_size = (
-            self.single_view_size[0] * 3,
-            self.single_view_size[1],
+        self.view_layout = str(policy_cfg.get("view_layout", default_layout)).lower()
+        self.ref_image_size = (
+            int(
+                policy_cfg.get(
+                    "ref_image_width",
+                    320 if self.view_layout == "tshape" else self.single_view_size[0] * 3,
+                )
+            ),
+            int(
+                policy_cfg.get(
+                    "ref_image_height",
+                    384 if self.view_layout == "tshape" else self.single_view_size[1],
+                )
+            ),
         )
+        # full_image_size is the image canvas passed to the WA pipeline.
+        self.full_image_size = self.ref_image_size
         self.device_ref = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        transformer_ckpt = cfg.model_path
         base_model_dir = policy_cfg.base_model_dir
         norm_json = policy_cfg.norm_json
 
@@ -1213,11 +1464,51 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
     def _build_ref_image(self, env_obs: dict[str, Any], index: int) -> Image.Image:
         img_high, img_left, img_right = self._extract_views(env_obs, index)
-        cat = np.concatenate(
-            [np.asarray(img_high), np.asarray(img_left), np.asarray(img_right)],
-            axis=1,
-        )
-        return Image.fromarray(cat)
+        if self.view_layout in {"horizontal", "hstack"}:
+            cat = np.concatenate(
+                [np.asarray(img_high), np.asarray(img_left), np.asarray(img_right)],
+                axis=1,
+            )
+            ref_image = Image.fromarray(cat)
+        elif self.view_layout in {"tshape", "t_shape", "t"}:
+            target_w, target_h = img_high.size
+            top_h = target_h
+            bottom_h = top_h // 2
+            split_w = target_w // 2
+            right_w = target_w - split_w
+
+            img_high = TF.resize(
+                img_high,
+                (top_h, target_w),
+                interpolation=InterpolationMode.BILINEAR,
+            )
+            img_left = TF.resize(
+                img_left,
+                (bottom_h, split_w),
+                interpolation=InterpolationMode.BILINEAR,
+            )
+            img_right = TF.resize(
+                img_right,
+                (bottom_h, right_w),
+                interpolation=InterpolationMode.BILINEAR,
+            )
+
+            ref_image = Image.new("RGB", (target_w, top_h + bottom_h))
+            ref_image.paste(img_high, (0, 0))
+            ref_image.paste(img_left, (0, top_h))
+            ref_image.paste(img_right, (split_w, top_h))
+        else:
+            raise ValueError(
+                f"Unsupported view_layout={self.view_layout}; expected horizontal or tshape."
+            )
+
+        if ref_image.size != self.full_image_size:
+            ref_image = TF.resize(
+                ref_image,
+                (self.full_image_size[1], self.full_image_size[0]),
+                interpolation=InterpolationMode.BILINEAR,
+            )
+        return ref_image
 
     def _normalize_state(self, state_raw: torch.Tensor):
         state_raw = torch.as_tensor(state_raw, dtype=torch.float32).flatten()
@@ -1566,7 +1857,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             width=self.full_image_size[0],
         ).to(self.device_ref, dtype=torch.float32)
 
-        latents_outputs = self.pipe.prepare_latents(
+        prepare_kwargs = dict(
             image=image,
             batch_size=1,
             num_channels_latents=self.pipe.vae.config.z_dim,
@@ -1580,8 +1871,16 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             last_image=None,
             action_chunk=self.wa_action_chunk,
             action_dim=self.model_action_dim,
-            return_latent_debug=False,
         )
+        try:
+            latents_outputs = self.pipe.prepare_latents(
+                **prepare_kwargs,
+                return_latent_debug=False,
+            )
+        except TypeError as e:
+            if "return_latent_debug" not in str(e):
+                raise
+            latents_outputs = self.pipe.prepare_latents(**prepare_kwargs)
 
         if self.pipe.config.expand_timesteps:
             # returns: latents, latent_condition, first_frame_mask, action
