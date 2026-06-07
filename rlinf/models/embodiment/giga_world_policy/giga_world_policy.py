@@ -18,22 +18,24 @@ import json
 import os
 import sys
 import types
-from datetime import datetime
 from typing import Any, Optional
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from omegaconf import DictConfig
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
+from rlinf.algorithms.gigawa_losses import compute_bc_loss
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.adapter.gigawa_actor_critic import (
+    CrossAttentionActor,
+    CrossAttentionCritic,
+    init_actor_output_small,
+    set_requires_grad,
+)
 
 
 def _load_module_from_file(
@@ -59,7 +61,7 @@ def _load_module_from_file(
     return module
 
 
-def _setup_wa_paths(wa_root: str, diffusers_src: Optional[str] = None):
+def _setup_wa_paths(wa_root: str, diffusers_src: Optional[str] = None) -> None:
     wa_root = os.path.abspath(wa_root)
     if diffusers_src:
         diffusers_src = os.path.abspath(diffusers_src)
@@ -77,6 +79,20 @@ def _setup_wa_paths(wa_root: str, diffusers_src: Optional[str] = None):
         path = os.path.abspath(path)
         if path not in sys.path:
             sys.path.insert(0, path)
+
+
+def _make_dummy_sockets_module():
+    sockets_mod = types.ModuleType("giga_models.sockets")
+
+    class _DummyRobotInferenceServer:
+        pass
+
+    class _DummyRobotInferenceClient:
+        pass
+
+    sockets_mod.RobotInferenceServer = _DummyRobotInferenceServer
+    sockets_mod.RobotInferenceClient = _DummyRobotInferenceClient
+    return sockets_mod
 
 
 def _preload_wa_runtime(wa_root: str):
@@ -112,17 +128,7 @@ def _preload_wa_runtime(wa_root: str):
         gm_pkg.__path__ = [os.path.join(wa_root, "giga-models", "giga_models")]
         sys.modules["giga_models"] = gm_pkg
     if "giga_models.sockets" not in sys.modules:
-        sockets_mod = types.ModuleType("giga_models.sockets")
-
-        class _DummyRobotInferenceServer:
-            pass
-
-        class _DummyRobotInferenceClient:
-            pass
-
-        sockets_mod.RobotInferenceServer = _DummyRobotInferenceServer
-        sockets_mod.RobotInferenceClient = _DummyRobotInferenceClient
-        sys.modules["giga_models.sockets"] = sockets_mod
+        sys.modules["giga_models.sockets"] = _make_dummy_sockets_module()
 
     infer_module_name = "wa_inference_openloop_action_only_min"
     if infer_module_name in sys.modules:
@@ -146,530 +152,19 @@ def _preload_wa_runtime(wa_root: str):
     return transformer_mod.CasualWorldActionTransformer, infer_mod.WAPipeline
 
 
-class MLP(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dims: list[int],
-        output_dim: int,
-        activate_final: bool = False,
-        layer_norm: bool = False,
-    ):
-        super().__init__()
-        dims = [input_dim] + hidden_dims + [output_dim]
-        layers = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            is_last = i == len(dims) - 2
-            if (not is_last) or activate_final:
-                if layer_norm:
-                    layers.append(nn.LayerNorm(dims[i + 1]))
-                layers.append(nn.GELU())
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class VisualCompressor2D(nn.Module):
-    """
-    Input:  [B, 48, 12, 48]
-    Output: [B, 2048]
-    """
-    def __init__(self, in_channels: int = 48, out_dim: int = 2048):
-        super().__init__()
-        if out_dim != 2048:
-            raise ValueError("This first version assumes out_dim=2048.")
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 128, kernel_size=3, stride=2, padding=1),  # 12x48 -> 6x24
-            nn.GELU(),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),          # 6x24 -> 3x12
-            nn.GELU(),
-            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),          # 3x12 -> 3x12
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d((2, 4)),                                      # -> 2x4
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        return x.flatten(1)  # [B, 256*2*4] = [B, 2048]
-
-
-class SelfAttentionBlock(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.token_norm = nn.LayerNorm(hidden_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.ffn_norm = nn.LayerNorm(hidden_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-        )
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        norm_tokens = self.token_norm(tokens)
-        attn_out, _ = self.attn(norm_tokens, norm_tokens, norm_tokens, need_weights=False)
-        x = tokens + attn_out
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
-
-
-class CrossAttentionBlock(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.query_norm = nn.LayerNorm(hidden_dim)
-        self.kv_norm = nn.LayerNorm(hidden_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.ffn_norm = nn.LayerNorm(hidden_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-        )
-
-    def forward(self, query_tokens: torch.Tensor, visual_tokens: Optional[torch.Tensor]) -> torch.Tensor:
-        if visual_tokens is None or visual_tokens.numel() == 0:
-            x = query_tokens
-        else:
-            q = self.query_norm(query_tokens)
-            kv = self.kv_norm(visual_tokens)
-            attn_out, _ = self.attn(q, kv, kv, need_weights=False)
-            x = query_tokens + attn_out
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
-
-
-class CrossAttentionActor(nn.Module):
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        dropout: float,
-        robot_state_dim: int,
-        action_dim: int,
-        action_chunk: int,
-    ):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.action_chunk = action_chunk
-        self.action_dim = action_dim
-        self.state_proj = nn.Linear(robot_state_dim, hidden_dim)
-        self.ref_action_proj = nn.Linear(action_dim, hidden_dim)
-        self.action_query_embed = nn.Parameter(torch.zeros(1, action_chunk, hidden_dim))
-        nn.init.normal_(self.action_query_embed, mean=0.0, std=0.02)
-        self.self_attn = SelfAttentionBlock(hidden_dim, num_heads, dropout)
-        self.cross_attn = CrossAttentionBlock(hidden_dim, num_heads, dropout)
-        self.output_head = MLP(
-            input_dim=hidden_dim,
-            hidden_dims=[1024, 512],
-            output_dim=action_dim,
-            activate_final=False,
-            layer_norm=False,
-        )
-
-    def forward(
-        self,
-        visual_tokens: Optional[torch.Tensor],
-        robot_state: Optional[torch.Tensor],
-        ref_action: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = None
-        if visual_tokens is not None:
-            batch_size = visual_tokens.shape[0]
-            device = visual_tokens.device
-            dtype = visual_tokens.dtype
-        elif ref_action is not None:
-            batch_size = ref_action.shape[0]
-            device = ref_action.device
-            dtype = ref_action.dtype
-        elif robot_state is not None:
-            batch_size = robot_state.shape[0]
-            device = robot_state.device
-            dtype = robot_state.dtype
-        else:
-            raise RuntimeError(
-                "Actor hybrid attention received no inputs. At least one of visual/robot_state/ref_action must remain enabled."
-            )
-
-        action_tokens = self.action_query_embed.expand(batch_size, -1, -1).to(device=device, dtype=dtype)
-        if ref_action is not None:
-            action_tokens = action_tokens + self.ref_action_proj(ref_action)
-
-        query_tokens = []
-        if robot_state is not None:
-            query_tokens.append(self.state_proj(robot_state).unsqueeze(1))
-        query_tokens.append(action_tokens)
-        query_tokens = torch.cat(query_tokens, dim=1)
-
-        query_tokens = self.self_attn(query_tokens)
-        fused_tokens = self.cross_attn(query_tokens, visual_tokens)
-
-        action_token_start = fused_tokens.shape[1] - self.action_chunk
-        fused_action_tokens = fused_tokens[:, action_token_start:]
-        action = self.output_head(fused_action_tokens)
-        fused_state = fused_tokens.mean(dim=1)
-        return action, fused_state
-
-
-class TwinCritic(nn.Module):
-    def __init__(self, input_dim: int):
-        super().__init__()
-        self.q1 = MLP(
-            input_dim=input_dim,
-            hidden_dims=[2048, 1024, 512],
-            output_dim=1,
-            activate_final=False,
-            layer_norm=False,
-        )
-        self.q2 = MLP(
-            input_dim=input_dim,
-            hidden_dims=[2048, 1024, 512],
-            output_dim=1,
-            activate_final=False,
-            layer_norm=False,
-        )
-
-    def forward(self, x: torch.Tensor, action_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        qa_input = torch.cat([x, action_flat], dim=-1)
-        return self.q1(qa_input), self.q2(qa_input)
-
-
-class TwinCriticValue(nn.Module):
-    def __init__(self, input_dim: int):
-        super().__init__()
-        self.q1 = MLP(
-            input_dim=input_dim,
-            hidden_dims=[2048, 1024, 512],
-            output_dim=1,
-            activate_final=False,
-            layer_norm=False,
-        )
-        self.q2 = MLP(
-            input_dim=input_dim,
-            hidden_dims=[2048, 1024, 512],
-            output_dim=1,
-            activate_final=False,
-            layer_norm=False,
-        )
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.q1(x), self.q2(x)
-
-
-class CrossAttentionCritic(nn.Module):
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        dropout: float,
-        robot_state_dim: int,
-        action_dim: int,
-    ):
-        super().__init__()
-        self.state_proj = nn.Linear(robot_state_dim, hidden_dim)
-        self.ref_action_proj = nn.Linear(action_dim, hidden_dim)
-        self.action_proj = nn.Linear(action_dim, hidden_dim)
-        self.cross_attn = CrossAttentionBlock(hidden_dim, num_heads, dropout)
-        self.value_head = TwinCriticValue(input_dim=hidden_dim)
-
-    def forward(
-        self,
-        visual_tokens: Optional[torch.Tensor],
-        robot_state: Optional[torch.Tensor],
-        ref_action: Optional[torch.Tensor],
-        action: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        query_tokens = []
-        if robot_state is not None:
-            query_tokens.append(self.state_proj(robot_state).unsqueeze(1))
-        if ref_action is not None:
-            query_tokens.append(self.ref_action_proj(ref_action))
-        query_tokens.append(self.action_proj(action))
-        query_tokens = torch.cat(query_tokens, dim=1)
-        fused_tokens = self.cross_attn(query_tokens, visual_tokens)
-        fused_state = fused_tokens.mean(dim=1)
-        q1, q2 = self.value_head(fused_state)
-        return q1, q2, fused_state
-
-
-class RLTLikeTokenAutoEncoder(nn.Module):
-    """
-    RL-Token-like bottleneck over WA/VAE latent tokens.
-
-    Stage 1 usage:
-        visual_tokens [B,N,Dv] -> encoder -> compact rl_tokens [B,K,Dr]
-        -> decoder -> reconstructed visual_tokens [B,N,Dv]
-
-    Stage 2 usage:
-        visual_tokens -> frozen encoder -> compact rl_tokens.
-
-    RLT uses a single 2048-dim RL token.  To keep this WA baseline faithful
-    while preserving the existing 512-dim actor/critic heads, this module uses
-    token_dim=2048 for the bottleneck token and reconstructs back to the visual
-    token dimension.
-    """
-
-    def __init__(
-        self,
-        visual_dim: int,
-        token_dim: int,
-        num_heads: int,
-        dropout: float,
-        num_tokens: int,
-        max_visual_tokens: int,
-    ):
-        super().__init__()
-        if num_tokens <= 0:
-            raise ValueError(f"rlt_num_tokens must be positive, got {num_tokens}.")
-        if token_dim % num_heads != 0:
-            raise ValueError(
-                f"rlt_token_dim ({token_dim}) must be divisible by cross_attention_heads ({num_heads})."
-            )
-        self.visual_dim = visual_dim
-        self.token_dim = token_dim
-        self.num_tokens = num_tokens
-        self.max_visual_tokens = max_visual_tokens
-
-        self.visual_to_token = nn.Sequential(
-            nn.LayerNorm(visual_dim),
-            nn.Linear(visual_dim, token_dim),
-        )
-        self.rl_query_embed = nn.Parameter(torch.zeros(1, num_tokens, token_dim))
-        self.encoder = CrossAttentionBlock(token_dim, num_heads, dropout)
-
-        self.recon_query_embed = nn.Parameter(torch.zeros(1, max_visual_tokens, token_dim))
-        self.decoder = CrossAttentionBlock(token_dim, num_heads, dropout)
-        self.recon_head = nn.Sequential(
-            nn.LayerNorm(token_dim),
-            nn.Linear(token_dim, visual_dim),
-        )
-
-        nn.init.normal_(self.rl_query_embed, mean=0.0, std=0.02)
-        nn.init.normal_(self.recon_query_embed, mean=0.0, std=0.02)
-
-    def encode(self, visual_tokens: torch.Tensor) -> torch.Tensor:
-        batch_size = visual_tokens.shape[0]
-        token_kv = self.visual_to_token(visual_tokens)
-        query = self.rl_query_embed.expand(batch_size, -1, -1).to(
-            device=token_kv.device, dtype=token_kv.dtype
-        )
-        return self.encoder(query, token_kv)
-
-    def decode(self, rl_tokens: torch.Tensor, num_visual_tokens: int) -> torch.Tensor:
-        if num_visual_tokens > self.max_visual_tokens:
-            raise RuntimeError(
-                f"num_visual_tokens={num_visual_tokens} exceeds max_visual_tokens={self.max_visual_tokens}."
-            )
-        batch_size = rl_tokens.shape[0]
-        query = self.recon_query_embed[:, :num_visual_tokens].expand(batch_size, -1, -1).to(
-            device=rl_tokens.device, dtype=rl_tokens.dtype
-        )
-        recon_tokens = self.decoder(query, rl_tokens)
-        return self.recon_head(recon_tokens)
-
-    def forward(
-        self,
-        visual_tokens: torch.Tensor,
-        return_reconstruction: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        rl_tokens = self.encode(visual_tokens)
-        if not return_reconstruction:
-            return rl_tokens
-        recon_tokens = self.decode(rl_tokens, visual_tokens.shape[1])
-        return rl_tokens, recon_tokens
-
-
-class RLTLikeActor(nn.Module):
-    """
-    Pure RL-token-like actor.
-
-    It follows the RLT-style interface more directly:
-        single compact RL token(s) + flattened WA reference action + robot state
-        -> MLP -> full action chunk.
-
-    No cross attention and no 2048->512 adapter-space projection are used in the
-    actor.  The MLP depth is kept comparable to the original action head:
-        input_dim -> 1024 -> 512 -> C*A.
-    """
-
-    def __init__(
-        self,
-        rlt_token_dim: int,
-        rlt_num_tokens: int,
-        robot_state_dim: int,
-        action_dim: int,
-        action_chunk: int,
-    ):
-        super().__init__()
-        self.rlt_token_dim = int(rlt_token_dim)
-        self.rlt_num_tokens = int(rlt_num_tokens)
-        self.robot_state_dim = int(robot_state_dim)
-        self.action_dim = int(action_dim)
-        self.action_chunk = int(action_chunk)
-        self.ref_action_flat_dim = self.action_chunk * self.action_dim
-        self.rlt_flat_dim = self.rlt_num_tokens * self.rlt_token_dim
-        self.input_dim = self.rlt_flat_dim + self.robot_state_dim + self.ref_action_flat_dim
-
-        self.output_head = MLP(
-            input_dim=self.input_dim,
-            hidden_dims=[1024, 512],
-            output_dim=self.ref_action_flat_dim,
-            activate_final=False,
-            layer_norm=False,
-        )
-
-    def _infer_batch_device_dtype(
-        self,
-        rl_tokens: Optional[torch.Tensor],
-        robot_state: Optional[torch.Tensor],
-        ref_action: Optional[torch.Tensor],
-    ) -> tuple[int, torch.device, torch.dtype]:
-        for tensor in (rl_tokens, robot_state, ref_action):
-            if tensor is not None:
-                return tensor.shape[0], tensor.device, tensor.dtype
-        raise RuntimeError(
-            "RLTLikeActor received no inputs. At least one of RL tokens / robot_state / ref_action must remain enabled."
-        )
-
-    def _flat_or_zeros(
-        self,
-        tensor: Optional[torch.Tensor],
-        batch_size: int,
-        flat_dim: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if tensor is None:
-            return torch.zeros(batch_size, flat_dim, device=device, dtype=dtype)
-        return tensor.reshape(batch_size, -1).to(device=device, dtype=dtype)
-
-    def forward(
-        self,
-        rl_tokens: Optional[torch.Tensor],
-        robot_state: Optional[torch.Tensor],
-        ref_action: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, device, dtype = self._infer_batch_device_dtype(
-            rl_tokens, robot_state, ref_action
-        )
-
-        rl_flat = self._flat_or_zeros(
-            rl_tokens, batch_size, self.rlt_flat_dim, device, dtype
-        )
-        robot_flat = self._flat_or_zeros(
-            robot_state, batch_size, self.robot_state_dim, device, dtype
-        )
-        ref_flat = self._flat_or_zeros(
-            ref_action, batch_size, self.ref_action_flat_dim, device, dtype
-        )
-
-        actor_input = torch.cat([rl_flat, robot_flat, ref_flat], dim=-1)
-        action_flat = self.output_head(actor_input)
-        action = action_flat.view(batch_size, self.action_chunk, self.action_dim)
-        return action, actor_input
-
-
-class RLTLikeCritic(nn.Module):
-    """
-    Pure RL-token-like twin critic.
-
-    It consumes the same flat RLT-style state as the actor, plus the candidate
-    action chunk:
-        [RL token(s), robot state, WA ref action, candidate action] -> twin MLP Q.
-
-    No cross attention and no 2048->512 projection are used in the critic.
-    """
-
-    def __init__(
-        self,
-        rlt_token_dim: int,
-        rlt_num_tokens: int,
-        robot_state_dim: int,
-        action_dim: int,
-        action_chunk: int,
-    ):
-        super().__init__()
-        self.rlt_token_dim = int(rlt_token_dim)
-        self.rlt_num_tokens = int(rlt_num_tokens)
-        self.robot_state_dim = int(robot_state_dim)
-        self.action_dim = int(action_dim)
-        self.action_chunk = int(action_chunk)
-        self.ref_action_flat_dim = self.action_chunk * self.action_dim
-        self.action_flat_dim = self.ref_action_flat_dim
-        self.rlt_flat_dim = self.rlt_num_tokens * self.rlt_token_dim
-        self.input_dim = (
-            self.rlt_flat_dim
-            + self.robot_state_dim
-            + self.ref_action_flat_dim
-            + self.action_flat_dim
-        )
-        self.value_head = TwinCriticValue(input_dim=self.input_dim)
-
-    def _flat_or_zeros(
-        self,
-        tensor: Optional[torch.Tensor],
-        batch_size: int,
-        flat_dim: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if tensor is None:
-            return torch.zeros(batch_size, flat_dim, device=device, dtype=dtype)
-        return tensor.reshape(batch_size, -1).to(device=device, dtype=dtype)
-
-    def forward(
-        self,
-        rl_tokens: Optional[torch.Tensor],
-        robot_state: Optional[torch.Tensor],
-        ref_action: Optional[torch.Tensor],
-        action: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size = action.shape[0]
-        device = action.device
-        dtype = action.dtype
-
-        rl_flat = self._flat_or_zeros(
-            rl_tokens, batch_size, self.rlt_flat_dim, device, dtype
-        )
-        robot_flat = self._flat_or_zeros(
-            robot_state, batch_size, self.robot_state_dim, device, dtype
-        )
-        ref_flat = self._flat_or_zeros(
-            ref_action, batch_size, self.ref_action_flat_dim, device, dtype
-        )
-        action_flat = action.reshape(batch_size, -1).to(device=device, dtype=dtype)
-
-        critic_input = torch.cat([rl_flat, robot_flat, ref_flat, action_flat], dim=-1)
-        q1, q2 = self.value_head(critic_input)
-        return q1, q2, critic_input
 
 class GigaWorldPolicy(BasePolicy, nn.Module):
     """
     RLinf Giga World Action policy wrapper.
 
-    This version keeps the frozen WA backbone for reference-action generation
-    and VAE-latent extraction, and adds trainable RL heads:
-      - cross_attention: full visual tokens + action-conditioned attention
-      - rlt_like: one 2048-dim RL token + pure MLP actor/critic
-      - concat_mlp: legacy flattened visual feature + MLP
-      - twin critics + target networks
+    Frozen WA backbone plus trainable cross-attention actor/critic heads.
     """
 
     def __init__(self, cfg: DictConfig, torch_dtype: Optional[torch.dtype] = None):
         super().__init__()
 
         policy_cfg = cfg.giga_world_policy
+        transformer_ckpt = cfg.model_path
         _setup_wa_paths(
             wa_root=policy_cfg.wa_root,
             diffusers_src=policy_cfg.get("diffusers_src", None),
@@ -702,48 +197,16 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             int(policy_cfg.get("single_view_width", 256)),
             int(policy_cfg.get("single_view_height", 192)),
         )
-        self.full_image_size = (
-            self.single_view_size[0] * 3,
-            self.single_view_size[1],
+        self.ref_image_size = (
+            int(policy_cfg.get("ref_image_width", self.single_view_size[0] * 3)),
+            int(policy_cfg.get("ref_image_height", self.single_view_size[1])),
         )
+        # full_image_size is the image canvas passed to the WA pipeline.
+        self.full_image_size = self.ref_image_size
         self.device_ref = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        transformer_ckpt = cfg.model_path
         base_model_dir = policy_cfg.base_model_dir
         norm_json = policy_cfg.norm_json
-
-        self.enable_latent_debug = bool(policy_cfg.get("enable_latent_debug", False))
-        self.latent_debug_dir = str(
-            policy_cfg.get(
-                "latent_debug_dir",
-                "/shared_disk/users/angen.ye/code/world_module_rollout/results/latent_debug",
-            )
-        )
-        self._latent_debug_dumped = False
-        self._latent_debug_warned = False
-
-        self.enable_action_compare_debug = bool(
-            policy_cfg.get("enable_action_compare_debug", False)
-        )
-        self.action_compare_debug_dir = str(
-            policy_cfg.get(
-                "action_compare_debug_dir",
-                "/shared_disk/users/angen.ye/code/world_module_rollout/results/action_compare_debug",
-            )
-        )
-        self.action_compare_debug_max_batches = int(
-            policy_cfg.get("action_compare_debug_max_batches", 1)
-        )
-        self.action_compare_debug_max_items = int(
-            policy_cfg.get("action_compare_debug_max_items", 1)
-        )
-        self.action_compare_debug_print_full_tensors = bool(
-            policy_cfg.get("action_compare_debug_print_full_tensors", True)
-        )
-        self.action_compare_debug_save_full_tensors = bool(
-            policy_cfg.get("action_compare_debug_save_full_tensors", True)
-        )
-        self._action_compare_debug_dump_count = 0
 
         # rollout switch: keep base WA by default until RL worker is ready.
         # This flag must live in the state_dict so actor->rollout weight sync can carry it.
@@ -754,7 +217,6 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             persistent=True,
         )
 
-        # RLT-style knobs to expose to the future worker
         self.visual_feature_dim = int(policy_cfg.get("visual_feature_dim", 2048))
         self.bc_coef = float(policy_cfg.get("bc_coef", 1.0))
         self.ref_action_dropout_p = float(policy_cfg.get("ref_action_dropout_p", 0.5))
@@ -763,73 +225,15 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             policy_cfg.get("enable_absolute_action_bound", True)
         )
 
-        self.actor_output_mode = str(
-            policy_cfg.get("actor_output_mode", "learned")
-        ).lower()
-        valid_actor_output_modes = {"learned", "hard_copy_ref_action"}
-        if self.actor_output_mode not in valid_actor_output_modes:
-            raise ValueError(
-                f"Unsupported actor_output_mode={self.actor_output_mode}, "
-                f"expected one of {sorted(valid_actor_output_modes)}"
-            )
-
-        self.ref_action_input_mode = str(
-            policy_cfg.get("ref_action_input_mode", "normal")
-        ).lower()
-        valid_ref_action_input_modes = {"normal", "zero", "remove"}
-        if self.ref_action_input_mode not in valid_ref_action_input_modes:
-            raise ValueError(
-                f"Unsupported ref_action_input_mode={self.ref_action_input_mode}, "
-                f"expected one of {sorted(valid_ref_action_input_modes)}"
-            )
-
-        self.visual_input_mode = str(
-            policy_cfg.get("visual_input_mode", "normal")
-        ).lower()
-        valid_visual_input_modes = {"normal", "zero", "remove"}
-        if self.visual_input_mode not in valid_visual_input_modes:
-            raise ValueError(
-                f"Unsupported visual_input_mode={self.visual_input_mode}, "
-                f"expected one of {sorted(valid_visual_input_modes)}"
-            )
-
-        self.robot_state_input_mode = str(
-            policy_cfg.get("robot_state_input_mode", "normal")
-        ).lower()
-        valid_robot_state_input_modes = {"normal", "zero", "remove"}
-        if self.robot_state_input_mode not in valid_robot_state_input_modes:
-            raise ValueError(
-                f"Unsupported robot_state_input_mode={self.robot_state_input_mode}, "
-                f"expected one of {sorted(valid_robot_state_input_modes)}"
-            )
-
-        self.feature_extractor = str(
-            policy_cfg.get(
-                "feature_extractor",
-                policy_cfg.get("fusion_mode", "cross_attention"),
-            )
-        ).lower()
-        # Keep the older name as an alias because the rest of the worker code
-        # already branches on fusion_mode.
-        self.fusion_mode = self.feature_extractor
-        valid_fusion_modes = {"cross_attention", "rlt_like", "concat_mlp"}
-        if self.fusion_mode not in valid_fusion_modes:
-            raise ValueError(
-                f"Unsupported fusion_mode={self.fusion_mode}, "
-                f"expected one of {sorted(valid_fusion_modes)}"
-            )
-
         self.cross_attention_dim = int(policy_cfg.get("cross_attention_dim", 512))
         self.cross_attention_heads = int(policy_cfg.get("cross_attention_heads", 8))
         self.cross_attention_dropout = float(policy_cfg.get("cross_attention_dropout", 0.0))
         self.cross_attention_time_reduce = str(
             policy_cfg.get("cross_attention_time_reduce", "mean")
         ).lower()
-        valid_time_reduce = {"mean", "first"}
-        if self.cross_attention_time_reduce not in valid_time_reduce:
+        if self.cross_attention_time_reduce not in {"mean", "first"}:
             raise ValueError(
-                f"Unsupported cross_attention_time_reduce={self.cross_attention_time_reduce}, "
-                f"expected one of {sorted(valid_time_reduce)}"
+                f"Unsupported cross_attention_time_reduce={self.cross_attention_time_reduce}."
             )
         if self.cross_attention_dim % self.cross_attention_heads != 0:
             raise ValueError(
@@ -837,23 +241,6 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 f"cross_attention_heads ({self.cross_attention_heads})."
             )
         self.max_visual_tokens = int(policy_cfg.get("max_visual_tokens", 1024))
-        self.rlt_num_tokens = int(
-            policy_cfg.get("rlt_num_tokens", policy_cfg.get("rl_token_num_tokens", 1))
-        )
-        self.rlt_token_dim = int(policy_cfg.get("rlt_token_dim", 2048))
-        self.rlt_freeze_tokenizer = bool(policy_cfg.get("rlt_freeze_tokenizer", False))
-        self.rlt_freeze_visual_adapter = bool(
-            policy_cfg.get("rlt_freeze_visual_adapter", self.rlt_freeze_tokenizer)
-        )
-        if self.rlt_num_tokens <= 0:
-            raise ValueError(f"rlt_num_tokens must be positive, got {self.rlt_num_tokens}.")
-        if self.rlt_token_dim <= 0:
-            raise ValueError(f"rlt_token_dim must be positive, got {self.rlt_token_dim}.")
-        if self.rlt_token_dim % self.cross_attention_heads != 0:
-            raise ValueError(
-                f"rlt_token_dim ({self.rlt_token_dim}) must be divisible by "
-                f"cross_attention_heads ({self.cross_attention_heads})."
-            )
 
         vae = AutoencoderKLWan.from_pretrained(
             base_model_dir,
@@ -901,10 +288,6 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             self._load_stat("action", "std", 1.0),
             persistent=False,
         )
-        # q01/q99 in the stats file live in the same *raw* action space as
-        # action mean/std. The actor, however, predicts in normalized model space.
-        # So we must first normalize q01/q99 before using them as model-space
-        # output bounds.
         self.register_buffer(
             "action_q01_raw",
             self._load_stat("action", "q01", -1.0),
@@ -946,91 +329,33 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             persistent=False,
         )
 
-        # ----------------------------
-        # Trainable RL heads
-        # ----------------------------
         self.ref_action_flat_dim = self.action_chunk * self.model_action_dim
         self.robot_state_dim = self.model_action_dim
-        self.visual_cond_dim = 0 if self.visual_input_mode == "remove" else self.visual_feature_dim
-        self.robot_state_cond_dim = 0 if self.robot_state_input_mode == "remove" else self.robot_state_dim
-        self.ref_action_cond_dim = 0 if self.ref_action_input_mode == "remove" else self.ref_action_flat_dim
-        self.rl_state_dim = (
-            self.visual_cond_dim + self.robot_state_cond_dim + self.ref_action_cond_dim
+        self.rl_state_dim = self.cross_attention_dim
+        self.visual_compressor = nn.Sequential(
+            nn.Linear(self.vae_z_dim, self.cross_attention_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.cross_attention_dim),
         )
-
-        if self.fusion_mode in {"cross_attention", "rlt_like"}:
-            self.visual_compressor = nn.Sequential(
-                nn.Linear(self.vae_z_dim, self.cross_attention_dim),
-                nn.GELU(),
-                nn.LayerNorm(self.cross_attention_dim),
-            )
-            self.visual_pos_embed = nn.Parameter(
-                torch.zeros(1, self.max_visual_tokens, self.cross_attention_dim)
-            )
-            nn.init.normal_(self.visual_pos_embed, mean=0.0, std=0.02)
-
-            if self.fusion_mode == "cross_attention":
-                self.actor_head = CrossAttentionActor(
-                    hidden_dim=self.cross_attention_dim,
-                    num_heads=self.cross_attention_heads,
-                    dropout=self.cross_attention_dropout,
-                    robot_state_dim=self.robot_state_dim,
-                    action_dim=self.model_action_dim,
-                    action_chunk=self.action_chunk,
-                )
-                self.critic = CrossAttentionCritic(
-                    hidden_dim=self.cross_attention_dim,
-                    num_heads=self.cross_attention_heads,
-                    dropout=self.cross_attention_dropout,
-                    robot_state_dim=self.robot_state_dim,
-                    action_dim=self.model_action_dim,
-                )
-            else:
-                self.rlt_tokenizer = RLTLikeTokenAutoEncoder(
-                    visual_dim=self.cross_attention_dim,
-                    token_dim=self.rlt_token_dim,
-                    num_heads=self.cross_attention_heads,
-                    dropout=self.cross_attention_dropout,
-                    num_tokens=self.rlt_num_tokens,
-                    max_visual_tokens=self.max_visual_tokens,
-                )
-                self.actor_head = RLTLikeActor(
-                    rlt_token_dim=self.rlt_token_dim,
-                    rlt_num_tokens=self.rlt_num_tokens,
-                    robot_state_dim=self.robot_state_dim,
-                    action_dim=self.model_action_dim,
-                    action_chunk=self.action_chunk,
-                )
-                self.critic = RLTLikeCritic(
-                    rlt_token_dim=self.rlt_token_dim,
-                    rlt_num_tokens=self.rlt_num_tokens,
-                    robot_state_dim=self.robot_state_dim,
-                    action_dim=self.model_action_dim,
-                    action_chunk=self.action_chunk,
-                )
-                if self.rlt_freeze_tokenizer:
-                    self.set_rlt_tokenizer_trainable(
-                        False, include_visual_adapter=self.rlt_freeze_visual_adapter
-                    )
-            self.rl_state_dim = (
-                self.rlt_token_dim if self.fusion_mode == "rlt_like" else self.cross_attention_dim
-            )
-        else:
-            self.visual_compressor = VisualCompressor2D(
-                in_channels=self.vae_z_dim,
-                out_dim=self.visual_feature_dim,
-            )
-            self.actor_head = MLP(
-                input_dim=self.rl_state_dim,
-                hidden_dims=[2048, 1024],
-                output_dim=self.ref_action_flat_dim,
-                activate_final=False,
-                layer_norm=False,
-            )
-            critic_input_dim = self.rl_state_dim + self.ref_action_flat_dim
-            self.critic = TwinCritic(input_dim=critic_input_dim)
-
-        # target networks
+        self.visual_pos_embed = nn.Parameter(
+            torch.zeros(1, self.max_visual_tokens, self.cross_attention_dim)
+        )
+        nn.init.normal_(self.visual_pos_embed, mean=0.0, std=0.02)
+        self.actor_head = CrossAttentionActor(
+            hidden_dim=self.cross_attention_dim,
+            num_heads=self.cross_attention_heads,
+            dropout=self.cross_attention_dropout,
+            robot_state_dim=self.robot_state_dim,
+            action_dim=self.model_action_dim,
+            action_chunk=self.action_chunk,
+        )
+        self.critic = CrossAttentionCritic(
+            hidden_dim=self.cross_attention_dim,
+            num_heads=self.cross_attention_heads,
+            dropout=self.cross_attention_dropout,
+            robot_state_dim=self.robot_state_dim,
+            action_dim=self.model_action_dim,
+        )
         self.actor_target = copy.deepcopy(self.actor_head)
         self.critic_target = copy.deepcopy(self.critic)
         self._set_requires_grad(self.actor_target, False)
@@ -1064,28 +389,12 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
     @staticmethod
     def _set_requires_grad(module: nn.Module, requires_grad: bool):
-        for p in module.parameters():
-            p.requires_grad = requires_grad
+        set_requires_grad(module, requires_grad)
 
     def set_visual_trainable(self, trainable: bool) -> None:
         self._set_requires_grad(self.visual_compressor, trainable)
         if hasattr(self, "visual_pos_embed"):
             self.visual_pos_embed.requires_grad = trainable
-        if hasattr(self, "rlt_tokenizer"):
-            self._set_requires_grad(self.rlt_tokenizer, trainable)
-
-    def set_rlt_tokenizer_trainable(
-        self,
-        trainable: bool,
-        include_visual_adapter: bool = True,
-    ) -> None:
-        if not hasattr(self, "rlt_tokenizer"):
-            return
-        self._set_requires_grad(self.rlt_tokenizer, trainable)
-        if include_visual_adapter:
-            self._set_requires_grad(self.visual_compressor, trainable)
-            if hasattr(self, "visual_pos_embed"):
-                self.visual_pos_embed.requires_grad = trainable
 
     def set_actor_head_trainable(self, trainable: bool) -> None:
         self._set_requires_grad(self.actor_head, trainable)
@@ -1094,13 +403,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         self._set_requires_grad(self.critic, trainable)
 
     def _init_actor_output_small(self):
-        last_linear = None
-        for m in self.actor_head.modules():
-            if isinstance(m, nn.Linear):
-                last_linear = m
-        if last_linear is not None:
-            nn.init.uniform_(last_linear.weight, -1e-3, 1e-3)
-            nn.init.uniform_(last_linear.bias, -1e-3, 1e-3)
+        init_actor_output_small(self.actor_head)
 
     def _load_stat(self, key1: str, key2: str, pad_value: float) -> torch.Tensor:
         x = torch.as_tensor(self.stats[key1][key2], dtype=torch.float32)
@@ -1217,7 +520,15 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             [np.asarray(img_high), np.asarray(img_left), np.asarray(img_right)],
             axis=1,
         )
-        return Image.fromarray(cat)
+        ref_image = Image.fromarray(cat)
+
+        if ref_image.size != self.full_image_size:
+            ref_image = TF.resize(
+                ref_image,
+                (self.full_image_size[1], self.full_image_size[0]),
+                interpolation=InterpolationMode.BILINEAR,
+            )
+        return ref_image
 
     def _normalize_state(self, state_raw: torch.Tensor):
         state_raw = torch.as_tensor(state_raw, dtype=torch.float32).flatten()
@@ -1239,274 +550,14 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             return ""
         return str(task_descriptions[index])
 
-    @staticmethod
-    def _tensor_summary(x: torch.Tensor) -> str:
-        x = x.detach().float().cpu()
-        return (
-            f"shape={tuple(x.shape)}, dtype={x.dtype}, "
-            f"mean={x.mean().item():.6f}, std={x.std().item():.6f}, "
-            f"min={x.min().item():.6f}, max={x.max().item():.6f}"
-        )
-
-    def _dump_latent_debug(self, debug_dict: dict[str, Any], prompt: str):
-        if debug_dict is None or self._latent_debug_dumped:
-            return
-
-        os.makedirs(self.latent_debug_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pid = os.getpid()
-
-        pt_path = os.path.join(
-            self.latent_debug_dir,
-            f"giga_world_policy_latent_debug_pid{pid}_{timestamp}.pt",
-        )
-        txt_path = os.path.join(
-            self.latent_debug_dir,
-            f"giga_world_policy_latent_debug_pid{pid}_{timestamp}.txt",
-        )
-
-        safe_debug = {}
-        summary_lines = [
-            f"prompt: {prompt}",
-            f"pid: {pid}",
-            f"device_ref: {self.device_ref}",
-        ]
-
-        for k, v in debug_dict.items():
-            if torch.is_tensor(v):
-                safe_debug[k] = v.detach().cpu()
-                summary_lines.append(f"{k}: {self._tensor_summary(v)}")
-            else:
-                safe_debug[k] = v
-                summary_lines.append(f"{k}: type={type(v)}")
-
-        torch.save(safe_debug, pt_path)
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(summary_lines))
-
-        for line in summary_lines:
-            print(f"[giga_world_policy] {line}", flush=True)
-        print(f"[giga_world_policy] latent debug saved to: {pt_path}", flush=True)
-        print(f"[giga_world_policy] latent summary saved to: {txt_path}", flush=True)
-
-        self._latent_debug_dumped = True
-
-    def _dump_action_compare_debug(
-        self,
-        env_obs: dict[str, Any],
-        wa_action_model: torch.Tensor,
-        wa_action_exec: torch.Tensor,
-        actor_action_model: torch.Tensor,
-        actor_action_exec: torch.Tensor,
-    ) -> None:
-        if not self.enable_action_compare_debug:
-            return
-        if self._action_compare_debug_dump_count >= self.action_compare_debug_max_batches:
-            return
-
-        os.makedirs(self.action_compare_debug_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        pid = os.getpid()
-        dump_idx = self._action_compare_debug_dump_count
-        self._action_compare_debug_dump_count += 1
-
-        wa_action_model_cpu = wa_action_model.detach().float().cpu()
-        wa_action_exec_cpu = wa_action_exec.detach().float().cpu()
-        actor_action_model_cpu = actor_action_model.detach().float().cpu()
-        actor_action_exec_cpu = actor_action_exec.detach().float().cpu()
-
-        diff_model = actor_action_model_cpu - wa_action_model_cpu
-        diff_exec = actor_action_exec_cpu - wa_action_exec_cpu
-        mse_model_per_sample = diff_model.pow(2).mean(dim=(1, 2))
-        mse_exec_per_sample = diff_exec.pow(2).mean(dim=(1, 2))
-        mse_model_global = float(diff_model.pow(2).mean().item())
-        mse_exec_global = float(diff_exec.pow(2).mean().item())
-
-        task_descriptions = env_obs.get("task_descriptions", None)
-        state_tensor = env_obs.get("states", None)
-
-        batch_pt_path = os.path.join(
-            self.action_compare_debug_dir,
-            f"action_compare_batch_{dump_idx:04d}_pid{pid}_{timestamp}.pt",
-        )
-        if self.action_compare_debug_save_full_tensors:
-            torch.save(
-                {
-                    "wa_action_model": wa_action_model_cpu,
-                    "wa_action_exec": wa_action_exec_cpu,
-                    "actor_action_model": actor_action_model_cpu,
-                    "actor_action_exec": actor_action_exec_cpu,
-                    "diff_model": diff_model,
-                    "diff_exec": diff_exec,
-                    "mse_model_per_sample": mse_model_per_sample,
-                    "mse_exec_per_sample": mse_exec_per_sample,
-                    "states": state_tensor.detach().cpu() if torch.is_tensor(state_tensor) else state_tensor,
-                    "task_descriptions": task_descriptions,
-                },
-                batch_pt_path,
-            )
-
-        summary_lines = [
-            f"pid={pid}",
-            f"dump_idx={dump_idx}",
-            f"task={task_descriptions[0] if task_descriptions else ''}",
-            f"batch_size={wa_action_model_cpu.shape[0]}",
-            f"use_rl_head_for_rollout={self.get_use_rl_head_for_rollout()}",
-            f"mse_model_global={mse_model_global:.10f}",
-            f"mse_exec_global={mse_exec_global:.10f}",
-            f"runtime_action_chunk={self.action_chunk}",
-            f"wa_action_chunk={self.wa_action_chunk}",
-            f"mse_model_per_sample={mse_model_per_sample.tolist()}",
-            f"mse_exec_per_sample={mse_exec_per_sample.tolist()}",
-        ]
-
-        txt_path = os.path.join(
-            self.action_compare_debug_dir,
-            f"action_compare_summary_{dump_idx:04d}_pid{pid}_{timestamp}.txt",
-        )
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(summary_lines))
-
-        max_items = min(int(wa_action_model_cpu.shape[0]), self.action_compare_debug_max_items)
-        for item_idx in range(max_items):
-            item_json_path = os.path.join(
-                self.action_compare_debug_dir,
-                f"action_compare_item_{dump_idx:04d}_sample{item_idx:02d}_pid{pid}_{timestamp}.json",
-            )
-            item_payload = {
-                "pid": pid,
-                "dump_idx": dump_idx,
-                "sample_idx": item_idx,
-                "task_description": (
-                    str(task_descriptions[item_idx])
-                    if task_descriptions is not None and item_idx < len(task_descriptions)
-                    else ""
-                ),
-                "use_rl_head_for_rollout": bool(self.get_use_rl_head_for_rollout()),
-                "mse_model": float(mse_model_per_sample[item_idx].item()),
-                "mse_exec": float(mse_exec_per_sample[item_idx].item()),
-                "state": (
-                    state_tensor[item_idx].detach().cpu().float().tolist()
-                    if torch.is_tensor(state_tensor)
-                    else None
-                ),
-                "wa_action_model": wa_action_model_cpu[item_idx].tolist(),
-                "actor_action_model": actor_action_model_cpu[item_idx].tolist(),
-                "diff_action_model": diff_model[item_idx].tolist(),
-                "wa_action_exec": wa_action_exec_cpu[item_idx].tolist(),
-                "actor_action_exec": actor_action_exec_cpu[item_idx].tolist(),
-                "diff_action_exec": diff_exec[item_idx].tolist(),
-            }
-            with open(item_json_path, "w", encoding="utf-8") as f:
-                json.dump(item_payload, f, ensure_ascii=False, indent=2)
-
-            fig, axes = plt.subplots(2, 3, figsize=(16, 8))
-            fig.suptitle(
-                (
-                    f"sample={item_idx} | mse_model={mse_model_per_sample[item_idx].item():.8f} | "
-                    f"mse_exec={mse_exec_per_sample[item_idx].item():.8f}"
-                ),
-                fontsize=12,
-            )
-
-            model_panels = [
-                (wa_action_model_cpu[item_idx].numpy(), "WA model action"),
-                (actor_action_model_cpu[item_idx].numpy(), "Actor model action"),
-                (diff_model[item_idx].abs().numpy(), "|Model diff|"),
-            ]
-            exec_panels = [
-                (wa_action_exec_cpu[item_idx].numpy(), "WA exec action"),
-                (actor_action_exec_cpu[item_idx].numpy(), "Actor exec action"),
-                (diff_exec[item_idx].abs().numpy(), "|Exec diff|"),
-            ]
-
-            for col, (panel, title) in enumerate(model_panels):
-                ax = axes[0, col]
-                im = ax.imshow(panel, aspect="auto")
-                ax.set_title(title)
-                ax.set_xlabel("action dim")
-                ax.set_ylabel("chunk idx")
-                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-            for col, (panel, title) in enumerate(exec_panels):
-                ax = axes[1, col]
-                im = ax.imshow(panel, aspect="auto")
-                ax.set_title(title)
-                ax.set_xlabel("action dim")
-                ax.set_ylabel("chunk idx")
-                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-            fig_path = os.path.join(
-                self.action_compare_debug_dir,
-                f"action_compare_item_{dump_idx:04d}_sample{item_idx:02d}_pid{pid}_{timestamp}.png",
-            )
-            fig.savefig(fig_path, dpi=160)
-            plt.close(fig)
-
-            print(
-                "[giga_world_policy][action_compare] "
-                f"saved sample={item_idx} figure to {fig_path} | "
-                f"json to {item_json_path} | "
-                f"mse_model={mse_model_per_sample[item_idx].item():.10f} | "
-                f"mse_exec={mse_exec_per_sample[item_idx].item():.10f}",
-                flush=True,
-            )
-            print(
-                "[giga_world_policy][action_compare] "
-                f"sample={item_idx} wa_action_model_summary={self._tensor_summary(wa_action_model_cpu[item_idx])} | "
-                f"actor_action_model_summary={self._tensor_summary(actor_action_model_cpu[item_idx])}",
-                flush=True,
-            )
-            print(
-                "[giga_world_policy][action_compare] "
-                f"sample={item_idx} wa_action_exec_summary={self._tensor_summary(wa_action_exec_cpu[item_idx])} | "
-                f"actor_action_exec_summary={self._tensor_summary(actor_action_exec_cpu[item_idx])}",
-                flush=True,
-            )
-            if self.action_compare_debug_print_full_tensors:
-                print(
-                    "[giga_world_policy][action_compare][full] "
-                    f"sample={item_idx} wa_action_model={wa_action_model_cpu[item_idx].tolist()}",
-                    flush=True,
-                )
-                print(
-                    "[giga_world_policy][action_compare][full] "
-                    f"sample={item_idx} actor_action_model={actor_action_model_cpu[item_idx].tolist()}",
-                    flush=True,
-                )
-                print(
-                    "[giga_world_policy][action_compare][full] "
-                    f"sample={item_idx} wa_action_exec={wa_action_exec_cpu[item_idx].tolist()}",
-                    flush=True,
-                )
-                print(
-                    "[giga_world_policy][action_compare][full] "
-                    f"sample={item_idx} actor_action_exec={actor_action_exec_cpu[item_idx].tolist()}",
-                    flush=True,
-                )
-
-        print(
-            "[giga_world_policy][action_compare] "
-            f"saved batch summary to {txt_path} | "
-            f"batch_pt_path={batch_pt_path if self.action_compare_debug_save_full_tensors else 'disabled'} | "
-            f"mse_model_global={mse_model_global:.10f} | mse_exec_global={mse_exec_global:.10f}",
-            flush=True,
-        )
-
     @torch.no_grad()
     def _run_pipe(
         self,
         ref_image: Image.Image,
         norm_state: torch.Tensor,
         prompt: str,
-    ) -> tuple[torch.Tensor, Optional[dict[str, Any]]]:
-        """
-        Debug path used only once to dump latent stats.
-        """
-        want_debug = self.enable_latent_debug and (not self._latent_debug_dumped)
-
-        common_kwargs = dict(
+    ) -> torch.Tensor:
+        _, pred_delta_norm = self.pipe(
             height=self.full_image_size[1],
             width=self.full_image_size[0],
             action_chunk=self.wa_action_chunk,
@@ -1518,36 +569,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             prompt=prompt,
             return_dict=False,
         )
-
-        if want_debug:
-            try:
-                outputs = self.pipe(
-                    **common_kwargs,
-                    return_latent_debug=True,
-                )
-                if isinstance(outputs, tuple) and len(outputs) >= 3:
-                    _, pred_delta_norm, debug_dict = outputs[:3]
-                    return pred_delta_norm, debug_dict
-
-                if not self._latent_debug_warned:
-                    print(
-                        "[giga_world_policy] warning: pipe accepted debug path but did not "
-                        "return a 3-tuple; falling back to normal inference.",
-                        flush=True,
-                    )
-                    self._latent_debug_warned = True
-            except TypeError as e:
-                if not self._latent_debug_warned:
-                    print(
-                        "[giga_world_policy] warning: pipe does not yet support "
-                        "`return_latent_debug`; falling back to normal inference. "
-                        f"TypeError: {e}",
-                        flush=True,
-                    )
-                    self._latent_debug_warned = True
-
-        _, pred_delta_norm = self.pipe(**common_kwargs)
-        return pred_delta_norm, None
+        return pred_delta_norm
 
     @torch.no_grad()
     def _extract_visual_latent_from_ref(
@@ -1566,7 +588,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             width=self.full_image_size[0],
         ).to(self.device_ref, dtype=torch.float32)
 
-        latents_outputs = self.pipe.prepare_latents(
+        prepare_kwargs = dict(
             image=image,
             batch_size=1,
             num_channels_latents=self.pipe.vae.config.z_dim,
@@ -1580,8 +602,16 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             last_image=None,
             action_chunk=self.wa_action_chunk,
             action_dim=self.model_action_dim,
-            return_latent_debug=False,
         )
+        try:
+            latents_outputs = self.pipe.prepare_latents(
+                **prepare_kwargs,
+                return_latent_debug=False,
+            )
+        except TypeError as e:
+            if "return_latent_debug" not in str(e):
+                raise
+            latents_outputs = self.pipe.prepare_latents(**prepare_kwargs)
 
         if self.pipe.config.expand_timesteps:
             # returns: latents, latent_condition, first_frame_mask, action
@@ -1614,13 +644,11 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         norm_state, state_pad = self._normalize_state(env_obs["states"][index])
         prompt = self._select_prompt(env_obs, index)
 
-        pred_delta_norm, debug_dict = self._run_pipe(
+        pred_delta_norm = self._run_pipe(
             ref_image=ref_image,
             norm_state=norm_state,
             prompt=prompt,
         )
-        if debug_dict is not None:
-            self._dump_latent_debug(debug_dict, prompt=prompt)
 
         if pred_delta_norm.shape[1] < self.action_chunk:
             raise RuntimeError(
@@ -1670,20 +698,15 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             "ref_action_exec": ref_action_exec,
         }
 
-    def _encode_visual_tokens_from_latent(self, visual_latent: torch.Tensor) -> torch.Tensor:
-        """
-        Shared WA/VAE latent tokenization used by both our cross-attention
-        method and the RL-token-like bottleneck baseline.
-
-        visual_latent [B, Z, T, H, W] -> visual_tokens [B, H*W, D]
-        """
+    def encode_visual(self, visual_latent: torch.Tensor) -> torch.Tensor:
         if visual_latent.ndim != 5:
-            raise ValueError(f"Expected visual_latent [B,Z,T,H,W], got {tuple(visual_latent.shape)}")
+            raise ValueError(
+                f"Expected visual_latent [B,Z,T,H,W], got {tuple(visual_latent.shape)}"
+            )
 
         comp_param = next(self.visual_compressor.parameters())
         comp_device = comp_param.device
         comp_dtype = comp_param.dtype
-
         x = visual_latent.to(device=comp_device, dtype=comp_dtype)
         if x.shape[2] == 1 or self.cross_attention_time_reduce == "first":
             x = x[:, :, 0]
@@ -1699,238 +722,6 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         x = self.visual_compressor(x)
         pos = self.visual_pos_embed[:, : x.shape[1]].to(device=comp_device, dtype=comp_dtype)
         return x + pos
-
-    def encode_visual(self, visual_latent: torch.Tensor) -> torch.Tensor:
-        """
-        concat_mlp mode:
-            visual_latent [B, Z, T, H, W] -> [B, 2048]
-        cross_attention mode:
-            visual_latent [B, Z, T, H, W] -> full visual tokens [B, H*W, D]
-        rlt_like mode:
-            visual_latent [B, Z, T, H, W] -> compact RL tokens [B, K, Dr]
-        """
-        if visual_latent.ndim != 5:
-            raise ValueError(f"Expected visual_latent [B,Z,T,H,W], got {tuple(visual_latent.shape)}")
-
-        comp_param = next(self.visual_compressor.parameters())
-        comp_device = comp_param.device
-        comp_dtype = comp_param.dtype
-
-        x = visual_latent.to(device=comp_device, dtype=comp_dtype)
-        if x.shape[2] == 1 or self.cross_attention_time_reduce == "first":
-            x = x[:, :, 0]
-        else:
-            x = x.mean(dim=2)
-
-        if self.fusion_mode == "concat_mlp":
-            return self.visual_compressor(x)
-
-        visual_tokens = self._encode_visual_tokens_from_latent(visual_latent)
-        if self.fusion_mode == "rlt_like":
-            return self.rlt_tokenizer.encode(visual_tokens)
-        return visual_tokens
-
-    def rlt_autoencoder_forward(self, visual_latent: torch.Tensor) -> dict[str, torch.Tensor]:
-        """
-        Stage-1 pretraining objective for the RL-token-like baseline.
-
-        It reconstructs the lightweight WA/VAE visual tokens through a compact
-        bottleneck. Use this in a separate pretraining run, save the checkpoint,
-        then set rlt_freeze_tokenizer=true for the actor-critic run.
-        """
-        if self.fusion_mode != "rlt_like":
-            raise RuntimeError(
-                f"rlt_autoencoder_forward is only available when fusion_mode='rlt_like', got {self.fusion_mode}."
-            )
-        visual_tokens = self._encode_visual_tokens_from_latent(visual_latent)
-        rl_tokens, recon_tokens = self.rlt_tokenizer(
-            visual_tokens, return_reconstruction=True
-        )
-        recon_loss = F.mse_loss(recon_tokens.float(), visual_tokens.detach().float())
-        return {
-            "loss": recon_loss,
-            "recon_loss": recon_loss.detach(),
-            "visual_tokens": visual_tokens,
-            "rl_tokens": rl_tokens,
-            "reconstructed_visual_tokens": recon_tokens,
-        }
-
-    def build_zero_visual_feat_from_latent(
-        self,
-        visual_latent: torch.Tensor,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        batch_size = int(visual_latent.shape[0])
-        if self.fusion_mode == "concat_mlp":
-            return torch.zeros(
-                batch_size,
-                int(self.visual_feature_dim),
-                device=device,
-                dtype=dtype,
-            )
-        if self.fusion_mode == "rlt_like":
-            return torch.zeros(
-                batch_size,
-                int(self.rlt_num_tokens),
-                int(self.rlt_token_dim),
-                device=device,
-                dtype=dtype,
-            )
-        num_visual_tokens = int(visual_latent.shape[-2] * visual_latent.shape[-1])
-        return torch.zeros(
-            batch_size,
-            num_visual_tokens,
-            int(self.cross_attention_dim),
-            device=device,
-            dtype=dtype,
-        )
-
-    def _condition_visual_for_attention(
-        self,
-        visual_feat: torch.Tensor,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
-        visual_tokens = visual_feat.to(device=device, dtype=dtype)
-        visual_summary = visual_tokens.mean(dim=1)
-        if self.visual_input_mode == "remove":
-            return None, torch.zeros_like(visual_summary)
-        if self.visual_input_mode == "zero":
-            zero_tokens = torch.zeros_like(visual_tokens)
-            return zero_tokens, torch.zeros_like(visual_summary)
-        return visual_tokens, visual_summary
-
-    def _condition_robot_state_for_attention(
-        self,
-        robot_state: torch.Tensor,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        robot_state = robot_state.to(device=device, dtype=dtype)
-        if self.robot_state_input_mode == "remove":
-            return None
-        if self.robot_state_input_mode == "zero":
-            return torch.zeros_like(robot_state)
-        return robot_state
-
-    def _condition_ref_action_for_attention(
-        self,
-        ref_action: torch.Tensor,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        ref_action = ref_action.to(device=device, dtype=dtype)
-        if self.ref_action_input_mode == "remove":
-            return None
-        if self.ref_action_input_mode == "zero":
-            return torch.zeros_like(ref_action)
-        return ref_action
-
-    def build_rl_state(
-        self,
-        visual_feat: torch.Tensor,
-        robot_state: torch.Tensor,
-        ref_action: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """
-        Build actor/critic state from the selected conditioning sources.
-
-        concat_mlp mode returns the original concatenated state.
-        cross_attention / rlt_like modes return a compact debug/state summary
-        vector so legacy diagnostics that expect a tensor can keep working.
-        """
-        actor_param = next(self.actor_head.parameters())
-        actor_device = actor_param.device
-        actor_dtype = actor_param.dtype
-
-        if self.fusion_mode in {"cross_attention", "rlt_like"}:
-            visual_tokens_for_state, visual_feat_for_state = self._condition_visual_for_attention(
-                visual_feat,
-                device=actor_device,
-                dtype=actor_dtype,
-            )
-            robot_state_for_state = self._condition_robot_state_for_attention(
-                robot_state,
-                device=actor_device,
-                dtype=actor_dtype,
-            )
-            ref_action_for_state = self._condition_ref_action_for_attention(
-                ref_action,
-                device=actor_device,
-                dtype=actor_dtype,
-            )
-            state_parts = [visual_feat_for_state]
-            if robot_state_for_state is not None:
-                state_parts.append(robot_state_for_state)
-            if ref_action_for_state is not None:
-                state_parts.append(ref_action_for_state.reshape(ref_action_for_state.shape[0], -1))
-            aux = {
-                "visual_feat_for_state": visual_feat_for_state,
-                "robot_state_for_state": (
-                    robot_state_for_state
-                    if robot_state_for_state is not None
-                    else torch.zeros(
-                        robot_state.shape[0],
-                        robot_state.shape[1],
-                        device=actor_device,
-                        dtype=actor_dtype,
-                    )
-                ),
-                "ref_action_flat_for_state": (
-                    ref_action_for_state.reshape(ref_action_for_state.shape[0], -1)
-                    if ref_action_for_state is not None
-                    else torch.zeros(
-                        ref_action.shape[0],
-                        ref_action.shape[1] * ref_action.shape[2],
-                        device=actor_device,
-                        dtype=actor_dtype,
-                    )
-                ),
-            }
-            return torch.cat(state_parts, dim=-1), aux
-
-        visual_feat = visual_feat.to(device=actor_device, dtype=actor_dtype)
-        robot_state = robot_state.to(device=actor_device, dtype=actor_dtype)
-        ref_action_flat = ref_action.reshape(ref_action.shape[0], -1).to(
-            device=actor_device, dtype=actor_dtype
-        )
-
-        parts = []
-        aux = {}
-
-        if self.visual_input_mode != "remove":
-            visual_feat_for_state = (
-                torch.zeros_like(visual_feat) if self.visual_input_mode == "zero" else visual_feat
-            )
-            parts.append(visual_feat_for_state)
-            aux["visual_feat_for_state"] = visual_feat_for_state
-
-        if self.robot_state_input_mode != "remove":
-            robot_state_for_state = (
-                torch.zeros_like(robot_state) if self.robot_state_input_mode == "zero" else robot_state
-            )
-            parts.append(robot_state_for_state)
-            aux["robot_state_for_state"] = robot_state_for_state
-
-        if self.ref_action_input_mode != "remove":
-            ref_action_flat_for_state = (
-                torch.zeros_like(ref_action_flat)
-                if self.ref_action_input_mode == "zero"
-                else ref_action_flat
-            )
-            parts.append(ref_action_flat_for_state)
-            aux["ref_action_flat_for_state"] = ref_action_flat_for_state
-
-        if not parts:
-            raise RuntimeError(
-                "RL state is empty. At least one of visual / robot_state / ref_action must remain in the actor input."
-            )
-
-        return torch.cat(parts, dim=-1), aux
 
     def _apply_ref_action_dropout(
         self,
@@ -1979,126 +770,44 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         ref_action_dropout_p: Optional[float] = None,
         use_target: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """
-        Actor outputs FINAL action chunk directly.
-
-        Inputs:
-            concat_mlp mode: visual_feat [B, 2048]
-            cross_attention mode: visual_feat [B, N, D]
-            robot_state: [B, state_dim]
-            ref_action:  [B, C, A]
-        Returns:
-            action: [B, C, A]
-            aux: dict with rl_state / dropped_ref_action / dropout_mask
-        """
         if ref_action_dropout_p is None:
             ref_action_dropout_p = self.ref_action_dropout_p
 
         cond_ref_action, dropout_mask = self._apply_ref_action_dropout(
             ref_action, p=ref_action_dropout_p
         )
-
         head = self.actor_target if use_target else self.actor_head
         actor_param = next(head.parameters())
         actor_device = actor_param.device
         actor_dtype = actor_param.dtype
 
-        if self.fusion_mode in {"cross_attention", "rlt_like"}:
-            visual_tokens, visual_feat_for_state = self._condition_visual_for_attention(
-                visual_feat,
-                device=actor_device,
-                dtype=actor_dtype,
-            )
-            robot_state_for_state = self._condition_robot_state_for_attention(
-                robot_state,
-                device=actor_device,
-                dtype=actor_dtype,
-            )
-            ref_action_for_state = self._condition_ref_action_for_attention(
-                cond_ref_action,
-                device=actor_device,
-                dtype=actor_dtype,
-            )
-
-            if self.fusion_mode == "cross_attention":
-                learned_action, fused_state = head(
-                    visual_tokens=visual_tokens,
-                    robot_state=robot_state_for_state,
-                    ref_action=ref_action_for_state,
-                )
-            else:
-                learned_action, fused_state = head(
-                    rl_tokens=visual_tokens,
-                    robot_state=robot_state_for_state,
-                    ref_action=ref_action_for_state,
-                )
-
-            if self.actor_output_mode == "hard_copy_ref_action":
-                action = ref_action.to(device=actor_device, dtype=actor_dtype) + 0.0 * learned_action
-            else:
-                action = (
-                    self._bound_absolute_action_model(learned_action)
-                    if self.enable_absolute_action_bound
-                    else learned_action
-                )
-
-            aux = {
-                "raw_action": learned_action,
-                "rl_state": fused_state,
-                "cond_ref_action": cond_ref_action,
-                "visual_feat_for_state": visual_feat_for_state,
-                "robot_state_for_state": (
-                    robot_state_for_state
-                    if robot_state_for_state is not None
-                    else torch.zeros(
-                        robot_state.shape[0],
-                        robot_state.shape[1],
-                        device=actor_device,
-                        dtype=actor_dtype,
-                    )
-                ),
-                "ref_action_flat_for_state": (
-                    ref_action_for_state.reshape(ref_action_for_state.shape[0], -1)
-                    if ref_action_for_state is not None
-                    else torch.zeros(
-                        ref_action.shape[0],
-                        ref_action.shape[1] * ref_action.shape[2],
-                        device=actor_device,
-                        dtype=actor_dtype,
-                    )
-                ),
-                "critic_visual_tokens": visual_tokens,
-                "critic_robot_state": robot_state_for_state,
-                "critic_ref_action": ref_action_for_state,
-            }
-            if dropout_mask is not None:
-                aux["ref_dropout_mask"] = dropout_mask
-            return action, aux
-
-        rl_state, rl_state_aux = self.build_rl_state(
-            visual_feat=visual_feat,
-            robot_state=robot_state,
-            ref_action=cond_ref_action,
+        visual_tokens = visual_feat.to(device=actor_device, dtype=actor_dtype)
+        visual_summary = visual_tokens.mean(dim=1)
+        robot_state_for_state = robot_state.to(device=actor_device, dtype=actor_dtype)
+        ref_action_for_state = cond_ref_action.to(device=actor_device, dtype=actor_dtype)
+        learned_action, fused_state = head(
+            visual_tokens=visual_tokens,
+            robot_state=robot_state_for_state,
+            ref_action=ref_action_for_state,
         )
-
-        action_flat = head(rl_state)
-        learned_action = action_flat.view(-1, self.action_chunk, self.model_action_dim)
-
-        if self.actor_output_mode == "hard_copy_ref_action":
-            action = ref_action.to(dtype=rl_state.dtype) + 0.0 * learned_action
-        else:
-            action = (
-                self._bound_absolute_action_model(learned_action)
-                if self.enable_absolute_action_bound
-                else learned_action
-            )
-
+        action = (
+            self._bound_absolute_action_model(learned_action)
+            if self.enable_absolute_action_bound
+            else learned_action
+        )
         aux = {
             "raw_action": learned_action,
-            "rl_state": rl_state,
+            "rl_state": fused_state,
             "cond_ref_action": cond_ref_action,
+            "visual_feat_for_state": visual_summary,
+            "robot_state_for_state": robot_state_for_state,
+            "ref_action_flat_for_state": ref_action_for_state.reshape(
+                ref_action_for_state.shape[0], -1
+            ),
+            "critic_visual_tokens": visual_tokens,
+            "critic_robot_state": robot_state_for_state,
+            "critic_ref_action": ref_action_for_state,
         }
-        aux.update(rl_state_aux)
         if dropout_mask is not None:
             aux["ref_dropout_mask"] = dropout_mask
         return action, aux
@@ -2117,47 +826,33 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         critic_device = critic_param.device
         critic_dtype = critic_param.dtype
 
+        if critic_visual_tokens is None:
+            raise RuntimeError(
+                "critic_forward requires actor_aux['critic_visual_tokens'] from actor_forward."
+            )
         action_for_critic = (
             self._bound_absolute_action_model(action)
             if self.enable_absolute_action_bound
             else action
+        ).to(device=critic_device, dtype=critic_dtype)
+        visual_tokens = critic_visual_tokens.to(device=critic_device, dtype=critic_dtype)
+        robot_state = (
+            critic_robot_state.to(device=critic_device, dtype=critic_dtype)
+            if critic_robot_state is not None
+            else None
         )
-        action_for_critic = action_for_critic.to(device=critic_device, dtype=critic_dtype)
-
-        if self.fusion_mode in {"cross_attention", "rlt_like"}:
-            if critic_visual_tokens is None and self.visual_input_mode != "remove":
-                raise RuntimeError(
-                    f"{self.fusion_mode} critic_forward requires critic_visual_tokens / RL tokens. "
-                    "Pass actor_aux['critic_visual_tokens'] from actor_forward."
-                )
-            visual_tokens = None
-            if critic_visual_tokens is not None:
-                visual_tokens = critic_visual_tokens.to(device=critic_device, dtype=critic_dtype)
-            robot_state = None
-            if critic_robot_state is not None:
-                robot_state = critic_robot_state.to(device=critic_device, dtype=critic_dtype)
-            ref_action = None
-            if critic_ref_action is not None:
-                ref_action = critic_ref_action.to(device=critic_device, dtype=critic_dtype)
-            if self.fusion_mode == "cross_attention":
-                q1, q2, _ = critic(
-                    visual_tokens=visual_tokens,
-                    robot_state=robot_state,
-                    ref_action=ref_action,
-                    action=action_for_critic,
-                )
-            else:
-                q1, q2, _ = critic(
-                    rl_tokens=visual_tokens,
-                    robot_state=robot_state,
-                    ref_action=ref_action,
-                    action=action_for_critic,
-                )
-            return q1, q2
-
-        rl_state = rl_state.to(device=critic_device, dtype=critic_dtype)
-        action_flat = action_for_critic.reshape(action_for_critic.shape[0], -1)
-        return critic(rl_state, action_flat)
+        ref_action = (
+            critic_ref_action.to(device=critic_device, dtype=critic_dtype)
+            if critic_ref_action is not None
+            else None
+        )
+        q1, q2, _ = critic(
+            visual_tokens=visual_tokens,
+            robot_state=robot_state,
+            ref_action=ref_action,
+            action=action_for_critic,
+        )
+        return q1, q2
 
     def target_actor_forward(
         self,
@@ -2219,37 +914,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         valid_mask: Optional[torch.Tensor] = None,
         reduction: str = "mean",
     ) -> torch.Tensor:
-        """
-        Reserve BC loss exactly for later worker-side actor objective:
-            ||a - a_ref||^2
-
-        When valid_mask is provided, entries outside the valid range are excluded
-        from the reduction instead of contributing zeros to the denominator.
-        """
-        diff = (pred_action.float() - ref_action.float()) ** 2  # [B, C, A]
-        if valid_mask is not None:
-            # valid_mask can be [B,C] or [B,C,1]
-            if valid_mask.ndim == 2:
-                valid_mask = valid_mask.unsqueeze(-1)
-            valid_mask = valid_mask.to(device=diff.device, dtype=diff.dtype)
-            diff = diff * valid_mask
-
-            if reduction == "mean":
-                denom = valid_mask.sum() * diff.shape[-1]
-                return diff.sum() / denom.clamp_min(1.0)
-            if reduction == "sum":
-                return diff.sum()
-            if reduction == "none":
-                return diff
-            raise ValueError(f"Unknown reduction: {reduction}")
-
-        if reduction == "mean":
-            return diff.mean()
-        if reduction == "sum":
-            return diff.sum()
-        if reduction == "none":
-            return diff
-        raise ValueError(f"Unknown reduction: {reduction}")
+        return compute_bc_loss(pred_action, ref_action, valid_mask, reduction)
 
     def set_use_rl_head_for_rollout(self, flag: bool):
         self.use_rl_head_for_rollout_flag.fill_(1 if flag else 0)
@@ -2367,9 +1032,6 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         if mode == "encode_visual":
             return self.encode_visual(kwargs["visual_latent"])
 
-        if mode == "rlt_autoencoder":
-            return self.rlt_autoencoder_forward(kwargs["visual_latent"])
-
         raise ValueError(f"Unsupported mode for default_forward: {mode}")
 
     @torch.no_grad()
@@ -2385,14 +1047,11 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         norm_state, state_pad = self._normalize_state(env_obs["states"][index])
         prompt = self._select_prompt(env_obs, index)
 
-        pred_delta_norm, debug_dict = self._run_pipe(
+        pred_delta_norm = self._run_pipe(
             ref_image=ref_image,
             norm_state=norm_state,
             prompt=prompt,
         )
-
-        if debug_dict is not None:
-            self._dump_latent_debug(debug_dict, prompt=prompt)
 
         if pred_delta_norm.shape[1] < self.action_chunk:
             raise RuntimeError(
@@ -2416,17 +1075,11 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         batch_size = int(env_obs["states"].shape[0])
 
         rollout_uses_actor = self.get_use_rl_head_for_rollout()
-        backbone = None
-        wa_actions_model = None
-        wa_actions_exec = None
         actor_actions_model = None
         actor_actions_exec = None
 
-        if rollout_uses_actor or self.enable_action_compare_debug:
+        if rollout_uses_actor:
             backbone = self.extract_frozen_backbone_batch(env_obs)
-            wa_actions_model = backbone["ref_action"].to(self.device_ref)
-            wa_actions_exec = backbone["ref_action_exec"].to(self.device_ref)
-
             visual_feat = self.encode_visual(backbone["visual_latent"])
             actor_actions_model, _ = self.actor_forward(
                 visual_feat=visual_feat,
@@ -2441,31 +1094,18 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 robot_state=backbone["robot_state"],
             ).to(self.device_ref)
 
-            if self.enable_action_compare_debug:
-                self._dump_action_compare_debug(
-                    env_obs=env_obs,
-                    wa_action_model=wa_actions_model,
-                    wa_action_exec=wa_actions_exec,
-                    actor_action_model=actor_actions_model,
-                    actor_action_exec=actor_actions_exec,
-                )
-
         if rollout_uses_actor:
             actions_model = actor_actions_model
             actions_exec = actor_actions_exec
         else:
-            if wa_actions_model is None or wa_actions_exec is None:
-                exec_chunks = []
-                model_chunks = []
-                for idx in range(batch_size):
-                    action_exec, action_model = self._plan_single(env_obs, idx)
-                    exec_chunks.append(action_exec)
-                    model_chunks.append(action_model)
-                actions_exec = torch.stack(exec_chunks, dim=0).to(self.device_ref)
-                actions_model = torch.stack(model_chunks, dim=0).to(self.device_ref)
-            else:
-                actions_model = wa_actions_model
-                actions_exec = wa_actions_exec
+            exec_chunks = []
+            model_chunks = []
+            for idx in range(batch_size):
+                action_exec, action_model = self._plan_single(env_obs, idx)
+                exec_chunks.append(action_exec)
+                model_chunks.append(action_model)
+            actions_exec = torch.stack(exec_chunks, dim=0).to(self.device_ref)
+            actions_model = torch.stack(model_chunks, dim=0).to(self.device_ref)
 
         result = {
             "prev_logprobs": torch.zeros(

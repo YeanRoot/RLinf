@@ -18,15 +18,17 @@ import os
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
+from rlinf.algorithms.gigawa_losses import (
+    ActorLossConfig,
+    CriticLossConfig,
+    compute_bc_regularized_actor_loss,
+    compute_td3_critic_loss,
+)
 from rlinf.data.embodied_buffer_dataset import (
     PreloadReplayBufferDataset,
     ReplayBufferDataset,
@@ -68,12 +70,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.offline_bc_steps_per_epoch = 0
         self.offline_bc_val_steps = 0
         self.offline_bc_global_batch_per_rank = 0
-        self.offline_rlt_autoencoder_pretrain_enable = False
-        self.offline_rlt_autoencoder_train_buffer = None
-        self.offline_rlt_autoencoder_val_buffer = None
-        self.offline_rlt_autoencoder_steps_per_epoch = 0
-        self.offline_rlt_autoencoder_val_steps = 0
-        self.offline_rlt_autoencoder_global_batch_per_rank = 0
         self.offline_critic_pretrain_enable = False
         self.offline_critic_train_buffer = None
         self.offline_critic_val_buffer = None
@@ -108,24 +104,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.freeze_actor_updates = bool(self.cfg.algorithm.get("freeze_actor_updates", False))
         self.freeze_critic_updates = bool(self.cfg.algorithm.get("freeze_critic_updates", False))
         self.freeze_visual_layers = bool(self.cfg.algorithm.get("freeze_visual_layers", False))
-        actor_bc_guard_cfg = self.cfg.algorithm.get("actor_bc_guard", None) or {}
-        self.actor_bc_guard_mode = str(actor_bc_guard_cfg.get("mode", "none")).lower()
-        self.actor_bc_guard_threshold = float(actor_bc_guard_cfg.get("threshold", 0.004))
-        self.actor_bc_weighted_coef = float(actor_bc_guard_cfg.get("weighted_bc_coef", 50.0))
-        self.actor_bc_penalty_coef = float(actor_bc_guard_cfg.get("hard_penalty_coef", 5000.0))
-        self.actor_bc_penalty_power = float(actor_bc_guard_cfg.get("hard_penalty_power", 1.0))
-        self.actor_bc_trust_region_abs_threshold = float(
-            actor_bc_guard_cfg.get("trust_region_abs_threshold", self.actor_bc_guard_threshold)
-        )
-        self.actor_bc_trust_region_max_increase = float(
-            actor_bc_guard_cfg.get("trust_region_max_increase", 5e-4)
-        )
-        self.actor_bc_trust_region_max_ratio = float(
-            actor_bc_guard_cfg.get("trust_region_max_ratio", 1.15)
-        )
-        self.actor_bc_trust_region_eval_dropout_p = float(
-            actor_bc_guard_cfg.get("trust_region_eval_dropout_p", 0.0)
-        )
 
     # ---------------------------------------------------------------------
     # Init / setup
@@ -423,25 +401,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             else "reextract_features"
         )
 
-        diag_cfg = self.cfg.algorithm.get("action_diagnostics", None)
-        if diag_cfg is None:
-            diag_cfg = {}
-        self.action_diag_enable = bool(diag_cfg.get("enable", False))
-        self.action_diag_every_actor_updates = int(diag_cfg.get("every_actor_updates", 50))
-        self.action_diag_max_save_samples = int(diag_cfg.get("max_save_samples", 4))
-        self.action_diag_visual_feat_plot_dims = int(diag_cfg.get("visual_feat_plot_dims", 256))
-        self.action_diag_last_captured_actor_update = -1
-        self.action_diag_dir = Path(
-            diag_cfg.get(
-                "output_dir",
-                os.path.join(self.cfg.runner.logger.log_path, "action_diagnostics"),
-            )
-        )
-        if self.action_diag_enable and self._rank == 0:
-            self.action_diag_dir.mkdir(parents=True, exist_ok=True)
-
         self._setup_offline_collection(seed=seed)
-        self._setup_offline_rlt_autoencoder_pretrain(seed=seed)
         self._setup_offline_bc_pretrain(seed=seed)
         self._setup_offline_critic_pretrain(seed=seed)
         self._setup_offline_rl_pretrain(seed=seed)
@@ -628,82 +588,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         subset._trajectory_counter = max(subset._trajectory_id_list, default=-1) + 1
         subset._index_version += 1
         return subset
-
-    def _setup_offline_rlt_autoencoder_pretrain(self, seed: int) -> None:
-        rlt_cfg = self.cfg.algorithm.get("offline_rlt_autoencoder_pretrain", None)
-        if rlt_cfg is None:
-            return
-        self.offline_rlt_autoencoder_pretrain_enable = bool(rlt_cfg.get("enable", False))
-        if not self.offline_rlt_autoencoder_pretrain_enable:
-            return
-        if self.demo_buffer is None:
-            raise RuntimeError(
-                "offline_rlt_autoencoder_pretrain requires algorithm.demo_buffer.enable=true and a valid load_path"
-            )
-
-        policy = self._unwrap_policy(self.model)
-        if getattr(policy, "fusion_mode", None) != "rlt_like":
-            raise RuntimeError(
-                "offline_rlt_autoencoder_pretrain requires actor.model.giga_world_policy.feature_extractor=rlt_like"
-            )
-
-        all_ids = list(self.demo_buffer._trajectory_id_list)
-        if len(all_ids) < 2:
-            raise RuntimeError(
-                f"offline_rlt_autoencoder_pretrain needs at least 2 trajectories, got {len(all_ids)}"
-            )
-
-        split_seed = int(rlt_cfg.get("split_seed", seed))
-        val_ratio = float(rlt_cfg.get("val_ratio", 0.2))
-        val_ratio = min(max(val_ratio, 0.0), 0.9)
-        gen = torch.Generator().manual_seed(split_seed + self._rank)
-        perm = torch.randperm(len(all_ids), generator=gen).tolist()
-        shuffled_ids = [all_ids[i] for i in perm]
-        val_count = max(1, int(round(len(shuffled_ids) * val_ratio)))
-        if len(shuffled_ids) - val_count < 1:
-            val_count = max(1, len(shuffled_ids) - 1)
-        train_ids = shuffled_ids[:-val_count]
-        val_ids = shuffled_ids[-val_count:]
-
-        self.offline_rlt_autoencoder_train_buffer = self._make_subset_buffer(
-            self.demo_buffer, train_ids, seed + 151
-        )
-        self.offline_rlt_autoencoder_val_buffer = self._make_subset_buffer(
-            self.demo_buffer, val_ids, seed + 252
-        )
-
-        self.offline_rlt_autoencoder_global_batch_per_rank = (
-            self.cfg.actor.global_batch_size // self._world_size
-        )
-        default_steps = max(
-            1,
-            self.offline_rlt_autoencoder_train_buffer.total_samples
-            // max(1, self.offline_rlt_autoencoder_global_batch_per_rank),
-        )
-        self.offline_rlt_autoencoder_steps_per_epoch = int(
-            rlt_cfg.get("steps_per_epoch", default_steps)
-        )
-        default_val_steps = max(
-            1,
-            min(
-                50,
-                self.offline_rlt_autoencoder_val_buffer.total_samples
-                // max(1, self.offline_rlt_autoencoder_global_batch_per_rank),
-            ),
-        )
-        self.offline_rlt_autoencoder_val_steps = int(
-            rlt_cfg.get("val_steps_per_epoch", default_val_steps)
-        )
-
-        self.log_on_first_rank(
-            f"[offline_rlt_autoencoder_pretrain] enabled | "
-            f"train_traj={self.offline_rlt_autoencoder_train_buffer.size} | "
-            f"val_traj={self.offline_rlt_autoencoder_val_buffer.size} | "
-            f"train_samples={self.offline_rlt_autoencoder_train_buffer.total_samples} | "
-            f"val_samples={self.offline_rlt_autoencoder_val_buffer.total_samples} | "
-            f"steps_per_epoch={self.offline_rlt_autoencoder_steps_per_epoch} | "
-            f"val_steps={self.offline_rlt_autoencoder_val_steps}"
-        )
 
     def _setup_offline_bc_pretrain(self, seed: int) -> None:
         offline_bc_cfg = self.cfg.algorithm.get("offline_bc_pretrain", None)
@@ -1018,19 +902,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         if self.cfg.actor.get("compile_model", False):
             self.model = torch.compile(self.model, mode="default")
 
-    def init_offline_rlt_autoencoder_worker(self):
-        self.setup_model_and_optimizer()
-        self.setup_gigawa_components()
-        policy = self._unwrap_policy(self.model)
-        policy.soft_update_targets(tau=1.0)
-        policy.set_use_rl_head_for_rollout(False)
-        self.rollout_rl_head_enabled = False
-        if self.cfg.actor.get("enable_offload", False):
-            self.offload_param_and_grad()
-            self.offload_optimizer()
-        if self.cfg.actor.get("compile_model", False):
-            self.model = torch.compile(self.model, mode="default")
-
     def init_offline_bc_worker(self):
         self.setup_model_and_optimizer()
         self.setup_gigawa_components()
@@ -1055,16 +926,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         buffer = self.offline_bc_train_buffer if train else self.offline_bc_val_buffer
         return self._offline_sample_batch_from_buffer(
             buffer, self.offline_bc_global_batch_per_rank
-        )
-
-    def _offline_rlt_autoencoder_sample_batch(self, train: bool = True) -> dict[str, torch.Tensor]:
-        buffer = (
-            self.offline_rlt_autoencoder_train_buffer
-            if train
-            else self.offline_rlt_autoencoder_val_buffer
-        )
-        return self._offline_sample_batch_from_buffer(
-            buffer, self.offline_rlt_autoencoder_global_batch_per_rank
         )
 
     def _offline_critic_sample_batch(self, train: bool = True) -> dict[str, torch.Tensor]:
@@ -1227,7 +1088,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     buffer, self.offline_rl_global_batch_per_rank
                 )
                 for batch in self._offline_rl_microbatches(global_batch):
-                    actor_loss, actor_metrics, _ = self.forward_actor(batch, capture_diagnostics=False)
+                    actor_loss, actor_metrics = self.forward_actor(batch)
                     batch_count = float(batch["actions"].shape[0])
                     local[f"{prefix}/count"] += batch_count
                     local[f"{prefix}/actor_loss_sum"] += float(actor_loss.item()) * batch_count
@@ -1474,7 +1335,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 step_bc_losses = []
                 step_q_pi = []
                 for batch in train_micro_batch_list:
-                    actor_loss, actor_metrics, _ = self.forward_actor(batch, capture_diagnostics=False)
+                    actor_loss, actor_metrics = self.forward_actor(batch)
                     (actor_loss / self.gradient_accumulation).backward()
                     step_actor_losses.append(float(actor_loss.detach().item()))
                     step_bc_losses.append(float(actor_metrics.get("bc_loss", 0.0)))
@@ -1563,112 +1424,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.offload_optimizer()
         return metrics
 
-    @Worker.timer("forward_rlt_autoencoder")
-    def forward_rlt_autoencoder(self, batch):
-        curr_obs = batch["curr_obs"]
-        out = self.model(
-            forward_type=ForwardType.DEFAULT,
-            mode="rlt_autoencoder",
-            visual_latent=curr_obs["visual_latent"].to(self.device, dtype=self.torch_dtype),
-        )
-        loss = out["loss"]
-        with torch.no_grad():
-            visual_tokens = out["visual_tokens"].detach().float()
-            recon_tokens = out["reconstructed_visual_tokens"].detach().float()
-            token_energy = visual_tokens.pow(2).mean().clamp_min(1e-8)
-            rel_mse = (recon_tokens - visual_tokens).pow(2).mean() / token_energy
-        return loss, {
-            "rlt_autoencoder/recon_loss": float(loss.detach().item()),
-            "rlt_autoencoder/relative_mse": float(rel_mse.item()),
-            "rlt_autoencoder/token_abs_mean": float(visual_tokens.abs().mean().item()),
-            "rlt_autoencoder/rl_token_abs_mean": float(out["rl_tokens"].detach().float().abs().mean().item()),
-        }
-
-    @Worker.timer("run_offline_rlt_autoencoder_epoch")
-    def run_offline_rlt_autoencoder_epoch(self):
-        if not self.offline_rlt_autoencoder_pretrain_enable:
-            raise RuntimeError("offline_rlt_autoencoder_pretrain is not enabled in config")
-        if self.cfg.actor.get("enable_offload", False):
-            self.load_param_and_grad(self.device)
-            self.load_optimizer(self.device)
-
-        assert (
-            self.cfg.actor.global_batch_size
-            % (self.cfg.actor.micro_batch_size * self._world_size)
-            == 0
-        )
-        self.gradient_accumulation = (
-            self.cfg.actor.global_batch_size
-            // self.cfg.actor.micro_batch_size
-            // self._world_size
-        )
-
-        self.model.train()
-        train_losses = []
-        train_rel_mse = []
-        grad_norms = []
-        for _ in range(self.offline_rlt_autoencoder_steps_per_epoch):
-            global_batch = self._offline_rlt_autoencoder_sample_batch(train=True)
-            train_micro_batch_list = split_dict_to_chunk(
-                global_batch,
-                max(1, self.offline_rlt_autoencoder_global_batch_per_rank // self.cfg.actor.micro_batch_size),
-            )
-            self.optimizer.zero_grad()
-            step_losses = []
-            step_rel_mse = []
-            for batch in train_micro_batch_list:
-                loss, metrics = self.forward_rlt_autoencoder(batch)
-                (loss / self.gradient_accumulation).backward()
-                step_losses.append(float(metrics["rlt_autoencoder/recon_loss"]))
-                step_rel_mse.append(float(metrics["rlt_autoencoder/relative_mse"]))
-            actor_grad_norm = self.model.clip_grad_norm_(
-                max_norm=self.cfg.actor.optim.clip_grad
-            )
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            self.update_step += 1
-            train_losses.append(float(np.mean(step_losses)))
-            train_rel_mse.append(float(np.mean(step_rel_mse)))
-            grad_norms.append(float(actor_grad_norm))
-
-        self.model.eval()
-        val_losses = []
-        val_rel_mse = []
-        with torch.no_grad():
-            for _ in range(self.offline_rlt_autoencoder_val_steps):
-                global_batch = self._offline_rlt_autoencoder_sample_batch(train=False)
-                val_micro_batch_list = split_dict_to_chunk(
-                    global_batch,
-                    max(1, self.offline_rlt_autoencoder_global_batch_per_rank // self.cfg.actor.micro_batch_size),
-                )
-                for batch in val_micro_batch_list:
-                    _, metrics = self.forward_rlt_autoencoder(batch)
-                    val_losses.append(float(metrics["rlt_autoencoder/recon_loss"]))
-                    val_rel_mse.append(float(metrics["rlt_autoencoder/relative_mse"]))
-
-        metrics = {
-            "offline_rlt_autoencoder/train_recon_loss": float(np.mean(train_losses)) if train_losses else 0.0,
-            "offline_rlt_autoencoder/val_recon_loss": float(np.mean(val_losses)) if val_losses else 0.0,
-            "offline_rlt_autoencoder/train_relative_mse": float(np.mean(train_rel_mse)) if train_rel_mse else 0.0,
-            "offline_rlt_autoencoder/val_relative_mse": float(np.mean(val_rel_mse)) if val_rel_mse else 0.0,
-            "offline_rlt_autoencoder/overfit_gap": (
-                float(np.mean(val_losses)) - float(np.mean(train_losses))
-            ) if train_losses and val_losses else 0.0,
-            "offline_rlt_autoencoder/train_num_trajectories": float(self.offline_rlt_autoencoder_train_buffer.size),
-            "offline_rlt_autoencoder/val_num_trajectories": float(self.offline_rlt_autoencoder_val_buffer.size),
-            "offline_rlt_autoencoder/train_total_samples": float(self.offline_rlt_autoencoder_train_buffer.total_samples),
-            "offline_rlt_autoencoder/val_total_samples": float(self.offline_rlt_autoencoder_val_buffer.total_samples),
-            "offline_rlt_autoencoder/steps_per_epoch": float(self.offline_rlt_autoencoder_steps_per_epoch),
-            "offline_rlt_autoencoder/val_steps": float(self.offline_rlt_autoencoder_val_steps),
-            "actor/lr": float(self.optimizer.param_groups[0]["lr"]),
-            "actor/grad_norm": float(np.mean(grad_norms)) if grad_norms else 0.0,
-        }
-        metrics = all_reduce_dict(metrics, op=torch.distributed.ReduceOp.AVG)
-        if self.cfg.actor.get("enable_offload", False):
-            self.offload_param_and_grad()
-            self.offload_optimizer()
-        return metrics
-
     @Worker.timer("run_offline_bc_epoch")
     def run_offline_bc_epoch(self):
         if not self.offline_bc_pretrain_enable:
@@ -1700,7 +1455,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.optimizer.zero_grad()
             step_losses = []
             for batch in train_micro_batch_list:
-                actor_loss, actor_metrics, _ = self.forward_actor(batch, capture_diagnostics=False)
+                actor_loss, actor_metrics = self.forward_actor(batch)
                 actor_loss = actor_loss / self.gradient_accumulation
                 actor_loss.backward()
                 step_losses.append(float(actor_metrics["bc_loss"]))
@@ -1724,7 +1479,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     max(1, self.offline_bc_global_batch_per_rank // self.cfg.actor.micro_batch_size),
                 )
                 for batch in val_micro_batch_list:
-                    actor_loss, actor_metrics, _ = self.forward_actor(batch, capture_diagnostics=False)
+                    actor_loss, actor_metrics = self.forward_actor(batch)
                     val_losses.append(float(actor_metrics["bc_loss"]))
 
         metrics = {
@@ -1753,186 +1508,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     def _unwrap_policy(model):
         return model.module if hasattr(model, "module") else model
 
-    def _visual_mode(self) -> str:
-        policy = self._unwrap_policy(self.model)
-        return str(getattr(policy, "visual_input_mode", "normal")).lower()
-
     def _build_visual_feat_for_actor(self, visual_latent: torch.Tensor) -> torch.Tensor:
-        policy = self._unwrap_policy(self.model)
-        mode = self._visual_mode()
-        if mode == "normal":
-            return self.model(
-                forward_type=ForwardType.DEFAULT,
-                mode="encode_visual",
-                visual_latent=visual_latent.to(self.device, dtype=self.torch_dtype),
-            )
-
-        return policy.build_zero_visual_feat_from_latent(
-            visual_latent=visual_latent,
-            device=self.device,
-            dtype=self.torch_dtype,
+        return self.model(
+            forward_type=ForwardType.DEFAULT,
+            mode="encode_visual",
+            visual_latent=visual_latent.to(self.device, dtype=self.torch_dtype),
         )
-
-    def _should_capture_action_diagnostics(self) -> bool:
-        if not self.action_diag_enable:
-            return False
-        if self._rank != 0:
-            return False
-        interval = max(1, self.action_diag_every_actor_updates)
-        upcoming_actor_update = self.actor_update_step + 1
-        if upcoming_actor_update == self.action_diag_last_captured_actor_update:
-            return False
-        return (upcoming_actor_update % interval) == 0
-
-    @staticmethod
-    def _tensor_to_numpy(t: torch.Tensor) -> np.ndarray:
-        return t.detach().float().cpu().numpy()
-
-    def _save_action_diagnostics(self, debug_bundle: dict[str, Any]) -> dict[str, float]:
-        policy = self._unwrap_policy(self.model)
-        tag = debug_bundle["tag"]
-        out_dir = self.action_diag_dir / tag
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        ref_action = debug_bundle["ref_action"].detach().float()
-        pred_action = debug_bundle["pred_action"].detach().float()
-        robot_state = debug_bundle["robot_state"].detach().float()
-        visual_feat = debug_bundle["visual_feat"].detach().float()
-        visual_feat_for_state = debug_bundle["visual_feat_for_state"].detach().float()
-        robot_state_for_state = debug_bundle["robot_state_for_state"].detach().float()
-        ref_action_flat_for_state = debug_bundle["ref_action_flat_for_state"].detach().float()
-
-        with torch.no_grad():
-            ref_exec = policy.postprocess_action_model_batch(ref_action, robot_state)
-            pred_exec = policy.postprocess_action_model_batch(pred_action, robot_state)
-
-        model_diff = pred_action - ref_action
-        exec_diff = pred_exec - ref_exec
-
-        model_mse = float((model_diff.pow(2)).mean().item())
-        exec_mse = float((exec_diff.pow(2)).mean().item())
-        model_mae = float(model_diff.abs().mean().item())
-        exec_mae = float(exec_diff.abs().mean().item())
-        model_max_abs = float(model_diff.abs().max().item())
-        exec_max_abs = float(exec_diff.abs().max().item())
-
-        model_per_step_mse = model_diff.pow(2).mean(dim=(0, 2)).cpu().numpy()
-        exec_per_step_mse = exec_diff.pow(2).mean(dim=(0, 2)).cpu().numpy()
-        model_per_dim_mse = model_diff.pow(2).mean(dim=(0, 1)).cpu().numpy()
-        exec_per_dim_mse = exec_diff.pow(2).mean(dim=(0, 1)).cpu().numpy()
-
-        save_n = min(self.action_diag_max_save_samples, ref_action.shape[0])
-        np.savez_compressed(
-            out_dir / "action_diag_samples.npz",
-            ref_action_model=self._tensor_to_numpy(ref_action[:save_n]),
-            actor_action_model=self._tensor_to_numpy(pred_action[:save_n]),
-            diff_action_model=self._tensor_to_numpy(model_diff[:save_n]),
-            ref_action_exec=self._tensor_to_numpy(ref_exec[:save_n]),
-            actor_action_exec=self._tensor_to_numpy(pred_exec[:save_n]),
-            diff_action_exec=self._tensor_to_numpy(exec_diff[:save_n]),
-            robot_state=self._tensor_to_numpy(robot_state[:save_n]),
-            visual_feat=self._tensor_to_numpy(visual_feat[:save_n]),
-            visual_feat_for_state=self._tensor_to_numpy(visual_feat_for_state[:save_n]),
-            robot_state_for_state=self._tensor_to_numpy(robot_state_for_state[:save_n]),
-            ref_action_flat_for_state=self._tensor_to_numpy(ref_action_flat_for_state[:save_n]),
-            model_per_step_mse=model_per_step_mse,
-            exec_per_step_mse=exec_per_step_mse,
-            model_per_dim_mse=model_per_dim_mse,
-            exec_per_dim_mse=exec_per_dim_mse,
-        )
-
-        summary = {
-            "tag": tag,
-            "update_step": int(debug_bundle["update_step"]),
-            "actor_update_step": int(debug_bundle["actor_update_step"]),
-            "batch_size": int(ref_action.shape[0]),
-            "save_n": int(save_n),
-            "model_mse": model_mse,
-            "exec_mse": exec_mse,
-            "model_mae": model_mae,
-            "exec_mae": exec_mae,
-            "model_max_abs": model_max_abs,
-            "exec_max_abs": exec_max_abs,
-            "visual_feat_norm": float(visual_feat.norm(dim=-1).mean().item()),
-            "robot_state_norm": float(robot_state.norm(dim=-1).mean().item()),
-            "model_per_step_mse": model_per_step_mse.tolist(),
-            "exec_per_step_mse": exec_per_step_mse.tolist(),
-            "model_per_dim_mse": model_per_dim_mse.tolist(),
-            "exec_per_dim_mse": exec_per_dim_mse.tolist(),
-        }
-        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
-
-        sample_idx = 0
-        ref0 = self._tensor_to_numpy(ref_action[sample_idx])
-        pred0 = self._tensor_to_numpy(pred_action[sample_idx])
-        diff0 = self._tensor_to_numpy(model_diff[sample_idx])
-        ref_exec0 = self._tensor_to_numpy(ref_exec[sample_idx])
-        pred_exec0 = self._tensor_to_numpy(pred_exec[sample_idx])
-        diff_exec0 = self._tensor_to_numpy(exec_diff[sample_idx])
-        robot0 = self._tensor_to_numpy(robot_state[sample_idx])
-        visual0 = self._tensor_to_numpy(visual_feat_for_state[sample_idx])
-        plot_visual_dims = min(self.action_diag_visual_feat_plot_dims, visual0.shape[0])
-
-        fig, axes = plt.subplots(3, 4, figsize=(24, 14))
-        ax = axes.reshape(-1)
-        ims = []
-        ims.append(ax[0].imshow(ref0, aspect="auto")); ax[0].set_title("WA ref action (model)")
-        ims.append(ax[1].imshow(pred0, aspect="auto")); ax[1].set_title("Actor action (model)")
-        ims.append(ax[2].imshow(diff0, aspect="auto")); ax[2].set_title("Diff (model)")
-        ims.append(ax[3].imshow(ref_exec0, aspect="auto")); ax[3].set_title("WA ref action (exec)")
-        ims.append(ax[4].imshow(pred_exec0, aspect="auto")); ax[4].set_title("Actor action (exec)")
-        ims.append(ax[5].imshow(diff_exec0, aspect="auto")); ax[5].set_title("Diff (exec)")
-        for i in range(6):
-            fig.colorbar(ims[i], ax=ax[i], fraction=0.046, pad=0.04)
-            ax[i].set_xlabel("action dim")
-            ax[i].set_ylabel("chunk step")
-
-        ax[6].plot(model_per_step_mse, label="model")
-        ax[6].plot(exec_per_step_mse, label="exec")
-        ax[6].set_title("Per-step MSE")
-        ax[6].set_xlabel("chunk step")
-        ax[6].legend()
-
-        ax[7].plot(model_per_dim_mse, label="model")
-        ax[7].plot(exec_per_dim_mse, label="exec")
-        ax[7].set_title("Per-dim MSE")
-        ax[7].set_xlabel("action dim")
-        ax[7].legend()
-
-        ax[8].plot(robot0)
-        ax[8].set_title("Actor input robot_state (sample0)")
-        ax[8].set_xlabel("state dim")
-
-        ax[9].plot(visual0[:plot_visual_dims])
-        ax[9].set_title(f"Actor input visual feat first {plot_visual_dims} dims")
-        ax[9].set_xlabel("visual dim")
-
-        ax[10].hist(diff0.reshape(-1), bins=50)
-        ax[10].set_title("Model diff histogram (sample0)")
-
-        ax[11].axis("off")
-        ax[11].text(0.0, 1.0,
-            f"tag: {tag}\nmodel_mse: {model_mse:.6e}\nexec_mse: {exec_mse:.6e}\nmodel_mae: {model_mae:.6e}\nexec_mae: {exec_mae:.6e}\nmodel_max_abs: {model_max_abs:.6e}\nexec_max_abs: {exec_max_abs:.6e}\nvisual_feat_norm: {summary['visual_feat_norm']:.6e}\nrobot_state_norm: {summary['robot_state_norm']:.6e}",
-            va="top", family="monospace")
-
-        fig.tight_layout()
-        fig.savefig(out_dir / "action_diag_overview.png", dpi=180)
-        plt.close(fig)
-
-        self.action_diag_last_captured_actor_update = int(debug_bundle["actor_update_step"])
-        self.log_on_first_rank(
-            f"[action_diagnostics] saved to {out_dir} | model_mse={model_mse:.6e} | exec_mse={exec_mse:.6e}"
-        )
-
-        return {
-            "actor_debug/model_mse": model_mse,
-            "actor_debug/exec_mse": exec_mse,
-            "actor_debug/model_mae": model_mae,
-            "actor_debug/exec_mae": exec_mae,
-            "actor_debug/model_max_abs": model_max_abs,
-            "actor_debug/exec_max_abs": exec_max_abs,
-        }
 
     def _maybe_enable_rollout_rl_head(self):
         if self.rollout_rl_head_enabled:
@@ -2083,6 +1664,47 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             else:
                 step_obs[key] = value
         return step_obs
+
+    def _fallback_task_description(self, traj: Trajectory) -> str | None:
+        sources = []
+        if getattr(traj, "sample_infos", None):
+            sources.extend(traj.sample_infos)
+        metadata = getattr(traj, "metadata", None)
+        if metadata:
+            sources.append(metadata)
+
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key in (
+                "task_description",
+                "task_descriptions",
+                "instruction",
+                "prompt",
+            ):
+                value = source.get(key)
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, (list, tuple)) and value:
+                    first_value = value[0]
+                    if isinstance(first_value, str):
+                        return first_value
+
+        task_name = self.cfg.env.train.get("task_config", {}).get("task_name", None)
+        if isinstance(task_name, str) and task_name:
+            return task_name.replace("_", " ")
+        return None
+
+    def _ensure_task_description(
+        self,
+        obs_step: dict[str, Any],
+        task_description: str | None,
+    ) -> dict[str, Any]:
+        if "task_descriptions" in obs_step or task_description is None:
+            return obs_step
+        obs_step = dict(obs_step)
+        obs_step["task_descriptions"] = [task_description]
+        return obs_step
 
     @torch.no_grad()
     def _extract_step_features(self, obs_step: dict[str, Any]) -> dict[str, torch.Tensor]:
@@ -2350,6 +1972,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         source_actions = source_actions[:traj_len]
         curr_obs = self._slice_obs_dict(traj.curr_obs, traj_len)
         next_obs = self._slice_obs_dict(traj.next_obs, traj_len)
+        task_description = self._fallback_task_description(traj)
 
         curr_visual_latents = []
         curr_robot_states = []
@@ -2361,6 +1984,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         for t in range(traj_len):
             curr_step_obs = self._slice_obs_at_step(curr_obs, t)
             next_step_obs = self._slice_obs_at_step(next_obs, t)
+            curr_step_obs = self._ensure_task_description(curr_step_obs, task_description)
+            next_step_obs = self._ensure_task_description(next_step_obs, task_description)
 
             curr_feat = self._extract_step_features(curr_step_obs)
             next_feat = self._extract_step_features(next_step_obs)
@@ -2476,6 +2101,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         primitive_obs = self._build_primitive_obs_dict(traj, traj_len=traj_len)
         if "states" not in primitive_obs:
             return [self._convert_standard_trajectory_for_gigawa(traj)]
+        task_description = self._fallback_task_description(traj)
 
         traj_len, batch_size, action_flat_dim = source_actions.shape
         action_chunk = int(self.cfg.actor.model.get("num_action_chunks", 1))
@@ -2555,6 +2181,8 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
                 curr_step_obs = {key: value[start_idx] for key, value in primitive_obs.items()}
                 next_step_obs = {key: value[next_idx] for key, value in primitive_obs.items()}
+                curr_step_obs = self._ensure_task_description(curr_step_obs, task_description)
+                next_step_obs = self._ensure_task_description(next_step_obs, task_description)
                 curr_feat = self._extract_step_features(curr_step_obs)
                 next_feat = self._extract_step_features(next_step_obs)
                 curr_visual_latents.append(curr_feat["visual_latent"])
@@ -2739,7 +2367,14 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             return x
 
         expected_chunk = int(self.cfg.actor.model.get("num_action_chunks", 1))
-        action_dim = int(self.cfg.actor.model.get("action_dim", 14))
+        policy = self._unwrap_policy(self.model)
+        action_dim = int(
+            getattr(
+                policy,
+                "model_action_dim",
+                self.cfg.actor.model.get("model_action_dim", self.cfg.actor.model.get("action_dim", 14)),
+            )
+        )
 
         y = x
         if y.ndim == 2:
@@ -2840,11 +2475,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 critic_ref_action=next_actor_aux.get("critic_ref_action", None),
             )
             target_q = torch.minimum(target_q1, target_q2)
-            if self.enable_critic_q_upper_bound and self.critic_target_clamp_to_upper_bound:
-                target_q = torch.clamp(target_q, max=self.critic_q_upper_bound)
-            target_q_values = rewards_for_bootstrap + (1.0 - done_mask) * self.discount * target_q
-            if self.enable_critic_q_upper_bound and self.critic_target_clamp_to_upper_bound:
-                target_q_values = torch.clamp(target_q_values, max=self.critic_q_upper_bound)
 
         q1, q2 = self.model(
             forward_type=ForwardType.DEFAULT,
@@ -2856,22 +2486,20 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             critic_robot_state=curr_critic_robot_state,
             critic_ref_action=curr_critic_ref_action,
         )
-        target_q_values = target_q_values.to(dtype=q1.dtype)
-        critic_loss = F.mse_loss(q1, target_q_values) + F.mse_loss(q2, target_q_values)
-        q1_overshoot = torch.clamp(q1 - self.critic_q_upper_bound, min=0.0)
-        q2_overshoot = torch.clamp(q2 - self.critic_q_upper_bound, min=0.0)
-        critic_overshoot_penalty = q1.new_zeros(())
-        if self.enable_critic_q_upper_bound and self.critic_overshoot_penalty_coef > 0.0:
-            critic_overshoot_penalty = self.critic_overshoot_penalty_coef * (
-                (q1_overshoot ** 2).mean() + (q2_overshoot ** 2).mean()
-            )
-            critic_loss = critic_loss + critic_overshoot_penalty
-        critic_aux = {
-            "critic_overshoot_penalty": float(critic_overshoot_penalty.detach().item()),
-            "q1_overshoot": float(q1_overshoot.mean().detach().item()),
-            "q2_overshoot": float(q2_overshoot.mean().detach().item()),
-            "q_upper_bound": float(self.critic_q_upper_bound),
-        }
+        critic_loss, target_q_values, critic_aux = compute_td3_critic_loss(
+            q1=q1,
+            q2=q2,
+            rewards=rewards_for_bootstrap,
+            done_mask=done_mask,
+            target_q=target_q,
+            cfg=CriticLossConfig(
+                discount=float(self.discount),
+                q_upper_bound=float(self.critic_q_upper_bound),
+                clamp_target_to_upper_bound=bool(self.critic_target_clamp_to_upper_bound),
+                enable_q_upper_bound=bool(self.enable_critic_q_upper_bound),
+                overshoot_penalty_coef=float(self.critic_overshoot_penalty_coef),
+            ),
+        )
         return critic_loss, q1, q2, target_q_values, critic_aux
 
     @Worker.timer("forward_critic")
@@ -2888,92 +2516,19 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         }
 
     def _compose_actor_loss(self, q_pi: torch.Tensor | None, bc_loss: torch.Tensor):
-        q_term = bc_loss.new_zeros(())
-        q_weight = 1.0
-        effective_bc_coef = float(self.bc_coef)
-        hard_penalty = bc_loss.new_zeros(())
-        guard_active = 0.0
-        q_pi_for_loss = None
-
-        if q_pi is not None:
-            q_pi_for_loss = q_pi
-            if self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound:
-                q_pi_for_loss = torch.clamp(q_pi_for_loss, max=self.critic_q_upper_bound)
-            q_term = (-q_pi_for_loss).mean()
-
-        if self.actor_bc_guard_mode == "weighted":
-            effective_bc_coef = float(self.actor_bc_weighted_coef)
-        elif self.actor_bc_guard_mode == "hard_penalty":
-            exceed = torch.clamp(bc_loss - self.actor_bc_guard_threshold, min=0.0)
-            if float(exceed.detach().item()) > 0.0:
-                guard_active = 1.0
-            hard_penalty = self.actor_bc_penalty_coef * (exceed ** self.actor_bc_penalty_power)
-
-        actor_loss = q_weight * q_term + effective_bc_coef * bc_loss + hard_penalty
-        metrics = {
-            "bc_coef_effective": effective_bc_coef,
-            "q_upper_bound_enabled": float(self.enable_critic_q_upper_bound),
-            "q_upper_bound": float(self.critic_q_upper_bound),
-            "q_loss_clamped": float(
-                self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound and q_pi is not None
+        return compute_bc_regularized_actor_loss(
+            q_pi=q_pi,
+            bc_loss=bc_loss,
+            cfg=ActorLossConfig(
+                bc_coef=float(self.bc_coef),
+                q_upper_bound=float(self.critic_q_upper_bound),
+                clamp_q_to_upper_bound=bool(self.actor_q_loss_clamp_to_upper_bound),
+                enable_q_upper_bound=bool(self.enable_critic_q_upper_bound),
             ),
-            "q_pi_used_for_loss": float(
-                q_pi_for_loss.mean().detach().item()
-            ) if q_pi_for_loss is not None else 0.0,
-            "bc_guard_mode": float(
-                0 if self.actor_bc_guard_mode == "none"
-                else 1 if self.actor_bc_guard_mode == "weighted"
-                else 2 if self.actor_bc_guard_mode == "hard_penalty"
-                else 3 if self.actor_bc_guard_mode == "trust_region"
-                else -1
-            ),
-            "bc_guard_threshold": float(self.actor_bc_guard_threshold),
-            "bc_guard_penalty": float(hard_penalty.detach().item()),
-            "bc_guard_active": guard_active,
-            "q_weight": q_weight,
-        }
-        return actor_loss, metrics
-
-    @torch.no_grad()
-    def _compute_mean_bc_loss_on_batches(self, micro_batch_list: list[dict[str, torch.Tensor]]) -> float:
-        policy = self._unwrap_policy(self.model)
-        was_training = self.model.training
-        self.model.eval()
-        losses = []
-        for batch in micro_batch_list:
-            curr_obs = batch["curr_obs"]
-            robot_state = curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype)
-            ref_action = self._reshape_runtime_action_tensor(
-                curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
-                tensor_name="curr_obs.ref_action",
-            )
-            visual_feat = self._build_visual_feat_for_actor(curr_obs["visual_latent"])
-            pi, _ = self.model(
-                forward_type=ForwardType.DEFAULT,
-                mode="actor",
-                visual_feat=visual_feat,
-                robot_state=robot_state,
-                ref_action=ref_action,
-                ref_action_dropout_p=self.actor_bc_trust_region_eval_dropout_p,
-                use_target=False,
-            )
-            bc_loss = policy.compute_bc_loss(pi, ref_action)
-            losses.append(float(bc_loss.item()))
-        if was_training:
-            self.model.train()
-        return float(np.mean(losses)) if losses else 0.0
-
-    def _snapshot_trainable_params(self):
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        snapshot = [p.detach().clone() for p in params]
-        return params, snapshot
-
-    def _restore_trainable_params(self, params, snapshot) -> None:
-        for p, saved in zip(params, snapshot):
-            p.data.copy_(saved)
+        )
 
     @Worker.timer("forward_actor")
-    def forward_actor(self, batch, capture_diagnostics: bool = False):
+    def forward_actor(self, batch):
         policy = self._unwrap_policy(self.model)
         curr_obs = batch["curr_obs"]
         robot_state = curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype)
@@ -3005,28 +2560,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             ),
         }
 
-        debug_bundle = None
-        if capture_diagnostics:
-            debug_bundle = {
-                "tag": f"update_{self.update_step + 1:07d}_actor_{self.actor_update_step + 1:07d}",
-                "update_step": self.update_step + 1,
-                "actor_update_step": self.actor_update_step + 1,
-                "ref_action": ref_action.detach(),
-                "pred_action": pi.detach(),
-                "robot_state": robot_state.detach(),
-                "visual_feat": visual_feat.detach(),
-                "visual_feat_for_state": actor_aux.get("visual_feat_for_state", visual_feat).detach(),
-                "robot_state_for_state": actor_aux.get("robot_state_for_state", robot_state).detach(),
-                "ref_action_flat_for_state": actor_aux.get(
-                    "ref_action_flat_for_state", ref_action.reshape(ref_action.shape[0], -1)
-                ).detach(),
-            }
-
         if self.stage_actor_bc_only:
             actor_loss, guard_metrics = self._compose_actor_loss(q_pi=None, bc_loss=bc_loss)
             metrics.update(guard_metrics)
             metrics["q_pi"] = 0.0
-            return actor_loss, metrics, debug_bundle
+            return actor_loss, metrics
 
         rl_state = actor_aux["rl_state"]
         q1_pi, q2_pi = self.model(
@@ -3048,7 +2586,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             metrics["q_pi_clamped"] = torch.clamp(q_pi, max=self.critic_q_upper_bound).mean().item()
         else:
             metrics["q_pi_clamped"] = q_pi.mean().item()
-        return actor_loss, metrics, debug_bundle
+        return actor_loss, metrics
 
     # ---------------------------------------------------------------------
     # Update loop
@@ -3075,14 +2613,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "stage/freeze_actor_updates": float(self.freeze_actor_updates),
             "stage/freeze_critic_updates": float(self.freeze_critic_updates),
             "stage/freeze_visual_layers": float(self.freeze_visual_layers),
-            "stage/actor_bc_guard_mode": float(
-                0 if self.actor_bc_guard_mode == "none"
-                else 1 if self.actor_bc_guard_mode == "weighted"
-                else 2 if self.actor_bc_guard_mode == "hard_penalty"
-                else 3 if self.actor_bc_guard_mode == "trust_region"
-                else -1
-            ),
-            "stage/actor_bc_guard_threshold": float(self.actor_bc_guard_threshold),
         }
 
         critic_updated = False
@@ -3131,57 +2661,21 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             all_actor_metrics = {}
-            capture_debug_this_update = self._should_capture_action_diagnostics()
-            debug_bundle_to_save = None
-            trust_region_mode = self.actor_bc_guard_mode == "trust_region"
-            pre_step_bc_loss = None
-            actor_param_snapshot = None
-            optimizer_snapshot = None
-            if trust_region_mode:
-                pre_step_bc_loss = self._compute_mean_bc_loss_on_batches(train_micro_batch_list)
-                actor_params, actor_param_snapshot = self._snapshot_trainable_params()
-                optimizer_snapshot = copy.deepcopy(self.optimizer.state_dict())
-            else:
-                actor_params = None
-            for batch_idx, batch in enumerate(train_micro_batch_list):
-                actor_loss, actor_metrics, debug_bundle = self.forward_actor(
-                    batch,
-                    capture_diagnostics=(capture_debug_this_update and batch_idx == 0),
-                )
+            for batch in train_micro_batch_list:
+                actor_loss, actor_metrics = self.forward_actor(batch)
                 actor_loss = actor_loss / self.gradient_accumulation
                 actor_loss.backward()
                 gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
                 append_to_dict(all_actor_metrics, actor_metrics)
-                if debug_bundle is not None:
-                    debug_bundle_to_save = debug_bundle
             all_actor_metrics = {f"actor/{k}": np.mean(v) for k, v in all_actor_metrics.items()}
             actor_grad_norm = self.model.clip_grad_norm_(
                 max_norm=self.cfg.actor.optim.clip_grad
             )
             self.optimizer.step()
+            self.lr_scheduler.step()
+            actor_updated = True
+            self.actor_update_step += 1
 
-            trust_region_rejected = False
-            post_step_bc_loss = None
-            if trust_region_mode:
-                post_step_bc_loss = self._compute_mean_bc_loss_on_batches(train_micro_batch_list)
-                bc_abs_ok = post_step_bc_loss <= self.actor_bc_trust_region_abs_threshold
-                bc_delta_ok = post_step_bc_loss <= (pre_step_bc_loss + self.actor_bc_trust_region_max_increase)
-                trust_region_rejected = not (bc_abs_ok and bc_delta_ok)
-                if trust_region_rejected:
-                    self._restore_trainable_params(actor_params, actor_param_snapshot)
-                    self.optimizer.load_state_dict(optimizer_snapshot)
-                    self.optimizer.zero_grad()
-                else:
-                    self.lr_scheduler.step()
-                    actor_updated = True
-                    self.actor_update_step += 1
-            else:
-                self.lr_scheduler.step()
-                actor_updated = True
-                self.actor_update_step += 1
-
-            if debug_bundle_to_save is not None and actor_updated:
-                metrics_data.update(self._save_action_diagnostics(debug_bundle_to_save))
             metrics_data.update(
                 {
                     "gigawa/actor_loss": np.mean(gbs_actor_loss),
@@ -3190,17 +2684,6 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     **all_actor_metrics,
                 }
             )
-            if trust_region_mode:
-                metrics_data.update(
-                    {
-                        "actor/trust_region_bc_before": float(pre_step_bc_loss),
-                        "actor/trust_region_bc_after": float(post_step_bc_loss),
-                        "actor/trust_region_abs_threshold": float(self.actor_bc_trust_region_abs_threshold),
-                        "actor/trust_region_max_increase": float(self.actor_bc_trust_region_max_increase),
-                        "actor/trust_region_max_ratio": float(self.actor_bc_trust_region_max_ratio),
-                        "actor/trust_region_rejected": float(trust_region_rejected),
-                    }
-                )
         elif self.stage_freeze_actor or self.freeze_actor_updates:
             metrics_data.update({"gigawa/actor_frozen": 1.0})
 

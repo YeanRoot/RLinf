@@ -121,11 +121,6 @@ algorithm:
   freeze_actor_updates: false
   freeze_visual_layers: false
 
-  actor_bc_guard:
-    mode: none
-    # threshold: 0.004
-    # weighted_bc_coef: 50.0
-
   sampling_params:
     do_sample: False
     temperature_train: -1
@@ -237,16 +232,9 @@ actor:
       prompt: null
       use_safetensors: False
       use_rl_head_for_rollout: false
-      visual_feature_dim: 2048
       bc_coef: 50
       ref_action_dropout_p: 0
       target_tau: 0.005
-      enable_latent_debug: False
-      latent_debug_dir: "${runner.logger.log_path}/latent_debug"
-      actor_output_mode: "learned"
-      visual_input_mode: "normal"
-      robot_state_input_mode: "normal"
-      ref_action_input_mode: "normal"
       wa_num_action_chunks: 48
 
   optim:
