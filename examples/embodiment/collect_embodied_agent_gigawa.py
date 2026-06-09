@@ -853,6 +853,8 @@ def main(cfg) -> None:
     rank_dir.mkdir(parents=True, exist_ok=True)
 
     target_num_episodes = _as_int(collect_cfg.get("target_num_trajectories", 0), 0)
+    target_success_episodes = _as_int(collect_cfg.get("target_success_episodes", 0), 0)
+    target_failure_episodes = _as_int(collect_cfg.get("target_failure_episodes", 0), 0)
     max_collection_steps = _as_int(collect_cfg.get("max_collection_steps", 10**9), 10**9)
     log_interval = max(1, _as_int(collect_cfg.get("log_interval", 1), 1))
     success_threshold = _as_float(collect_cfg.get("success_threshold", 0.5), 0.5)
@@ -953,31 +955,52 @@ def main(cfg) -> None:
                     # Do not increment collected/success/failure: this was a
                     # keyboard-leak/too-short episode, not training data.
                 else:
-                    row = _save_episode(
-                        episode,
-                        episode_frames,
-                        rank_dir=rank_dir,
-                        episode_idx=episode_idx,
-                        success_threshold=success_threshold,
-                        video_fps=video_fps,
-                        save_video=save_video,
-                        write_replay_index=write_replay_index_per_split,
-                        replay_index_seed=replay_index_seed,
+                    q = _quality(episode, success_threshold)
+                    would_be_success = bool(q.get("is_success", False))
+                    split_target_full = (
+                        would_be_success
+                        and target_success_episodes > 0
+                        and success >= target_success_episodes
+                    ) or (
+                        (not would_be_success)
+                        and target_failure_episodes > 0
+                        and failure >= target_failure_episodes
                     )
-                    collected += 1
-                    total_samples += int(row.get("num_samples", 0))
-                    if row.get("is_success", False):
-                        success += 1
+                    if split_target_full:
+                        split = "success" if would_be_success else "failure"
+                        row = _record_skipped_episode(
+                            episode,
+                            rank_dir=rank_dir,
+                            episode_idx=episode_idx,
+                            success_threshold=success_threshold,
+                            reason=f"target_{split}_full",
+                        )
                     else:
-                        failure += 1
-                    print(
-                        f"[collect-episode] saved episode={episode_idx} split={row['split']} "
-                        f"outcome={row.get('episode_outcome')} chunks={row.get('num_chunks')} "
-                        f"samples={row.get('num_samples')} reward_sum={row.get('reward_sum'):.3f} "
-                        f"done_any={row.get('done_any')} valid_steps={row.get('valid_steps')} "
-                        f"reason={save_reason} path={row['path']}",
-                        flush=True,
-                    )
+                        row = _save_episode(
+                            episode,
+                            episode_frames,
+                            rank_dir=rank_dir,
+                            episode_idx=episode_idx,
+                            success_threshold=success_threshold,
+                            video_fps=video_fps,
+                            save_video=save_video,
+                            write_replay_index=write_replay_index_per_split,
+                            replay_index_seed=replay_index_seed,
+                        )
+                        collected += 1
+                        total_samples += int(row.get("num_samples", 0))
+                        if row.get("is_success", False):
+                            success += 1
+                        else:
+                            failure += 1
+                        print(
+                            f"[collect-episode] saved episode={episode_idx} split={row['split']} "
+                            f"outcome={row.get('episode_outcome')} chunks={row.get('num_chunks')} "
+                            f"samples={row.get('num_samples')} reward_sum={row.get('reward_sum'):.3f} "
+                            f"done_any={row.get('done_any')} valid_steps={row.get('valid_steps')} "
+                            f"reason={save_reason} path={row['path']}",
+                            flush=True,
+                        )
                 episode_parts = []
                 episode_frames = []
                 _write_metadata(rank_dir, collected, total_samples, success, failure)
@@ -1021,6 +1044,14 @@ def main(cfg) -> None:
                     + (" | " + " | ".join(metric_msg) if metric_msg else "")
                 )
 
+            split_targets_done = (
+                target_success_episodes > 0
+                and target_failure_episodes > 0
+                and success >= target_success_episodes
+                and failure >= target_failure_episodes
+            )
+            if split_targets_done:
+                break
             if target_num_episodes > 0 and collected >= target_num_episodes:
                 break
     finally:

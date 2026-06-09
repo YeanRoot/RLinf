@@ -105,8 +105,26 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
-            model_dict = torch.load(self.cfg.runner.ckpt_path)
-            self.hf_model.load_state_dict(model_dict)
+            ckpt_path = self.cfg.runner.ckpt_path
+            self.log_info(f"Loading rollout model checkpoint from runner.ckpt_path={ckpt_path}")
+            model_dict = torch.load(ckpt_path, map_location="cpu")
+            missing, unexpected = self.hf_model.load_state_dict(model_dict, strict=False)
+            self.log_info(
+                "Loaded rollout model checkpoint "
+                f"from {ckpt_path} | missing_keys={len(missing)} | unexpected_keys={len(unexpected)}"
+            )
+            if missing:
+                self.log_info(f"Missing rollout checkpoint keys sample: {list(missing)[:20]}")
+            if unexpected:
+                self.log_info(f"Unexpected rollout checkpoint keys sample: {list(unexpected)[:20]}")
+            giga_policy_cfg = self.cfg.actor.model.get("giga_world_policy", {})
+            rollout_flag = bool(giga_policy_cfg.get("use_rl_head_for_rollout", False))
+            if hasattr(self.hf_model, "set_use_rl_head_for_rollout"):
+                self.hf_model.set_use_rl_head_for_rollout(rollout_flag)
+                self.log_info(
+                    "Re-applied rollout actor flag after checkpoint load: "
+                    f"use_rl_head_for_rollout={rollout_flag}"
+                )
 
         if self.cfg.rollout.get("expert_model", None):
             expert_model_config = copy.deepcopy(self.cfg.actor.model)

@@ -612,9 +612,12 @@ def _build_trajectory_for_episode(
 
     curr_visual, curr_robot, curr_ref = [], [], []
     next_visual, next_robot, next_ref = [], [], []
+    curr_raw_states, next_raw_states = [], []
+    raw_states_before_action = []
 
     for i, (s, valid_len, next_idx) in enumerate(zip(starts, valid_lens, next_indices)):
         exec_chunk, valid_len = _make_padded_exec_chunk(actions_exec_all, s, chunk_size)
+        raw_state_chunk, _ = _make_padded_exec_chunk(states, s, chunk_size)
         model_action_flat = _convert_exec_chunk_to_model_action(
             policy=policy,
             exec_chunk=exec_chunk,
@@ -635,6 +638,9 @@ def _build_trajectory_for_episode(
         next_visual.append(nxt["visual_latent"])
         next_robot.append(nxt["robot_state"])
         next_ref.append(nxt["ref_action"])
+        curr_raw_states.append(torch.as_tensor(states[s], dtype=torch.float32))
+        next_raw_states.append(torch.as_tensor(states[next_idx], dtype=torch.float32))
+        raw_states_before_action.append(torch.as_tensor(raw_state_chunk, dtype=torch.float32))
 
     # All LeRobot demonstrations are assumed successful: final valid primitive step gets reward=1.
     last_i = T - 1
@@ -645,16 +651,25 @@ def _build_trajectory_for_episode(
 
     actions_model_tensor = torch.stack(actions_model, dim=0).view(T, 1, -1).contiguous()
     actions_exec_tensor = torch.stack(actions_exec, dim=0).view(T, 1, -1).contiguous()
+    curr_ref_tensor = torch.stack(curr_ref, dim=0).view(T, 1, chunk_size, policy.model_action_dim).contiguous()
+    next_ref_tensor = torch.stack(next_ref, dim=0).view(T, 1, chunk_size, policy.model_action_dim).contiguous()
+    curr_raw_state_tensor = torch.stack(curr_raw_states, dim=0).view(T, 1, -1).contiguous()
+    next_raw_state_tensor = torch.stack(next_raw_states, dim=0).view(T, 1, -1).contiguous()
+    raw_states_before_action_tensor = torch.stack(raw_states_before_action, dim=0).unsqueeze(1).contiguous()
 
     curr_obs = {
         "visual_latent": torch.stack(curr_visual, dim=0).unsqueeze(1).contiguous(),
         "robot_state": torch.stack(curr_robot, dim=0).unsqueeze(1).contiguous(),
-        "ref_action": torch.stack(curr_ref, dim=0).unsqueeze(1).contiguous(),
+        "raw_robot_state": curr_raw_state_tensor.clone(),
+        "states": curr_raw_state_tensor.clone(),
+        "ref_action": curr_ref_tensor,
     }
     next_obs = {
         "visual_latent": torch.stack(next_visual, dim=0).unsqueeze(1).contiguous(),
         "robot_state": torch.stack(next_robot, dim=0).unsqueeze(1).contiguous(),
-        "ref_action": torch.stack(next_ref, dim=0).unsqueeze(1).contiguous(),
+        "raw_robot_state": next_raw_state_tensor.clone(),
+        "states": next_raw_state_tensor.clone(),
+        "ref_action": next_ref_tensor,
     }
 
     # forward_inputs is not needed by offline BC forward_actor(), but keeping it
@@ -665,6 +680,16 @@ def _build_trajectory_for_episode(
         "action": actions_exec_tensor.clone(),
         "action_exec": actions_exec_tensor.clone(),
         "model_action": actions_model_tensor.clone(),
+        "policy_action_model": curr_ref_tensor.clone(),
+        "policy_action_exec": policy.model_action_to_exec_action(
+            curr_ref_tensor.view(T, chunk_size, policy.model_action_dim).to(policy.device_ref),
+            curr_raw_state_tensor.view(T, -1).to(policy.device_ref),
+        ).detach().cpu().float().view(T, 1, -1).contiguous(),
+        "raw_robot_state": curr_raw_state_tensor.clone(),
+        "raw_states_before_action": raw_states_before_action_tensor.clone(),
+        "robot_state": curr_obs["robot_state"].clone(),
+        "visual_latent": curr_obs["visual_latent"].clone(),
+        "ref_action": curr_ref_tensor.clone(),
         "action_valid_mask": action_valid_mask.clone(),
         "intervene_flags": intervene_flags.clone(),
         "action_source": action_source,

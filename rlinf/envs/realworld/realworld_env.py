@@ -37,7 +37,7 @@ from rlinf.envs.realworld.common.wrappers import (
 from rlinf.envs.realworld.venv import NoAutoResetSyncVectorEnv
 from rlinf.envs.utils import to_tensor
 from rlinf.scheduler import WorkerInfo
-
+import pdb
 
 class RealWorldEnv(gym.Env):
     def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
@@ -82,6 +82,10 @@ class RealWorldEnv(gym.Env):
         self.pad_interrupted_chunks = bool(cfg.get("pad_interrupted_chunks", True))
         self.intervention_max_steps = int(cfg.get("intervention_max_steps", 96))
         self.debug_intervention_chunks = bool(cfg.get("debug_intervention_chunks", True))
+        self.debug_action_chunks = bool(cfg.get("debug_action_chunks", False))
+        self.debug_action_chunks_max = int(cfg.get("debug_action_chunks_max", 4))
+        self.debug_action_print_full = bool(cfg.get("debug_action_print_full", True))
+        self._debug_action_chunk_count = 0
         # Do not auto-toggle PageDown at normal chunk end anymore. Teleop is
         # released only by the user's second PageDown, or by terminal/timeout/reset
         # safety fallbacks below.
@@ -102,6 +106,24 @@ class RealWorldEnv(gym.Env):
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
         self._init_reset_state_ids()
+
+    @staticmethod
+    def _debug_format_action(value, max_items: int = 14) -> str:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+        clipped = arr[:max_items]
+        text = " ".join(f"{v:+.5f}" for v in clipped.tolist())
+        if arr.size > max_items:
+            text += f" ... ({arr.size} dims)"
+        return text
+
+    @staticmethod
+    def _debug_max_abs_delta(a, b) -> float:
+        aa = np.asarray(a, dtype=np.float64).reshape(-1)
+        bb = np.asarray(b, dtype=np.float64).reshape(-1)
+        n = min(aa.size, bb.size)
+        if n == 0:
+            return 0.0
+        return float(np.max(np.abs(aa[:n] - bb[:n])))
 
     def _create_env(self, env_idx: int):
         worker_info: WorkerInfo = self.worker_info
@@ -396,6 +418,7 @@ class RealWorldEnv(gym.Env):
         )
 
         self._elapsed_steps += 1
+        # pdb.set_trace()
         raw_obs, _reward, terminations, truncations, infos = self.env.step(actions)
         raw_states_after = self._raw_state_from_raw_obs(raw_obs).copy()
         self._last_raw_states = raw_states_after.copy()
@@ -493,6 +516,38 @@ class RealWorldEnv(gym.Env):
         """
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = int(chunk_actions.shape[1])
+        debug_this_chunk = (
+            self.debug_action_chunks
+            and self._debug_action_chunk_count < self.debug_action_chunks_max
+        )
+        debug_chunk_idx = self._debug_action_chunk_count
+        if debug_this_chunk:
+            self._debug_action_chunk_count += 1
+            chunk_np = (
+                chunk_actions.detach().cpu().numpy()
+                if isinstance(chunk_actions, torch.Tensor)
+                else np.asarray(chunk_actions)
+            )
+            print(
+                "[RealWorldEnv][action_debug] "
+                f"chunk={debug_chunk_idx} chunk_actions_shape={tuple(chunk_np.shape)} "
+                f"chunk_size={chunk_size}",
+                flush=True,
+            )
+            if chunk_np.ndim >= 3 and chunk_np.shape[0] > 0:
+                first = chunk_np[0, 0]
+                last = chunk_np[0, chunk_size - 1]
+                print(
+                    "[RealWorldEnv][action_debug] "
+                    f"chunk={debug_chunk_idx} first_step={self._debug_format_action(first)}",
+                    flush=True,
+                )
+                print(
+                    "[RealWorldEnv][action_debug] "
+                    f"chunk={debug_chunk_idx} last_step={self._debug_format_action(last)} "
+                    f"max_abs_last_minus_first={self._debug_max_abs_delta(last, first):.6f}",
+                    flush=True,
+                )
         obs_list = []
         infos_list = []
         chunk_rewards = []
@@ -616,6 +671,25 @@ class RealWorldEnv(gym.Env):
                 actions = chunk_actions[:, i]
                 action_source = 0
 
+            if debug_this_chunk:
+                action_np = (
+                    actions.detach().cpu().numpy()
+                    if isinstance(actions, torch.Tensor)
+                    else np.asarray(actions)
+                )
+                raw_before_np = (
+                    np.asarray(self._last_raw_states)
+                    if self._last_raw_states is not None
+                    else np.zeros_like(action_np, dtype=np.float64)
+                )
+                print(
+                    "[RealWorldEnv][action_debug] "
+                    f"chunk={debug_chunk_idx} step={i:02d} source={action_source} "
+                    f"command={self._debug_format_action(action_np[0])} "
+                    f"max_abs_command_minus_prev_raw={self._debug_max_abs_delta(action_np[0], raw_before_np[0]):.6f}",
+                    flush=True,
+                )
+
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions, auto_reset=False
             )
@@ -636,6 +710,23 @@ class RealWorldEnv(gym.Env):
             if action_source == 1 or (intervention_active and teleop_after):
                 _force_human_step_info(infos)
                 action_source = 1
+
+            if debug_this_chunk:
+                executed_np = infos["executed_action_abs"].detach().cpu().numpy()
+                policy_np = infos["policy_action_abs"].detach().cpu().numpy()
+                raw_before_np = infos["raw_state_before_action"].detach().cpu().numpy()
+                raw_after_np = infos["raw_state_after_action"].detach().cpu().numpy()
+                print(
+                    "[RealWorldEnv][action_debug] "
+                    f"chunk={debug_chunk_idx} step={i:02d} source_after={action_source} "
+                    f"policy={self._debug_format_action(policy_np[0])} "
+                    f"executed={self._debug_format_action(executed_np[0])} "
+                    f"raw_before={self._debug_format_action(raw_before_np[0])} "
+                    f"raw_after={self._debug_format_action(raw_after_np[0])} "
+                    f"max_abs_executed_minus_raw_before={self._debug_max_abs_delta(executed_np[0], raw_before_np[0]):.6f} "
+                    f"max_abs_raw_after_minus_raw_before={self._debug_max_abs_delta(raw_after_np[0], raw_before_np[0]):.6f}",
+                    flush=True,
+                )
 
             _append_record(
                 extracted_obs,

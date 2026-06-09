@@ -30,7 +30,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_actor_intervention"
+    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_kwj/piper_lerobot_actor_bc_warmup/checkpoints/global_step_40"
     project_name: rlinf
     experiment_name: "collect_piper_gigawa_actor_intervention"
     logger_backends: ["tensorboard"]
@@ -44,7 +44,7 @@ runner:
   only_eval: false
   val_check_interval: -1
   save_interval: 200
-  resume_dir: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_warmup/piper_lerobot_actor_bc_warmup/checkpoints/global_step_200"
+  resume_dir: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_kwj/piper_lerobot_actor_bc_warmup/checkpoints/global_step_300"
   ckpt_path: null
   resume_load_optimizer_and_scheduler_state: false
 
@@ -276,7 +276,7 @@ actor:
     giga_world_policy:
       wa_root: "/home/ubuntu/users/angen.ye/gwp/wan-casual-cj"
       base_model_dir: "/home/ubuntu/users/angen.ye/gwp/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers"
-      norm_json: "/home/ubuntu/users/angen.ye/gwp/norm_stats_delta.json"
+      norm_json: "/home/ubuntu/users/angen.ye/gwp/rollout1/norm_stats_delta.json"
       diffusers_src: null
       robotype: "aloha"
       actor_robot_state_mode: normalized

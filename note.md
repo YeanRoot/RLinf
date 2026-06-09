@@ -1,9 +1,37 @@
 cd /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment
 python collect_embodied_agent_gigawa.py \
   --config-path ./config \
-  --config-name collect_piper_gigawa_realworld_actor
+  --config-name collect_piper_gigawa_realworld_success50_failure50
+
+python collect_embodied_agent_gigawa.py \
+  --config-path ./config \
+  --config-name collect_piper_gigawa_realworld_actor_takeover_test
+
 
 train
+
+纯BC
+python train_embodied_agent_gigawa_offline_bc.py \
+--config-path ./config \
+--config-name offline_piper_actor_bc_warmup
+
+TD3+BC
+python train_embodied_agent_gigawa_offline_rl_fast.py \
+  --config-path ./config \
+  --config-name offline_rl_pretrain
+
+离线compare
+cd /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment
+python compare_wa_actor_on_pt.py \
+  --config-path ./config \
+  --config-name offline_piper_actor_bc_warmup \
+  --pt /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention100/offline_collection/rank_0/all \
+  --actor-ckpt /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_kwj/piper_lerobot_actor_bc_warmup/checkpoints/global_step_400 \
+  --out /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/action_compare_intervention_all \
+  --batch-size 8
+重新计算pt norm_state
+cd /home/ubuntu/users/angen.ye/gwp/rollout1
+python compute_norm_stats_from_pt.py
 
 cd /home/ubuntu/users/angen.ye/gwp/RLinf
 export PYTHONPATH=$PWD:$PYTHONPATH
@@ -109,7 +137,7 @@ gpu报错用这个
 
 
 启动ros节点
- export RLINF_SKIP_ROS_CLEANUP=1
+export RLINF_SKIP_ROS_CLEANUP=1
 source /opt/ros/noetic/setup.bash
 source /opt/venv/piper_ws/setup_piper_ros.sh
 
@@ -203,3 +231,25 @@ python collect_embodied_agent_gigawa.py \
   env.train.force_disable_teleop_on_terminal=true \
   env.train.force_disable_teleop_on_timeout=true \
   env.train.debug_intervention_chunks=true
+
+
+
+cd /home/ubuntu/users/angen.ye/gwp/RLinf/examples/embodiment
+
+python compare_wa_actor_on_pt.py \
+  --config-path ./config \
+  --config-name offline_piper_actor_bc_warmup \
+  --pt /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention100/offline_collection/rank_0/success \
+  --actor-ckpt /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_kwj/piper_lerobot_actor_bc_warmup/checkpoints/global_step_40 \
+  --out /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/action_compare_success \
+  --batch-size 8 \
+  --max-files 10
+
+#lerobotdataset check
+python replay_episode_lerobot.py --episode 0 --dry-run
+python replay_episode_lerobot.py --dataset-path /home/ubuntu/users/angen.ye/gwp/repaly/dianyuan/260524155410_8c85 --episode 10 --hz 30 --noise-reduce-after-step 120
+#success seed
+#wangxian 006
+#jimu     025
+#dianyuan 004 007 012 013 
+#mukuai   014

@@ -12,7 +12,6 @@ hydra:
 
 cluster:
   num_nodes: 1
-
   component_placement:
     actor: 0
     rollout: 0
@@ -23,33 +22,76 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention_test2"
+    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_kwj"
     project_name: rlinf
-    experiment_name: "collect_piper_gigawa_intervention"
+    experiment_name: "piper_lerobot_actor_bc_warmup_fixed"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 1
+  # One epoch internally contains offline_bc_pretrain.steps_per_epoch actor updates.
+  max_epochs: 200
   max_steps: -1
-  async_rollout_training: false
-  async_disable_inline_eval: true
-  replay_channel_maxsize: 8
-  weight_sync_interval: 20
   only_eval: false
   val_check_interval: -1
-  save_interval: 200
+  save_interval: 50
+
   resume_dir: null
   ckpt_path: null
-  resume_load_optimizer_and_scheduler_state: false
+  resume_load_optimizer_and_scheduler_state: true
+  per_worker_log_path: null
 
 algorithm:
-  normalize_advantages: False
+  replay_buffer:
+    enable_cache: true
+    cache_size: 2000
+    sample_window_size: 5000
+    min_buffer_size: 0
+    require_for_training: false
+    store_online_data: false
+    auto_save: false
+    auto_save_path: null
+    trajectory_format: pt
+    enable_preload: false
+    prefetch_size: 10
+
+  demo_buffer:
+    enable: true
+    enable_cache: true
+    cache_size: 2000
+    sample_window_size: 6000
+    min_buffer_size: 2
+    train_actor_steps: 32
+    auto_save: false
+    auto_save_path: null
+    trajectory_format: pt
+    # 注意：这里填 buffer 根目录，不要填 rank_0
+    load_path:
+      - /home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/lerobot_actor_warmup_buffer_fixed
+    sample_ratio: 1.0
+    allow_train_on_demo_only: true
+    allow_demo_only_fallback: true
+    allow_replay_only_fallback: false
+    store_online_interventions: false
+
+  offline_bc_pretrain:
+    enable: true
+    val_ratio: 0.1
+    split_seed: 1234
+    # Keep one optimizer update per global_step so 50-step checkpoints mean
+    # roughly 50 actor updates and can be visualized frequently.
+    steps_per_epoch: 1
+    val_steps_per_epoch: 10
+
+  normalize_advantages: false
   kl_penalty: kl
   group_size: 1
+
   rollout_epoch: 1
   eval_rollout_epoch: 1
+
   reward_type: action_level
   logprob_type: token_level
   entropy_type: token_level
+
   adv_type: gae
   loss_type: embodied_gigawa
   loss_agg_func: "token-mean"
@@ -60,139 +102,78 @@ algorithm:
   clip_ratio_c: 3.0
   value_clip: 0.2
   huber_delta: 10.0
-  gamma: 0.9836
+
+  gamma: 0.82
   gae_lambda: 0.95
+
   reward_coef: 1
-  filter_rewards: False
+  filter_rewards: false
   rewards_lower_bound: 0.0
   rewards_upper_bound: 5.0
-  training_stage: full_rl
+
+  # 这里只做 actor BC warmup，不训练 critic。
+  training_stage: bc_actor_pretrain
+  actor_bc_target: batch_action
+  use_action_valid_mask: true
+
   update_epoch: 1
-  utd_ratio: 5
-  staleness_threshold: 2
+  utd_ratio: 1
   critic_actor_ratio: 2
   tau: 0.005
   target_update_freq: 1
   target_policy_noise: 0.0
   target_noise_clip: 0.0
+
+  # 纯 BC warmup 建议先用 1.0，避免梯度尺度过大。
+  # 如果 train/val BC 下降很慢，可以后面改成 10 或 50。
   bc_coef: 50
   ref_action_dropout_p: 0
-  actor_bc_target: batch_action
-  use_action_valid_mask: true
 
-  # Keep this false for episode collection: we only need one inference-frame obs per chunk.
+  warmup_steps: 0
+  train_actor_steps: 0
+  rollout_actor_after_warmup: false
+  rollout_actor_min_actor_updates: 100000000
+
+  freeze_critic_updates: true
+  freeze_actor_updates: false
+  freeze_visual_layers: false
+
+  # LeRobot 已经被转换成 12-step chunk buffer，这里不再做额外 sliding-window 增广。
   gigawa_sliding_window:
     enable: false
     offset_stride: 12
     max_offsets: 1
     augment_mode: preserve_ref_action
 
-  offline_collection:
-    enable: true
-    save_unit: episode
-    # One c/a/timeout terminal event produces one episode_XXXXXX.pt and one mp4.
-    output_dir: ${runner.logger.log_path}/offline_collection
-    target_num_trajectories: 100000
-    max_collection_steps: 100000000
-    log_interval: 1
-    success_threshold: 0.5
-    save_partial_on_exit: false
-    # Guard against stale keyboard events leaking across reset boundaries.
-    # In this real task, a one-chunk episode is almost always accidental
-    # keyboard leakage, so skip it instead of saving into all/success/failure.
-    min_episode_chunks_to_save: 2
-    min_valid_steps_to_save: 0
-    # Make all/, success/, and failure/ directly loadable by
-    # TrajectoryReplayBuffer.load_checkpoint(load_path=<that folder>).
-    write_replay_index_per_split: true
-    replay_index_seed: 1234
-    # Capture c/a that are pressed after a 12-step chunk has ended but before
-    # the next env.step(). Without this, the terminal marker lands at the next
-    # chunk's step 0.
-    poll_keyboard_between_chunks: true
-    inference_frame_video:
-      enable: true
-      fps: 5
-
-  warmup_steps: 200000
-  train_actor_steps: 0
-  rollout_actor_after_warmup: false
-  rollout_actor_min_actor_updates: 0
-  freeze_critic_updates: false
-  freeze_actor_updates: false
-  freeze_visual_layers: false
-  actor_bc_guard:
-    mode: none
   sampling_params:
-    do_sample: False
+    do_sample: false
     temperature_train: -1
     temperature_eval: -1
     top_k: -1
     top_p: 1.0
     repetition_penalty: 1.0
+
   length_params:
     max_new_token: null
     max_length: 512
     min_length: 1
 
-  replay_buffer:
-    enable_cache: False
-    cache_size: 1
-    sample_window_size: 1
-    min_buffer_size: 1
-    auto_save: False
-    auto_save_path: null
-    trajectory_format: pt
-    enable_preload: False
-    prefetch_size: 1
-  demo_buffer:
-    enable: False
-    enable_cache: False
-    cache_size: 1
-    sample_window_size: 1
-    min_buffer_size: 0
-    train_actor_steps: 0
-    auto_save: False
-    auto_save_path: null
-    trajectory_format: pt
-    load_path: null
-    sample_ratio: 0.0
-    allow_train_on_demo_only: true
-    allow_demo_only_fallback: true
-    allow_replay_only_fallback: true
-    store_online_interventions: true
-
 env:
   group_name: "EnvGroup"
-  enable_offload: False
+  enable_offload: false
 
   train:
     total_num_envs: 1
     reward_coef: ${algorithm.reward_coef}
     max_episode_steps: 960
-    # IMPORTANT: collector also forces this to num_action_chunks=12 in Python.
-    # This prevents Ray ChannelWorker from carrying 80 chunks of raw images at once.
-    max_steps_per_rollout_epoch: 12
+    max_steps_per_rollout_epoch: 960
     group_size: 1
-    break_chunk_on_intervention: true
-    latch_intervention_until_chunk_end: true
-    collect_intervention_until_release: false
-    pad_interrupted_chunks: true
-    intervention_max_steps: 960
-    force_disable_teleop_on_chunk_end: false
-    force_disable_teleop_on_terminal: true
-    force_disable_teleop_on_timeout: true
-    debug_intervention_chunks: true
-    auto_reset: True
-    ignore_terminations: False
+    auto_reset: false
+    ignore_terminations: false
     override_cfg:
-      is_dummy: false
+      is_dummy: true
       joint_action_mode: absolute
-      enable_human_intervention: true
-      wait_user_ready_after_reset: true
-      reset_ready_key: b
-      reset_ready_timeout_sec: null
-      post_reset_settle_sec: 0.5
+      enable_human_intervention: false
       camera_names:
         - cam_high
         - cam_left_wrist
@@ -205,13 +186,13 @@ env:
 
   eval:
     total_num_envs: 1
-    auto_reset: False
-    ignore_terminations: False
+    auto_reset: false
+    ignore_terminations: false
     max_episode_steps: 960
     reward_coef: ${algorithm.reward_coef}
-    max_steps_per_rollout_epoch: 12
+    max_steps_per_rollout_epoch: 960
     group_size: 1
-    use_fixed_reset_state_ids: False
+    use_fixed_reset_state_ids: false
     override_cfg:
       is_dummy: true
       joint_action_mode: absolute
@@ -226,16 +207,16 @@ env:
         - /camera_r/color/image_raw
       obs_img_resolution: [480, 640]
     video_cfg:
-      save_video: False
+      save_video: false
       video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:
   group_name: "RolloutGroup"
   generation_backend: "huggingface"
-  enable_offload: False
+  enable_offload: false
   pipeline_stage_num: 1
-  collect_transitions: True
-  collect_prev_infos: False
+  collect_transitions: true
+  collect_prev_infos: false
   model:
     model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
@@ -246,12 +227,12 @@ actor:
   micro_batch_size: 4
   global_batch_size: 64
   seed: 1234
-  enable_offload: False
-  recv_queue_maxsize: 8
-  recv_drain_max_trajectories: 32
+  enable_offload: false
+
+  recv_queue_maxsize: 4
+  recv_drain_max_trajectories: 16
   sync_weight_no_wait: false
-  async_skip_sleep_s: 0.2
-  async_skip_log_interval_s: 10.0
+
   critic_optim:
     lr: 3.0e-5
     adam_beta1: 0.9
@@ -259,7 +240,7 @@ actor:
     adam_eps: 1.0e-08
     weight_decay: 1.0e-10
     clip_grad: 1.0
-    total_training_steps: 200
+    total_training_steps: 16000
     lr_warmup_steps: 0
     lr_scheduler: constant
     num_cycles: 0.5
@@ -278,6 +259,7 @@ actor:
       robotype: "aloha"
       actor_robot_state_mode: normalized
       keep_raw_robot_state: true
+      enable_absolute_action_bound: false
       num_inference_steps: 10
       guidance_scale: 0.0
       num_frames: 5
@@ -286,13 +268,13 @@ actor:
       prompt: null
       prompt_embeds_path: "/home/ubuntu/users/angen.ye/gwp/T5/episode_000000.pt"
       prompt_embeds_max_length: 64
-      use_safetensors: False
+      use_safetensors: false
       use_rl_head_for_rollout: false
       visual_feature_dim: 2048
       bc_coef: 50
       ref_action_dropout_p: 0
       target_tau: 0.005
-      enable_latent_debug: False
+      enable_latent_debug: false
       latent_debug_dir: "${runner.logger.log_path}/latent_debug"
       actor_output_mode: "learned"
       visual_input_mode: "normal"
@@ -306,11 +288,11 @@ actor:
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
-    weight_decay: 1e-10
+    weight_decay: 1.0e-10
     clip_grad: 1.0
-    total_training_steps: 200
+    total_training_steps: 16000
     lr_warmup_steps: 0
-    lr_scheduler: "constant"
+    lr_scheduler: constant
     num_cycles: 0.5
     min_lr: 2.5e-6
 
@@ -318,14 +300,14 @@ actor:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
     use_orig_params: true
-    gradient_checkpointing: False
+    gradient_checkpointing: false
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
       buffer_dtype: ${actor.model.precision}
 
 reward:
-  use_reward_model: False
+  use_reward_model: false
 
 critic:
-  use_critic_model: False
+  use_critic_model: false

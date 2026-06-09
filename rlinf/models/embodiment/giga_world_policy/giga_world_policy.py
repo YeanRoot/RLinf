@@ -505,6 +505,19 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             policy_cfg.get("action_compare_debug_save_full_tensors", True)
         )
         self._action_compare_debug_dump_count = 0
+        self.print_rollout_action_debug = bool(
+            policy_cfg.get("print_rollout_action_debug", False)
+        )
+        self.rollout_action_debug_max_batches = int(
+            policy_cfg.get("rollout_action_debug_max_batches", 4)
+        )
+        self.rollout_action_debug_max_items = int(
+            policy_cfg.get("rollout_action_debug_max_items", 1)
+        )
+        self.rollout_action_debug_print_full_tensors = bool(
+            policy_cfg.get("rollout_action_debug_print_full_tensors", True)
+        )
+        self._rollout_action_debug_count = 0
 
         # rollout switch: keep base WA by default until RL worker is ready.
         # This flag must live in the state_dict so actor->rollout weight sync can carry it.
@@ -1080,6 +1093,98 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             f"min={x.min().item():.6f}, max={x.max().item():.6f}"
         )
 
+    @staticmethod
+    def _format_action_rows(x: torch.Tensor) -> str:
+        x = x.detach().float().cpu()
+        return "\n".join(
+            f"    step {idx:02d}: " + " ".join(f"{v:+.5f}" for v in row.tolist())
+            for idx, row in enumerate(x)
+        )
+
+    def _print_rollout_action_debug(
+        self,
+        *,
+        wa_action_model: Optional[torch.Tensor],
+        wa_action_exec: Optional[torch.Tensor],
+        actor_action_model: Optional[torch.Tensor],
+        actor_action_exec: Optional[torch.Tensor],
+        actions_model: torch.Tensor,
+        actions_exec: torch.Tensor,
+        rollout_uses_actor: bool,
+    ) -> None:
+        if not self.print_rollout_action_debug:
+            return
+        if self._rollout_action_debug_count >= self.rollout_action_debug_max_batches:
+            return
+
+        dump_idx = self._rollout_action_debug_count
+        self._rollout_action_debug_count += 1
+        pid = os.getpid()
+
+        print(
+            "[giga_world_policy][rollout_action_debug] "
+            f"dump_idx={dump_idx} pid={pid} rollout_uses_actor={rollout_uses_actor} "
+            f"runtime_action_chunk={self.action_chunk}",
+            flush=True,
+        )
+
+        tensors = {
+            "wa_action_model": wa_action_model,
+            "wa_action_exec": wa_action_exec,
+            "actor_action_model": actor_action_model,
+            "actor_action_exec": actor_action_exec,
+            "selected_action_model": actions_model,
+            "selected_action_exec": actions_exec,
+        }
+        for name, value in tensors.items():
+            if torch.is_tensor(value):
+                print(
+                    f"[giga_world_policy][rollout_action_debug] {name}: {self._tensor_summary(value)}",
+                    flush=True,
+                )
+        if torch.is_tensor(wa_action_exec) and torch.is_tensor(actor_action_exec):
+            diff_exec = actor_action_exec.detach().float() - wa_action_exec.detach().float()
+            print(
+                "[giga_world_policy][rollout_action_debug] "
+                f"actor_minus_wa_exec: {self._tensor_summary(diff_exec)}",
+                flush=True,
+            )
+
+        max_items = min(
+            int(actions_exec.shape[0]),
+            int(self.rollout_action_debug_max_items),
+        )
+        for item_idx in range(max_items):
+            print(
+                f"[giga_world_policy][rollout_action_debug] sample={item_idx} "
+                "per-step max_abs_delta_from_step0:",
+                flush=True,
+            )
+            for name, value in tensors.items():
+                if not torch.is_tensor(value):
+                    continue
+                item = value[item_idx].detach().float().cpu()
+                if item.ndim != 2:
+                    continue
+                delta_from_step0 = (item - item[:1]).abs().amax(dim=-1)
+                step_delta = (
+                    torch.zeros(1)
+                    if item.shape[0] <= 1
+                    else (item[1:] - item[:-1]).abs().amax(dim=-1)
+                )
+                print(
+                    f"[giga_world_policy][rollout_action_debug] sample={item_idx} {name} "
+                    f"delta_from_step0={delta_from_step0.tolist()} "
+                    f"step_to_step_max_abs={step_delta.tolist()}",
+                    flush=True,
+                )
+                if self.rollout_action_debug_print_full_tensors:
+                    print(
+                        f"[giga_world_policy][rollout_action_debug][full] sample={item_idx} {name}:\n"
+                        f"{self._format_action_rows(item)}",
+                        flush=True,
+                    )
+
     def _dump_latent_debug(self, debug_dict: dict[str, Any], prompt: str):
         if debug_dict is None or self._latent_debug_dumped:
             return
@@ -1126,6 +1231,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
     def _dump_action_compare_debug(
         self,
         env_obs: dict[str, Any],
+        backbone: Optional[dict[str, torch.Tensor]],
         wa_action_model: torch.Tensor,
         wa_action_exec: torch.Tensor,
         actor_action_model: torch.Tensor,
@@ -1156,6 +1262,12 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
 
         task_descriptions = env_obs.get("task_descriptions", None)
         state_tensor = env_obs.get("states", None)
+        backbone_cpu: dict[str, torch.Tensor] = {}
+        if backbone is not None:
+            for key in ("visual_latent", "visual_feat", "robot_state", "raw_robot_state", "ref_action", "ref_action_exec"):
+                value = backbone.get(key, None)
+                if torch.is_tensor(value):
+                    backbone_cpu[key] = value.detach().float().cpu()
 
         batch_pt_path = os.path.join(
             self.action_compare_debug_dir,
@@ -1174,6 +1286,7 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                     "mse_exec_per_sample": mse_exec_per_sample,
                     "states": state_tensor.detach().cpu() if torch.is_tensor(state_tensor) else state_tensor,
                     "task_descriptions": task_descriptions,
+                    **{f"backbone_{key}": value for key, value in backbone_cpu.items()},
                 },
                 batch_pt_path,
             )
@@ -1191,6 +1304,8 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             f"mse_model_per_sample={mse_model_per_sample.tolist()}",
             f"mse_exec_per_sample={mse_exec_per_sample.tolist()}",
         ]
+        for key, value in backbone_cpu.items():
+            summary_lines.append(f"backbone_{key}={self._tensor_summary(value)}")
 
         txt_path = os.path.join(
             self.action_compare_debug_dir,
@@ -1222,6 +1337,11 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                     if torch.is_tensor(state_tensor)
                     else None
                 ),
+                "backbone_summaries": {
+                    key: self._tensor_summary(value[item_idx])
+                    for key, value in backbone_cpu.items()
+                    if value.shape[0] > item_idx
+                },
                 "wa_action_model": wa_action_model_cpu[item_idx].tolist(),
                 "actor_action_model": actor_action_model_cpu[item_idx].tolist(),
                 "diff_action_model": diff_model[item_idx].tolist(),
@@ -1297,6 +1417,13 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 flush=True,
             )
             if self.action_compare_debug_print_full_tensors:
+                for key, value in backbone_cpu.items():
+                    if value.shape[0] > item_idx and key != "visual_latent":
+                        print(
+                            "[giga_world_policy][action_compare][full] "
+                            f"sample={item_idx} backbone_{key}={value[item_idx].tolist()}",
+                            flush=True,
+                        )
                 print(
                     "[giga_world_policy][action_compare][full] "
                     f"sample={item_idx} wa_action_model={wa_action_model_cpu[item_idx].tolist()}",
@@ -1455,6 +1582,9 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         raw_state = raw_state.to(device=model_view.device, dtype=model_view.dtype)
         if raw_state.dim() == 2:
             raw_state = raw_state[:, None, :].expand(batch, chunk, raw_state.shape[-1])
+        elif raw_state.dim() == 3:
+            # GigaWA chunk actions are normalized deltas from the chunk-start qpos.
+            raw_state = raw_state[:, :1, :].expand(batch, chunk, raw_state.shape[-1])
         if raw_state.shape[-1] < self.model_action_dim:
             pad = torch.zeros(*raw_state.shape[:-1], self.model_action_dim - raw_state.shape[-1], device=raw_state.device, dtype=raw_state.dtype)
             raw_state = torch.cat([raw_state, pad], dim=-1)
@@ -1481,6 +1611,9 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
         raw_state = raw_state.to(device=exec_view.device, dtype=exec_view.dtype)
         if raw_state.dim() == 2:
             raw_state = raw_state[:, None, :].expand(batch, chunk, raw_state.shape[-1])
+        elif raw_state.dim() == 3:
+            # GigaWA chunk actions are normalized deltas from the chunk-start qpos.
+            raw_state = raw_state[:, :1, :].expand(batch, chunk, raw_state.shape[-1])
         if raw_state.shape[-1] < self.model_action_dim:
             pad = torch.zeros(*raw_state.shape[:-1], self.model_action_dim - raw_state.shape[-1], device=raw_state.device, dtype=raw_state.dtype)
             raw_state = torch.cat([raw_state, pad], dim=-1)
@@ -2265,14 +2398,28 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
                 use_target=False,
             )
             actor_actions_model = actor_actions_model.to(self.device_ref)
+            # WA post-processing adds the current raw qpos back to normalized deltas.
+            # The actor conditioning state may be normalized, so do not reuse it here.
+            if "raw_robot_state" in backbone:
+                actor_exec_state = backbone["raw_robot_state"]
+            elif self.actor_robot_state_mode == "raw":
+                actor_exec_state = backbone["robot_state"]
+            else:
+                raise RuntimeError(
+                    "Actor rollout needs raw_robot_state to convert normalized-delta "
+                    "actor actions into executable qpos. Keep "
+                    "giga_world_policy.keep_raw_robot_state=True when "
+                    "actor_robot_state_mode=normalized."
+                )
             actor_actions_exec = self.postprocess_action_model_batch(
                 action_model=actor_actions_model,
-                robot_state=backbone["robot_state"],
+                robot_state=actor_exec_state,
             ).to(self.device_ref)
 
             if self.enable_action_compare_debug:
                 self._dump_action_compare_debug(
                     env_obs=env_obs,
+                    backbone=backbone,
                     wa_action_model=wa_actions_model,
                     wa_action_exec=wa_actions_exec,
                     actor_action_model=actor_actions_model,
@@ -2295,6 +2442,16 @@ class GigaWorldPolicy(BasePolicy, nn.Module):
             else:
                 actions_model = wa_actions_model
                 actions_exec = wa_actions_exec
+
+        self._print_rollout_action_debug(
+            wa_action_model=wa_actions_model,
+            wa_action_exec=wa_actions_exec,
+            actor_action_model=actor_actions_model,
+            actor_action_exec=actor_actions_exec,
+            actions_model=actions_model,
+            actions_exec=actions_exec,
+            rollout_uses_actor=rollout_uses_actor,
+        )
 
         forward_inputs = {
             "action": actions_exec.reshape(batch_size, -1).contiguous(),

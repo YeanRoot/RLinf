@@ -1,3 +1,10 @@
+# Shadow actor real-world debug config.
+# Based on collect_piper_gigawa_realworld.yaml.
+# Main differences:
+#   1) Load the LeRobot BC actor checkpoint directly into rollout.
+#   2) Execute WA on the robot while computing actor in compare/debug mode.
+#   3) Keep the first live check short and slow for inspection.
+
 defaults:
   - env/realworld_piper_gigawa@env.train
   - env/realworld_piper_gigawa@env.eval
@@ -23,9 +30,9 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_intervention_test2"
+    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/collect_piper_gigawa_actor_shadow_debug"
     project_name: rlinf
-    experiment_name: "collect_piper_gigawa_intervention"
+    experiment_name: "collect_piper_gigawa_actor_shadow_debug"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1
@@ -37,8 +44,8 @@ runner:
   only_eval: false
   val_check_interval: -1
   save_interval: 200
-  resume_dir: null
-  ckpt_path: null
+  resume_dir: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_kwj/piper_lerobot_actor_bc_warmup/checkpoints/global_step_600"
+  ckpt_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_piper_actor_bc_kwj/piper_lerobot_actor_bc_warmup/checkpoints/global_step_600/actor/model_state_dict/full_weights.pt"
   resume_load_optimizer_and_scheduler_state: false
 
 algorithm:
@@ -92,8 +99,8 @@ algorithm:
     save_unit: episode
     # One c/a/timeout terminal event produces one episode_XXXXXX.pt and one mp4.
     output_dir: ${runner.logger.log_path}/offline_collection
-    target_num_trajectories: 100000
-    max_collection_steps: 100000000
+    target_num_trajectories: 1
+    max_collection_steps: 48
     log_interval: 1
     success_threshold: 0.5
     save_partial_on_exit: false
@@ -102,8 +109,6 @@ algorithm:
     # keyboard leakage, so skip it instead of saving into all/success/failure.
     min_episode_chunks_to_save: 2
     min_valid_steps_to_save: 0
-    # Make all/, success/, and failure/ directly loadable by
-    # TrajectoryReplayBuffer.load_checkpoint(load_path=<that folder>).
     write_replay_index_per_split: true
     replay_index_seed: 1234
     # Capture c/a that are pressed after a 12-step chunk has ended but before
@@ -114,7 +119,7 @@ algorithm:
       enable: true
       fps: 5
 
-  warmup_steps: 200000
+  warmup_steps: 0
   train_actor_steps: 0
   rollout_actor_after_warmup: false
   rollout_actor_min_actor_updates: 0
@@ -169,7 +174,7 @@ env:
   train:
     total_num_envs: 1
     reward_coef: ${algorithm.reward_coef}
-    max_episode_steps: 960
+    max_episode_steps: 48
     # IMPORTANT: collector also forces this to num_action_chunks=12 in Python.
     # This prevents Ray ChannelWorker from carrying 80 chunks of raw images at once.
     max_steps_per_rollout_epoch: 12
@@ -178,15 +183,20 @@ env:
     latch_intervention_until_chunk_end: true
     collect_intervention_until_release: false
     pad_interrupted_chunks: true
-    intervention_max_steps: 960
+    intervention_max_steps: 240
     force_disable_teleop_on_chunk_end: false
     force_disable_teleop_on_terminal: true
     force_disable_teleop_on_timeout: true
     debug_intervention_chunks: true
+    debug_action_chunks: true
+    debug_action_chunks_max: 4
+    debug_action_print_full: true
     auto_reset: True
     ignore_terminations: False
     override_cfg:
       is_dummy: false
+      step_frequency: 5
+      publish_rate: 5
       joint_action_mode: absolute
       enable_human_intervention: true
       wait_user_ready_after_reset: true
@@ -207,7 +217,7 @@ env:
     total_num_envs: 1
     auto_reset: False
     ignore_terminations: False
-    max_episode_steps: 960
+    max_episode_steps: 240
     reward_coef: ${algorithm.reward_coef}
     max_steps_per_rollout_epoch: 12
     group_size: 1
@@ -288,6 +298,17 @@ actor:
       prompt_embeds_max_length: 64
       use_safetensors: False
       use_rl_head_for_rollout: false
+      enable_action_compare_debug: true
+      action_compare_debug_dir: "${runner.logger.log_path}/action_compare_debug"
+      action_compare_debug_max_batches: 4
+      action_compare_debug_max_items: 1
+      action_compare_debug_print_full_tensors: true
+      action_compare_debug_save_full_tensors: true
+      enable_absolute_action_bound: false
+      print_rollout_action_debug: true
+      rollout_action_debug_max_batches: 4
+      rollout_action_debug_max_items: 1
+      rollout_action_debug_print_full_tensors: true
       visual_feature_dim: 2048
       bc_coef: 50
       ref_action_dropout_p: 0

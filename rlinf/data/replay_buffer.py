@@ -1151,6 +1151,57 @@ class TrajectoryReplayBuffer:
                         flat_trajectory,
                     )
 
+    def load_checkpoints(
+        self,
+        load_paths: list,
+        is_distributed: bool = False,
+        local_rank: int = 0,
+        world_size: int = 1,
+    ):
+        """Load and merge trajectories from multiple directories."""
+        id_offset = 0
+        for path in load_paths:
+            metadata_path = os.path.join(path, "metadata.json")
+            index_path = os.path.join(path, "trajectory_index.json")
+            if not os.path.exists(metadata_path) or not os.path.exists(index_path):
+                raise FileNotFoundError(f"Metadata or index not found at {path}")
+
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+            with open(index_path, "r") as f:
+                index_data = json.load(f)
+
+            self.trajectory_format = metadata.get("trajectory_format", self.trajectory_format)
+
+            full_trajectory_index = {int(k): v for k, v in index_data.get("trajectory_index", {}).items()}
+            full_trajectory_id_list = [int(k) for k in index_data.get("trajectory_id_list", [])]
+
+            if is_distributed:
+                total = len(full_trajectory_id_list)
+                per_split = total // world_size
+                remainder = total % world_size
+                start = local_rank * per_split + min(local_rank, remainder)
+                end = start + per_split + (1 if local_rank < remainder else 0)
+                full_trajectory_id_list = full_trajectory_id_list[start:end]
+                full_trajectory_index = {id: full_trajectory_index[id] for id in full_trajectory_id_list if id in full_trajectory_index}
+
+            for old_id in full_trajectory_id_list:
+                new_id = old_id + id_offset
+                info = dict(full_trajectory_index[old_id])
+                info["trajectory_id"] = new_id
+                self._trajectory_index[new_id] = info
+                self._trajectory_id_list.append(new_id)
+                self._trajectory_file_path[new_id] = path
+
+            id_offset += max(full_trajectory_id_list) + 1 if full_trajectory_id_list else 0
+
+        self.size = len(self._trajectory_id_list)
+        self._total_samples = sum(info.get("num_samples", 0) for info in self._trajectory_index.values())
+        self._trajectory_counter = max(self._trajectory_index.keys()) + 1 if self._trajectory_index else 0
+
+        if self._flat_trajectory_cache is not None:
+            self._flat_trajectory_cache.clear()
+
     def clear_cache(self):
         """Clear trajectory cache."""
         self.close()

@@ -29,7 +29,7 @@ try:
 except Exception:  # pragma: no cover - optional video export dependency
     cv2 = None
 import torch.nn.functional as F
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 from rlinf.data.embodied_buffer_dataset import (
@@ -46,6 +46,16 @@ from rlinf.utils.metric_utils import append_to_dict, compute_split_num
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+
+def _normalize_demo_load_paths(raw_load_path):
+    if isinstance(raw_load_path, ListConfig):
+        load_paths = OmegaConf.to_container(raw_load_path, resolve=True)
+    elif isinstance(raw_load_path, (list, tuple)):
+        load_paths = list(raw_load_path)
+    else:
+        load_paths = [raw_load_path]
+    return [os.fspath(path) for path in load_paths]
 
 
 class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
@@ -296,31 +306,35 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 demo_cfg.get("store_online_interventions", True)
             )
             if demo_cfg.get("load_path", None) is not None:
-                demo_load_path = demo_cfg.load_path
-                rank_shard_path = os.path.join(demo_load_path, f"rank_{self._rank}")
+                raw_load_path = demo_cfg.load_path
+                load_paths = _normalize_demo_load_paths(raw_load_path)
 
-                root_metadata_path = os.path.join(demo_load_path, "metadata.json")
-                root_index_path = os.path.join(demo_load_path, "trajectory_index.json")
-                rank_metadata_path = os.path.join(rank_shard_path, "metadata.json")
-                rank_index_path = os.path.join(rank_shard_path, "trajectory_index.json")
+                def _load_single(demo_load_path):
+                    rank_shard_path = os.path.join(demo_load_path, f"rank_{self._rank}")
+                    rank_metadata_path = os.path.join(rank_shard_path, "metadata.json")
+                    rank_index_path = os.path.join(rank_shard_path, "trajectory_index.json")
+                    root_metadata_path = os.path.join(demo_load_path, "metadata.json")
+                    root_index_path = os.path.join(demo_load_path, "trajectory_index.json")
+                    if os.path.exists(rank_metadata_path) and os.path.exists(rank_index_path):
+                        return rank_shard_path, False
+                    elif os.path.exists(root_metadata_path) and os.path.exists(root_index_path):
+                        return demo_load_path, False
+                    else:
+                        return demo_load_path, True
 
-                if os.path.exists(rank_metadata_path) and os.path.exists(rank_index_path):
-                    # Preferred: repaired / sharded buffer layout.
+                if len(load_paths) == 1:
+                    path, distributed = _load_single(load_paths[0])
                     self.demo_buffer.load_checkpoint(
-                        rank_shard_path,
-                        is_distributed=False,
-                    )
-                elif os.path.exists(root_metadata_path) and os.path.exists(root_index_path):
-                    # Single-shard checkpoint root.
-                    self.demo_buffer.load_checkpoint(
-                        demo_load_path,
-                        is_distributed=False,
+                        path,
+                        is_distributed=distributed,
+                        local_rank=self._rank,
+                        world_size=self._world_size,
                     )
                 else:
-                    # Fall back to original behavior for older layouts.
-                    self.demo_buffer.load_checkpoint(
-                        demo_load_path,
-                        is_distributed=True,
+                    resolved = [_load_single(p) for p in load_paths]
+                    self.demo_buffer.load_checkpoints(
+                        [p for p, _ in resolved],
+                        is_distributed=any(d for _, d in resolved),
                         local_rank=self._rank,
                         world_size=self._world_size,
                     )
@@ -2492,6 +2506,10 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         curr_obs = self._slice_obs_dict(traj.curr_obs, traj_len)
         next_obs = self._slice_obs_dict(traj.next_obs, traj_len)
 
+        curr_has_preextracted = "visual_latent" in curr_obs and "robot_state" in curr_obs and "ref_action" in curr_obs
+        next_has_preextracted = "visual_latent" in next_obs and "robot_state" in next_obs and "ref_action" in next_obs
+        fi = traj.forward_inputs or {}
+
         curr_visual_latents = []
         curr_robot_states = []
         curr_ref_actions = []
@@ -2500,18 +2518,29 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         next_ref_actions = []
 
         for t in range(traj_len):
-            curr_step_obs = self._slice_obs_at_step(curr_obs, t)
-            next_step_obs = self._slice_obs_at_step(next_obs, t)
+            if curr_has_preextracted:
+                curr_visual_latents.append(curr_obs["visual_latent"][t])
+                curr_robot_states.append(curr_obs["robot_state"][t])
+                curr_ref_actions.append(curr_obs["ref_action"][t])
+            else:
+                curr_feat = self._extract_step_features(self._slice_obs_at_step(curr_obs, t))
+                curr_visual_latents.append(curr_feat["visual_latent"])
+                curr_robot_states.append(curr_feat["robot_state"])
+                curr_ref_actions.append(curr_feat["ref_action"])
 
-            curr_feat = self._extract_step_features(curr_step_obs)
-            next_feat = self._extract_step_features(next_step_obs)
-
-            curr_visual_latents.append(curr_feat["visual_latent"])
-            curr_robot_states.append(curr_feat["robot_state"])
-            curr_ref_actions.append(curr_feat["ref_action"])
-            next_visual_latents.append(next_feat["visual_latent"])
-            next_robot_states.append(next_feat["robot_state"])
-            next_ref_actions.append(next_feat["ref_action"])
+            if next_has_preextracted:
+                next_visual_latents.append(next_obs["visual_latent"][t])
+                next_robot_states.append(next_obs["robot_state"][t])
+                next_ref_actions.append(next_obs["ref_action"][t])
+            elif "visual_latent" in fi and "robot_state" in fi and "ref_action" in fi:
+                next_visual_latents.append(fi["visual_latent"][t])
+                next_robot_states.append(fi["robot_state"][t])
+                next_ref_actions.append(fi["ref_action"][t])
+            else:
+                next_feat = self._extract_step_features(self._slice_obs_at_step(next_obs, t))
+                next_visual_latents.append(next_feat["visual_latent"])
+                next_robot_states.append(next_feat["robot_state"])
+                next_ref_actions.append(next_feat["ref_action"])
 
         sample_info = dict(traj.sample_infos[0]) if getattr(traj, "sample_infos", None) else {}
         metadata = dict(getattr(traj, "metadata", {}))
@@ -3011,12 +3040,14 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             if curr_critic_ref_action is not None:
                 curr_critic_ref_action = curr_critic_ref_action.detach()
 
-            next_visual_feat = self._build_visual_feat_for_actor(next_obs["visual_latent"])
+            next_visual_feat = self._build_visual_feat_for_actor(
+                next_obs.get("visual_latent", curr_obs["visual_latent"])
+            )
             next_actions, next_actor_aux = policy.target_actor_forward(
                 visual_feat=next_visual_feat.detach(),
-                robot_state=next_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
+                robot_state=next_obs.get("robot_state", curr_obs["robot_state"]).to(self.device, dtype=self.torch_dtype),
                 ref_action=self._reshape_runtime_action_tensor(
-                    next_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
+                    next_obs.get("ref_action", curr_obs["ref_action"]).to(self.device, dtype=self.torch_dtype),
                     tensor_name="next_obs.ref_action",
                 )
             )

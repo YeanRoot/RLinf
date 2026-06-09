@@ -1104,6 +1104,25 @@ class EnvWorker(Worker):
         merged.update(feature_obs)
         return merged
 
+    def _inject_feature_obs_with_fallback(
+        self,
+        obs: dict[str, Any],
+        primary_rollout_result: RolloutResult | None,
+        fallback_rollout_result: RolloutResult | None,
+    ) -> dict[str, Any]:
+        if not isinstance(obs, dict):
+            return obs
+        primary = self._feature_obs_from_rollout_result(primary_rollout_result)
+        fallback = self._feature_obs_from_rollout_result(fallback_rollout_result)
+        if not primary and not fallback:
+            return obs
+        merged = dict(obs)
+        for key, value in fallback.items():
+            if key not in merged:
+                merged[key] = value
+        merged.update(primary)
+        return merged
+
     def _append_completed_train_chunk_step(
         self,
         stage_id: int,
@@ -1164,9 +1183,12 @@ class EnvWorker(Worker):
             )
 
         if self.collect_transitions:
+            use_final_obs = bool(
+                env_output.dones.any() and self.cfg.env.train.auto_reset
+            )
             next_obs = (
                 env_output.final_obs
-                if env_output.dones.any() and self.cfg.env.train.auto_reset
+                if use_final_obs
                 else env_output.obs
             )
             curr_obs_for_storage = self._augment_curr_obs_with_chunk_step_seq(
@@ -1176,8 +1198,11 @@ class EnvWorker(Worker):
             curr_obs_for_storage = self._inject_feature_obs(
                 curr_obs_for_storage, rollout_result
             )
-            next_obs_for_storage = self._inject_feature_obs(
-                next_obs, next_rollout_result
+            # Dynamic real-world resets/replans can produce a next observation
+            # before the next rollout carries compact GigaWA inputs. Prefer next
+            # rollout features when present and fill any gaps from this chunk.
+            next_obs_for_storage = self._inject_feature_obs_with_fallback(
+                next_obs, next_rollout_result, rollout_result
             )
             self.rollout_results[stage_id].append_transitions(
                 curr_obs_for_storage, next_obs_for_storage
