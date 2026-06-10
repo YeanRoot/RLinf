@@ -20,6 +20,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
 
 try:
@@ -35,6 +36,8 @@ from diagnose_piper_backfeed import (
     DEFAULT_NORM_JSON,
     DEFAULT_PT,
     DEFAULT_URDF,
+    CrossAttentionBlock,
+    MLP,
     SOURCE_NAME,
     UrdfChain,
     _torch_dtype,
@@ -65,6 +68,64 @@ LABELS = {
     "wa": "WA",
     "actor": "Actor",
 }
+
+
+class TwinCriticValue(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.q1 = MLP(
+            input_dim=input_dim,
+            hidden_dims=[2048, 1024, 512],
+            output_dim=1,
+            activate_final=False,
+            layer_norm=False,
+        )
+        self.q2 = MLP(
+            input_dim=input_dim,
+            hidden_dims=[2048, 1024, 512],
+            output_dim=1,
+            activate_final=False,
+            layer_norm=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.q1(x), self.q2(x)
+
+
+class LiteCrossAttentionCritic(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int = 512,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+        robot_state_dim: int = 14,
+        action_dim: int = 14,
+    ):
+        super().__init__()
+        self.state_proj = nn.Linear(robot_state_dim, hidden_dim)
+        self.ref_action_proj = nn.Linear(action_dim, hidden_dim)
+        self.action_proj = nn.Linear(action_dim, hidden_dim)
+        self.cross_attn = CrossAttentionBlock(hidden_dim, num_heads, dropout)
+        self.value_head = TwinCriticValue(input_dim=hidden_dim)
+
+    def forward(
+        self,
+        visual_tokens: torch.Tensor | None,
+        robot_state: torch.Tensor | None,
+        ref_action: torch.Tensor | None,
+        action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query_tokens = []
+        if robot_state is not None:
+            query_tokens.append(self.state_proj(robot_state).unsqueeze(1))
+        if ref_action is not None:
+            query_tokens.append(self.ref_action_proj(ref_action))
+        query_tokens.append(self.action_proj(action))
+        query_tokens = torch.cat(query_tokens, dim=1)
+        fused_tokens = self.cross_attn(query_tokens, visual_tokens)
+        fused_state = fused_tokens.mean(dim=1)
+        q1, q2 = self.value_head(fused_state)
+        return q1, q2, fused_state
 
 
 def _safe_stem(path: Path) -> str:
@@ -139,6 +200,16 @@ def get_saved_wa_model(data: dict[str, Any], action_dim: int, chunks: int) -> tu
     raise KeyError("Could not find saved WA/ref model action")
 
 
+def get_saved_wa_exec(data: dict[str, Any], action_dim: int, chunks: int) -> tuple[torch.Tensor, str]:
+    fi = data.get("forward_inputs", {})
+    if isinstance(fi, dict):
+        for key in ("policy_action_exec", "wa_action_exec", "ref_action_exec"):
+            value = fi.get(key)
+            if torch.is_tensor(value):
+                return reshape_action(value, action_dim, chunks, f"forward_inputs.{key}"), f"forward_inputs.{key}"
+    raise KeyError("Could not find saved WA exec-space action")
+
+
 def get_gt_exec(data: dict[str, Any], action_dim: int, chunks: int) -> tuple[torch.Tensor, str]:
     fi = data.get("forward_inputs", {})
     if isinstance(fi, dict):
@@ -147,6 +218,19 @@ def get_gt_exec(data: dict[str, Any], action_dim: int, chunks: int) -> tuple[tor
             if torch.is_tensor(value):
                 return reshape_action(value, action_dim, chunks, f"forward_inputs.{key}"), f"forward_inputs.{key}"
     raise KeyError("Could not find executable GT action_exec/action")
+
+
+def get_gt_model(data: dict[str, Any], action_dim: int, chunks: int) -> tuple[torch.Tensor, str]:
+    fi = data.get("forward_inputs", {})
+    if isinstance(fi, dict):
+        for key in ("model_action", "action_model"):
+            value = fi.get(key)
+            if torch.is_tensor(value):
+                return reshape_action(value, action_dim, chunks, f"forward_inputs.{key}"), f"forward_inputs.{key}"
+    value = data.get("actions")
+    if torch.is_tensor(value):
+        return reshape_action(value, action_dim, chunks, "actions"), "actions"
+    raise KeyError("Could not find model-space GT action")
 
 
 def model_to_exec(
@@ -160,6 +244,80 @@ def model_to_exec(
         raw_state.to(device),
         use_chunk_start_state=True,
     ).detach().float().cpu()
+
+
+def load_critic(
+    ckpt: str,
+    policy,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> LiteCrossAttentionCritic | None:
+    weight_file = find_full_weight_file(ckpt)
+    if weight_file is None:
+        return None
+    sd = torch.load(weight_file, map_location="cpu", weights_only=False)
+    critic_sd = {}
+    for key, value in sd.items():
+        if key.startswith("critic."):
+            critic_sd[key[len("critic.") :]] = value
+    if not critic_sd:
+        print("[viz] no critic.* weights found; skip Q plots")
+        return None
+    critic = LiteCrossAttentionCritic(
+        hidden_dim=int(getattr(policy, "hidden_dim", 512)),
+        num_heads=8,
+        dropout=0.0,
+        robot_state_dim=int(getattr(policy, "action_dim", 14)),
+        action_dim=int(getattr(policy, "action_dim", 14)),
+    )
+    missing, unexpected = critic.load_state_dict(critic_sd, strict=False)
+    print(f"[viz] load_critic missing={len(missing)} unexpected={len(unexpected)}")
+    if missing:
+        print("[viz] critic missing sample:", missing[:20])
+    if unexpected:
+        print("[viz] critic unexpected sample:", unexpected[:20])
+    critic.to(device=device, dtype=dtype)
+    critic.eval()
+    return critic
+
+
+def compute_q_values(
+    policy,
+    critic: LiteCrossAttentionCritic | None,
+    data: dict[str, Any],
+    candidates: dict[str, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+    action_dim: int,
+    chunks: int,
+) -> dict[str, torch.Tensor] | None:
+    if critic is None:
+        return None
+    gt_exec, _ = get_gt_exec(data, action_dim, chunks)
+    t = gt_exec.shape[0]
+    visual_latent = get_visual_latent(data, t)
+    robot_state = get_robot_state_for_actor(data, t, action_dim)
+    wa_model, _ = get_saved_wa_model(data, action_dim, chunks)
+
+    out = {key: [] for key in candidates}
+    with torch.no_grad():
+        for start in range(0, t, batch_size):
+            end = min(t, start + batch_size)
+            visual_tokens = policy.encode_visual(
+                visual_latent[start:end].to(device=device, dtype=dtype)
+            )
+            robot = robot_state[start:end].to(device=device, dtype=dtype)
+            ref = wa_model[start:end].to(device=device, dtype=dtype)
+            for key, action in candidates.items():
+                q1, q2, _ = critic(
+                    visual_tokens=visual_tokens,
+                    robot_state=robot,
+                    ref_action=ref,
+                    action=action[start:end].to(device=device, dtype=dtype),
+                )
+                out[key].append(torch.minimum(q1, q2).detach().float().cpu().squeeze(-1))
+    return {key: torch.cat(parts, dim=0) for key, parts in out.items()}
 
 
 def actor_saved_features(
@@ -511,6 +669,16 @@ def flatten_source(source: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return source.reshape(-1)[mask.reshape(-1)]
 
 
+def chunk_source(source: torch.Tensor) -> torch.Tensor:
+    if source.ndim == 1:
+        return source.contiguous()
+    out = torch.full((source.shape[0],), 3, dtype=source.dtype, device=source.device)
+    out[(source == 0).any(dim=-1)] = 0
+    out[(source == 2).any(dim=-1)] = 2
+    out[(source == 1).any(dim=-1)] = 1
+    return out.contiguous()
+
+
 def equalize_3d_axes(ax, points: list[np.ndarray]) -> None:
     if not points:
         return
@@ -630,6 +798,53 @@ def save_error_plot(
     plt.close(fig)
 
 
+def save_q_plot(
+    out: Path,
+    episode: str,
+    q_values: dict[str, torch.Tensor],
+    source: torch.Tensor,
+) -> None:
+    steps = np.arange(next(iter(q_values.values())).shape[0])
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True, gridspec_kw={"height_ratios": [2.2, 2.2, 0.5]})
+    for key in ("gt", "wa", "actor"):
+        if key in q_values:
+            axes[0].plot(steps, q_values[key].cpu().numpy(), color=COLORS[key], label=LABELS[key], linewidth=1.4)
+    axes[0].set_ylabel("Q")
+    axes[0].grid(True, alpha=0.25)
+    axes[0].legend()
+
+    if "actor" in q_values and "gt" in q_values:
+        axes[1].plot(
+            steps,
+            (q_values["actor"] - q_values["gt"]).cpu().numpy(),
+            color=COLORS["actor"],
+            label="Q(actor)-Q(GT)",
+            linewidth=1.4,
+        )
+    if "gt" in q_values and "wa" in q_values:
+        axes[1].plot(
+            steps,
+            (q_values["gt"] - q_values["wa"]).cpu().numpy(),
+            color=COLORS["wa"],
+            label="Q(GT)-Q(WA)",
+            linewidth=1.4,
+        )
+    axes[1].axhline(0.0, color="#888888", linewidth=0.9, linestyle="--")
+    axes[1].set_ylabel("Q gap")
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend()
+
+    src_np = source.cpu().numpy().reshape(1, -1)
+    axes[2].imshow(src_np, aspect="auto", cmap="tab10", vmin=0, vmax=9)
+    axes[2].set_yticks([])
+    axes[2].set_xlabel("chunk start")
+    axes[2].set_title("source: " + ", ".join(f"{k}={v}" for k, v in SOURCE_NAME.items()))
+    fig.suptitle(f"{episode} critic Q over chunks")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out, dpi=160)
+    plt.close(fig)
+
+
 def summarize(actions: dict[str, torch.Tensor], positions: dict[str, torch.Tensor], source: torch.Tensor) -> dict[str, float]:
     out: dict[str, float] = {
         "valid_steps": int(actions["gt"].shape[0]),
@@ -646,6 +861,26 @@ def summarize(actions: dict[str, torch.Tensor], positions: dict[str, torch.Tenso
         out[f"gt_vs_{key}_tcp_mean_m"] = float(tcp.mean().item())
         out[f"gt_vs_{key}_tcp_p95_m"] = float(torch.quantile(tcp.flatten(), 0.95).item())
         out[f"gt_vs_{key}_tcp_max_m"] = float(tcp.max().item())
+    return out
+
+
+def summarize_q(q_values: dict[str, torch.Tensor] | None, source: torch.Tensor) -> dict[str, float]:
+    if not q_values:
+        return {}
+    out: dict[str, float] = {}
+    for key, value in q_values.items():
+        out[f"q_{key}_mean"] = float(value.mean().item())
+        out[f"q_{key}_min"] = float(value.min().item())
+        out[f"q_{key}_max"] = float(value.max().item())
+    for lhs, rhs in (("actor", "gt"), ("gt", "wa"), ("actor", "wa")):
+        if lhs in q_values and rhs in q_values:
+            gap = q_values[lhs] - q_values[rhs]
+            out[f"q_{lhs}_minus_{rhs}_mean"] = float(gap.mean().item())
+            out[f"q_{lhs}_minus_{rhs}_positive_frac"] = float((gap > 0).float().mean().item())
+            human = source == 1
+            if bool(human.any().item()):
+                out[f"q_{lhs}_minus_{rhs}_human_mean"] = float(gap[human].mean().item())
+                out[f"q_{lhs}_minus_{rhs}_human_positive_frac"] = float((gap[human] > 0).float().mean().item())
     return out
 
 
@@ -669,16 +904,38 @@ def write_step_csv(path: Path, actions: dict[str, torch.Tensor], positions: dict
             writer.writerow(row)
 
 
+def write_q_csv(path: Path, q_values: dict[str, torch.Tensor], source: torch.Tensor) -> None:
+    with path.open("w", newline="") as f:
+        fieldnames = ["chunk", "source_id", "source"] + [f"q_{key}" for key in sorted(q_values)]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        t = next(iter(q_values.values())).shape[0]
+        for i in range(t):
+            sid = int(source[i].item()) if i < source.shape[0] else -1
+            row = {"chunk": i, "source_id": sid, "source": SOURCE_NAME.get(sid, str(sid))}
+            for key in sorted(q_values):
+                row[f"q_{key}"] = float(q_values[key][i].item())
+            writer.writerow(row)
+
+
 def write_index_html(out_dir: Path, summaries: list[dict[str, Any]]) -> None:
     rows = []
     for s in summaries:
         ep = s["episode"]
+        q_line = ""
+        if "q_actor_minus_gt_mean" in s:
+            q_line = (
+                f", Q(actor-GT)={s['q_actor_minus_gt_mean']:.4f}, "
+                f"Q(GT-WA)={s.get('q_gt_minus_wa_mean', 0.0):.4f}"
+            )
+        q_img = f"<img src='{ep}_q.png' width='900'><br>\n" if s.get("has_q_plot", 0.0) else ""
         rows.append(
             f"<h2>{ep}</h2>\n"
             f"<p>WA joint MAE={s['gt_vs_wa_joint_mae']:.6f}, "
             f"Actor joint MAE={s['gt_vs_actor_joint_mae']:.6f}, "
-            f"Actor TCP max={s['gt_vs_actor_tcp_max_m']:.4f} m</p>\n"
+            f"Actor TCP max={s['gt_vs_actor_tcp_max_m']:.4f} m{q_line}</p>\n"
             f"<img src='{ep}_tcp_3d.png' width='900'><br>\n"
+            f"{q_img}"
             f"<img src='{ep}_errors.png' width='900'><br>\n"
             f"<img src='{ep}_tcp_xyz.png' width='900'><br>\n"
             f"<img src='{ep}_joints.png' width='900'><hr>\n"
@@ -700,6 +957,7 @@ def visualize_one(
     out_dir: Path,
     chain: UrdfChain,
     lite_policy,
+    critic,
     full_policy,
     args,
     device: torch.device,
@@ -709,6 +967,7 @@ def visualize_one(
     action_dim = int(args.action_dim)
     chunks = int(args.num_chunks)
     gt_exec, gt_source_key = get_gt_exec(data, action_dim, chunks)
+    gt_model, gt_model_source_key = get_gt_model(data, action_dim, chunks)
     t = gt_exec.shape[0]
     mask = valid_mask(data, t, chunks)
     src = action_source(data, t, chunks)
@@ -716,7 +975,11 @@ def visualize_one(
 
     if args.wa_source == "saved":
         wa_model, wa_source_key = get_saved_wa_model(data, action_dim, chunks)
-        wa_exec = model_to_exec(lite_policy, wa_model, raw_state, device)
+        try:
+            wa_exec, wa_exec_source_key = get_saved_wa_exec(data, action_dim, chunks)
+        except KeyError:
+            wa_exec = model_to_exec(lite_policy, wa_model, raw_state, device)
+            wa_exec_source_key = f"{wa_source_key}->model_to_exec"
         actor_model, actor_exec = actor_saved_features(
             lite_policy,
             data,
@@ -740,6 +1003,7 @@ def visualize_one(
             chunks=chunks,
         )
         wa_source_key = "rerun_from_saved_visual_latent"
+        wa_exec_source_key = "rerun_from_saved_visual_latent"
     else:
         if full_policy is None:
             raise RuntimeError("--wa-source rerun requires full_policy")
@@ -752,11 +1016,13 @@ def visualize_one(
             chunks,
         )
         wa_source_key = "rerun_full_gigawa_policy"
+        wa_exec_source_key = "rerun_full_gigawa_policy"
 
     valid_gt = flatten_valid(gt_exec, mask)
     valid_wa = flatten_valid(wa_exec, mask)
     valid_actor = flatten_valid(actor_exec, mask)
     valid_src = flatten_source(src, mask)
+    q_source = chunk_source(src)
 
     actions = {
         "gt": valid_gt,
@@ -764,6 +1030,17 @@ def visualize_one(
         "actor": valid_actor,
     }
     positions = {key: chain.positions(value) for key, value in actions.items()}
+    q_values = compute_q_values(
+        lite_policy,
+        critic,
+        data,
+        candidates={"gt": gt_model, "wa": wa_model, "actor": actor_model},
+        device=device,
+        dtype=dtype,
+        batch_size=args.batch_size,
+        action_dim=action_dim,
+        chunks=chunks,
+    )
 
     episode = _safe_stem(pt_path)
     ep_dir = out_dir if not args.per_episode_dirs else out_dir / episode
@@ -774,29 +1051,45 @@ def visualize_one(
     save_tcp_xyz(ep_dir / f"{prefix}tcp_xyz.png", episode, positions)
     save_joint_plot(ep_dir / f"{prefix}joints.png", episode, actions)
     save_error_plot(ep_dir / f"{prefix}errors.png", episode, actions, positions, valid_src)
+    if q_values is not None:
+        save_q_plot(ep_dir / f"{prefix}q.png", episode, q_values, q_source)
     write_step_csv(ep_dir / f"{prefix}steps.csv", actions, positions, valid_src)
+    if q_values is not None:
+        write_q_csv(ep_dir / f"{prefix}q.csv", q_values, q_source)
+    npz_payload = {
+        "gt_action": actions["gt"].cpu().numpy(),
+        "wa_action": actions["wa"].cpu().numpy(),
+        "actor_action": actions["actor"].cpu().numpy(),
+        "gt_tcp": positions["gt"].cpu().numpy(),
+        "wa_tcp": positions["wa"].cpu().numpy(),
+        "actor_tcp": positions["actor"].cpu().numpy(),
+        "source": valid_src.cpu().numpy(),
+        "chunk_source": q_source.cpu().numpy(),
+        "gt_model": gt_model.cpu().numpy(),
+        "actor_model": flatten_valid(actor_model, mask).cpu().numpy(),
+        "wa_model": flatten_valid(wa_model, mask).cpu().numpy(),
+    }
+    if q_values is not None:
+        for key, value in q_values.items():
+            npz_payload[f"q_{key}"] = value.cpu().numpy()
     np.savez_compressed(
         ep_dir / f"{prefix}trajectories.npz",
-        gt_action=actions["gt"].cpu().numpy(),
-        wa_action=actions["wa"].cpu().numpy(),
-        actor_action=actions["actor"].cpu().numpy(),
-        gt_tcp=positions["gt"].cpu().numpy(),
-        wa_tcp=positions["wa"].cpu().numpy(),
-        actor_tcp=positions["actor"].cpu().numpy(),
-        source=valid_src.cpu().numpy(),
-        actor_model=flatten_valid(actor_model, mask).cpu().numpy(),
-        wa_model=flatten_valid(wa_model, mask).cpu().numpy(),
+        **npz_payload,
     )
 
     summary = summarize(actions, positions, valid_src)
+    summary.update(summarize_q(q_values, q_source))
     summary.update(
         {
             "episode": episode,
             "file": str(pt_path),
             "gt_source": gt_source_key,
+            "gt_model_source": gt_model_source_key,
             "wa_source": wa_source_key,
+            "wa_exec_source": wa_exec_source_key,
             "wa_mode": args.wa_source,
             "out_dir": str(ep_dir),
+            "has_q_plot": float(q_values is not None),
         }
     )
     (ep_dir / f"{prefix}summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -836,6 +1129,7 @@ def main() -> int:
     parser.add_argument("--config-name", default=DEFAULT_CONFIG_NAME)
     parser.add_argument("--per-episode-dirs", action="store_true")
     parser.add_argument("--enable-bound", action="store_true")
+    parser.add_argument("--skip-q", action="store_true", help="Do not load critic weights or write Q plots")
     parser.add_argument("overrides", nargs="*", help="Hydra overrides used only with --wa-source rerun")
     args = parser.parse_args()
 
@@ -847,6 +1141,7 @@ def main() -> int:
 
     chain = UrdfChain(args.urdf)
     lite_policy = load_actor(args.actor_ckpt, args.norm_json, device=device, dtype=dtype, enable_bound=args.enable_bound)
+    critic = None if args.skip_q else load_critic(args.actor_ckpt, lite_policy, device=device, dtype=dtype)
     files = find_episode_files(args.pt, args.max_files)
     full_policy = None
     if args.wa_source == "rerun":
@@ -865,6 +1160,7 @@ def main() -> int:
                 out_dir=out_dir,
                 chain=chain,
                 lite_policy=lite_policy,
+                critic=critic,
                 full_policy=full_policy,
                 args=args,
                 device=device,

@@ -31,7 +31,32 @@ def _save_actor_checkpoint(actor_group, cfg, global_step: int):
     )
     actor_save_path = os.path.join(base_output_dir, "actor")
     os.makedirs(actor_save_path, exist_ok=True)
-    actor_group.save_checkpoint(actor_save_path, global_step).wait()
+    actor_group.save_checkpoint(
+        actor_save_path,
+        global_step,
+        save_replay_buffers=bool(
+            cfg.runner.get("save_replay_buffers_with_checkpoint", False)
+        ),
+    ).wait()
+
+
+def _find_full_weight_file(path: str) -> str:
+    if os.path.isfile(path):
+        return path
+    candidates = [
+        os.path.join(path, "model_state_dict", "full_weights.pt"),
+        os.path.join(path, "actor", "model_state_dict", "full_weights.pt"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(f"Could not find full_weights.pt under {path}")
+
+
+def _load_actor_weights_only(actor_group, ckpt_path: str) -> None:
+    weight_file = _find_full_weight_file(str(ckpt_path))
+    actor_group.load_full_weights(weight_file).wait()
+    print(f"[offline_rl] loaded actor weights only from {weight_file}", flush=True)
 
 
 
@@ -77,6 +102,14 @@ def _log_key_offline_rl_metrics(writer, metrics: dict, epoch: int, global_step: 
     actor_loss = _safe_float(metrics.get("offline_rl/train_actor_loss"))
     bc_loss = _safe_float(metrics.get("offline_rl/train_bc_loss"))
     q_pi = _safe_float(metrics.get("offline_rl/train_q_pi_mean"))
+    human_bc_loss = _safe_float(metrics.get("offline_rl/train_human_bc_loss"))
+    wa_stay_loss = _safe_float(metrics.get("offline_rl/train_wa_stay_loss"))
+    smooth_loss = _safe_float(metrics.get("offline_rl/train_smooth_loss"))
+    pairwise_loss = _safe_float(metrics.get("offline_rl/train_pairwise_loss"))
+    q_human_minus_wa = _safe_float(metrics.get("offline_rl/train_q_human_minus_wa_pair"))
+    human_mask_frac = _safe_float(metrics.get("offline_rl/train_human_mask_frac"))
+    wa_mask_frac = _safe_float(metrics.get("offline_rl/train_wa_mask_frac"))
+    actor_q_weight = _safe_float(metrics.get("offline_rl/train_actor_q_weight"))
     critic_grad_norm = _safe_float(metrics.get("offline_rl/critic_grad_norm"))
     actor_grad_norm = _safe_float(metrics.get("offline_rl/actor_grad_norm"))
     critic_lr = _safe_float(metrics.get("critic/lr"))
@@ -89,6 +122,14 @@ def _log_key_offline_rl_metrics(writer, metrics: dict, epoch: int, global_step: 
         "tb_core/actor_loss": actor_loss,
         "tb_core/bc_loss": bc_loss,
         "tb_core/q_pi": q_pi,
+        "tb_intervention/human_bc_loss": human_bc_loss,
+        "tb_intervention/wa_stay_loss": wa_stay_loss,
+        "tb_intervention/smooth_loss": smooth_loss,
+        "tb_intervention/pairwise_loss": pairwise_loss,
+        "tb_intervention/q_human_minus_wa": q_human_minus_wa,
+        "tb_intervention/human_mask_frac": human_mask_frac,
+        "tb_intervention/wa_mask_frac": wa_mask_frac,
+        "tb_intervention/actor_q_weight": actor_q_weight,
         "tb_core/train_q": train_q,
         "tb_core/val_q": val_q,
         "tb_core/train_success_failure_gap": train_sf_gap,
@@ -150,6 +191,7 @@ def main(cfg) -> None:
     actor_group.init_offline_rl_worker().wait()
 
     resume_dir = cfg.runner.get("resume_dir", None)
+    ckpt_path = cfg.runner.get("ckpt_path", None)
     global_step = 0
     if resume_dir:
         actor_resume_path = (
@@ -163,6 +205,8 @@ def main(cfg) -> None:
                 global_step = int(resume_dir.split("global_step_")[-1].split("/")[0])
             except Exception:
                 global_step = 0
+    elif ckpt_path:
+        _load_actor_weights_only(actor_group, str(ckpt_path))
 
     tb_dir = os.path.join(
         cfg.runner.logger.log_path,
@@ -171,6 +215,13 @@ def main(cfg) -> None:
     )
     os.makedirs(tb_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_dir)
+
+    if bool(cfg.runner.get("save_initial_checkpoint", False)):
+        _save_actor_checkpoint(actor_group, cfg, global_step)
+        print(
+            f"[offline_rl] saved initial actor checkpoint at step={global_step}",
+            flush=True,
+        )
 
     max_epochs = int(cfg.runner.max_epochs)
     save_interval = int(cfg.runner.get("save_interval", 100))
@@ -203,6 +254,14 @@ def main(cfg) -> None:
         actor_loss = metrics.get("offline_rl/train_actor_loss", None)
         bc_loss = metrics.get("offline_rl/train_bc_loss", None)
         q_pi = metrics.get("offline_rl/train_q_pi_mean", None)
+        human_bc_loss = metrics.get("offline_rl/train_human_bc_loss", None)
+        wa_stay_loss = metrics.get("offline_rl/train_wa_stay_loss", None)
+        smooth_loss = metrics.get("offline_rl/train_smooth_loss", None)
+        pairwise_loss = metrics.get("offline_rl/train_pairwise_loss", None)
+        q_human_minus_wa = metrics.get("offline_rl/train_q_human_minus_wa_pair", None)
+        human_mask_frac = metrics.get("offline_rl/train_human_mask_frac", None)
+        wa_mask_frac = metrics.get("offline_rl/train_wa_mask_frac", None)
+        actor_q_weight = metrics.get("offline_rl/train_actor_q_weight", None)
         actor_grad_norm = metrics.get("offline_rl/actor_grad_norm", None)
         critic_grad_norm = metrics.get("offline_rl/critic_grad_norm", None)
         actor_lr = metrics.get("actor/lr", None)
@@ -214,6 +273,10 @@ def main(cfg) -> None:
             f"train_q={_fmt_metric(train_q)} | val_q={_fmt_metric(val_q)} | "
             f"train_sf_gap={_fmt_metric(train_gap)} | val_sf_gap={_fmt_metric(val_gap)} | "
             f"actor_loss={_fmt_metric(actor_loss)} | bc_loss={_fmt_metric(bc_loss)} | q_pi={_fmt_metric(q_pi)} | "
+            f"human_bc={_fmt_metric(human_bc_loss)} | wa_stay={_fmt_metric(wa_stay_loss)} | smooth={_fmt_metric(smooth_loss)} | "
+            f"pairwise={_fmt_metric(pairwise_loss)} | q_human_minus_wa={_fmt_metric(q_human_minus_wa)} | "
+            f"actor_q_weight={_fmt_metric(actor_q_weight)} | "
+            f"human_mask={_fmt_metric(human_mask_frac)} | wa_mask={_fmt_metric(wa_mask_frac)} | "
             f"critic_grad_norm={float(critic_grad_norm) if critic_grad_norm is not None else float('nan'):.6f} | "
             f"actor_grad_norm={float(actor_grad_norm) if actor_grad_norm is not None else float('nan'):.6f} | "
             f"critic_lr={float(critic_lr) if critic_lr is not None else float('nan'):.8e} | "

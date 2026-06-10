@@ -156,6 +156,20 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             )
         self.use_action_valid_mask = bool(self.cfg.algorithm.get("use_action_valid_mask", True))
 
+        intervention_cfg = self.cfg.algorithm.get("intervention_rl", None) or {}
+        self.intervention_rl_enable = bool(intervention_cfg.get("enable", False))
+        self.intervention_actor_success_only = bool(intervention_cfg.get("actor_success_only", True))
+        self.intervention_q_coef = float(intervention_cfg.get("q_coef", 1.0))
+        self.intervention_human_bc_coef = float(intervention_cfg.get("human_bc_coef", 10.0))
+        self.intervention_wa_stay_coef = float(intervention_cfg.get("wa_stay_coef", 1.0))
+        self.intervention_smooth_coef = float(intervention_cfg.get("smooth_coef", 0.0))
+        self.intervention_pairwise_coef = float(intervention_cfg.get("pairwise_coef", 1.0))
+        self.intervention_pairwise_margin = float(intervention_cfg.get("pairwise_margin", 0.05))
+        self.intervention_pairwise_success_only = bool(intervention_cfg.get("pairwise_success_only", True))
+        self.intervention_use_replan_as_human = bool(intervention_cfg.get("use_replan_as_human", False))
+        self.intervention_q_warmup_actor_updates = int(intervention_cfg.get("q_warmup_actor_updates", 0))
+        self.intervention_q_ramp_actor_updates = int(intervention_cfg.get("q_ramp_actor_updates", 0))
+
     # ---------------------------------------------------------------------
     # Init / setup
     # ---------------------------------------------------------------------
@@ -381,6 +395,28 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         self.ref_action_dropout_p = float(self.cfg.algorithm.get("ref_action_dropout_p", 0.5))
         self.target_policy_noise = float(self.cfg.algorithm.get("target_policy_noise", 0.2))
         self.target_noise_clip = float(self.cfg.algorithm.get("target_noise_clip", 0.5))
+
+        intervention_cfg = self.cfg.algorithm.get("intervention_rl", None) or {}
+        self.intervention_rl_enable = bool(intervention_cfg.get("enable", self.intervention_rl_enable))
+        self.intervention_actor_success_only = bool(intervention_cfg.get("actor_success_only", self.intervention_actor_success_only))
+        self.intervention_q_coef = float(intervention_cfg.get("q_coef", self.intervention_q_coef))
+        self.intervention_human_bc_coef = float(intervention_cfg.get("human_bc_coef", self.intervention_human_bc_coef))
+        self.intervention_wa_stay_coef = float(intervention_cfg.get("wa_stay_coef", self.intervention_wa_stay_coef))
+        self.intervention_smooth_coef = float(intervention_cfg.get("smooth_coef", self.intervention_smooth_coef))
+        self.intervention_pairwise_coef = float(intervention_cfg.get("pairwise_coef", self.intervention_pairwise_coef))
+        self.intervention_pairwise_margin = float(intervention_cfg.get("pairwise_margin", self.intervention_pairwise_margin))
+        self.intervention_pairwise_success_only = bool(
+            intervention_cfg.get("pairwise_success_only", self.intervention_pairwise_success_only)
+        )
+        self.intervention_use_replan_as_human = bool(
+            intervention_cfg.get("use_replan_as_human", self.intervention_use_replan_as_human)
+        )
+        self.intervention_q_warmup_actor_updates = int(
+            intervention_cfg.get("q_warmup_actor_updates", self.intervention_q_warmup_actor_updates)
+        )
+        self.intervention_q_ramp_actor_updates = int(
+            intervention_cfg.get("q_ramp_actor_updates", self.intervention_q_ramp_actor_updates)
+        )
 
         policy_head_cfg = self.cfg.actor.model.giga_world_policy
         self.enable_critic_q_upper_bound = bool(
@@ -1474,6 +1510,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             f"{prefix}/actor_loss_sum": 0.0,
             f"{prefix}/bc_loss_sum": 0.0,
             f"{prefix}/q_pi_sum": 0.0,
+            f"{prefix}/human_bc_loss_sum": 0.0,
+            f"{prefix}/wa_stay_loss_sum": 0.0,
+            f"{prefix}/smooth_loss_sum": 0.0,
+            f"{prefix}/human_mask_frac_sum": 0.0,
+            f"{prefix}/wa_mask_frac_sum": 0.0,
         }
         was_training = self.model.training
         self.model.eval()
@@ -1489,6 +1530,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     local[f"{prefix}/actor_loss_sum"] += float(actor_loss.item()) * batch_count
                     local[f"{prefix}/bc_loss_sum"] += float(actor_metrics.get("bc_loss", 0.0)) * batch_count
                     local[f"{prefix}/q_pi_sum"] += float(actor_metrics.get("q_pi", 0.0)) * batch_count
+                    local[f"{prefix}/human_bc_loss_sum"] += float(actor_metrics.get("human_bc_loss", 0.0)) * batch_count
+                    local[f"{prefix}/wa_stay_loss_sum"] += float(actor_metrics.get("wa_stay_loss", 0.0)) * batch_count
+                    local[f"{prefix}/smooth_loss_sum"] += float(actor_metrics.get("smooth_loss", 0.0)) * batch_count
+                    local[f"{prefix}/human_mask_frac_sum"] += float(actor_metrics.get("human_mask_frac", 0.0)) * batch_count
+                    local[f"{prefix}/wa_mask_frac_sum"] += float(actor_metrics.get("wa_mask_frac", 0.0)) * batch_count
         if was_training:
             self.model.train()
 
@@ -1499,6 +1545,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             f"{prefix}/actor_loss": reduced[f"{prefix}/actor_loss_sum"] / count,
             f"{prefix}/bc_loss": reduced[f"{prefix}/bc_loss_sum"] / count,
             f"{prefix}/q_pi_mean": reduced[f"{prefix}/q_pi_sum"] / count,
+            f"{prefix}/human_bc_loss": reduced[f"{prefix}/human_bc_loss_sum"] / count,
+            f"{prefix}/wa_stay_loss": reduced[f"{prefix}/wa_stay_loss_sum"] / count,
+            f"{prefix}/smooth_loss": reduced[f"{prefix}/smooth_loss_sum"] / count,
+            f"{prefix}/human_mask_frac": reduced[f"{prefix}/human_mask_frac_sum"] / count,
+            f"{prefix}/wa_mask_frac": reduced[f"{prefix}/wa_mask_frac_sum"] / count,
         }
 
     @Worker.timer("run_offline_critic_epoch")
@@ -1681,10 +1732,19 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         critic_q2_means = []
         critic_target_q_means = []
         critic_q_logged_means = []
+        critic_pairwise_losses = []
+        critic_pairwise_counts = []
+        critic_pairwise_gaps = []
         actor_train_losses = []
         actor_bc_losses = []
         actor_q_pi_means = []
         actor_grad_norms = []
+        actor_human_bc_losses = []
+        actor_wa_stay_losses = []
+        actor_smooth_losses = []
+        actor_human_mask_fracs = []
+        actor_wa_mask_fracs = []
+        actor_q_weights = []
 
         policy = self._unwrap_policy(self.model)
         tau = float(self.target_tau)
@@ -1701,8 +1761,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 step_q2 = []
                 step_target_q = []
                 step_q_logged = []
+                step_pairwise_loss = []
+                step_pairwise_count = []
+                step_pairwise_gap = []
                 for batch in train_micro_batch_list:
-                    critic_loss, q1, q2, target_q_values, _ = self._compute_critic_outputs(batch)
+                    critic_loss, q1, q2, target_q_values, critic_aux = self._compute_critic_outputs(batch)
                     (critic_loss / self.gradient_accumulation).backward()
                     q_logged = torch.minimum(q1.detach(), q2.detach())
                     step_losses.append(float(critic_loss.detach().item()))
@@ -1710,6 +1773,30 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                     step_q2.append(float(q2.detach().mean().item()))
                     step_target_q.append(float(target_q_values.detach().mean().item()))
                     step_q_logged.append(float(q_logged.mean().item()))
+                    if float(critic_aux.get("pairwise_count", 0.0)) > 0.0:
+                        step_pairwise_loss.append(float(critic_aux.get("pairwise_loss", 0.0)))
+                        step_pairwise_count.append(float(critic_aux.get("pairwise_count", 0.0)))
+                        step_pairwise_gap.append(float(critic_aux.get("q_human_minus_wa_pair", 0.0)))
+                if (
+                    self.intervention_rl_enable
+                    and self.intervention_pairwise_success_only
+                    and self.intervention_pairwise_coef > 0.0
+                    and self.offline_rl_train_success_buffer is not None
+                    and self.offline_rl_train_success_buffer.size > 0
+                ):
+                    pairwise_global_batch = self._offline_sample_batch_from_buffer(
+                        self.offline_rl_train_success_buffer,
+                        self.offline_rl_global_batch_per_rank,
+                    )
+                    for pairwise_batch in self._offline_rl_microbatches(pairwise_global_batch):
+                        pairwise_loss, pairwise_metrics = self._compute_intervention_pairwise_critic_loss(
+                            pairwise_batch
+                        )
+                        if float(pairwise_metrics.get("pairwise_count", 0.0)) > 0.0:
+                            (pairwise_loss / self.gradient_accumulation).backward()
+                        step_pairwise_loss.append(float(pairwise_metrics.get("pairwise_loss", 0.0)))
+                        step_pairwise_count.append(float(pairwise_metrics.get("pairwise_count", 0.0)))
+                        step_pairwise_gap.append(float(pairwise_metrics.get("q_human_minus_wa_pair", 0.0)))
                 critic_grad_norm = self.model.clip_grad_norm_(max_norm=self.cfg.actor.critic_optim.clip_grad)
                 self.qf_optimizer.step()
                 self.qf_lr_scheduler.step()
@@ -1720,21 +1807,46 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 critic_q2_means.append(float(np.mean(step_q2)))
                 critic_target_q_means.append(float(np.mean(step_target_q)))
                 critic_q_logged_means.append(float(np.mean(step_q_logged)))
+                critic_pairwise_losses.append(float(np.mean(step_pairwise_loss)) if step_pairwise_loss else 0.0)
+                critic_pairwise_counts.append(float(np.sum(step_pairwise_count)) if step_pairwise_count else 0.0)
+                critic_pairwise_gaps.append(float(np.mean(step_pairwise_gap)) if step_pairwise_gap else 0.0)
 
             for _ in range(self.offline_rl_actor_updates_per_step):
                 self._apply_training_param_freeze(actor_phase=True, critic_phase=False)
-                global_batch = self._offline_rl_sample_batch(train=True)
+                if (
+                    self.intervention_rl_enable
+                    and self.intervention_actor_success_only
+                    and self.offline_rl_train_success_buffer is not None
+                ):
+                    global_batch = self._offline_sample_batch_from_buffer(
+                        self.offline_rl_train_success_buffer,
+                        self.offline_rl_global_batch_per_rank,
+                    )
+                else:
+                    global_batch = self._offline_rl_sample_batch(train=True)
                 train_micro_batch_list = self._offline_rl_microbatches(global_batch)
                 self.optimizer.zero_grad()
                 step_actor_losses = []
                 step_bc_losses = []
                 step_q_pi = []
+                step_human_bc = []
+                step_wa_stay = []
+                step_smooth = []
+                step_human_mask = []
+                step_wa_mask = []
+                step_q_weight = []
                 for batch in train_micro_batch_list:
                     actor_loss, actor_metrics, _ = self.forward_actor(batch, capture_diagnostics=False)
                     (actor_loss / self.gradient_accumulation).backward()
                     step_actor_losses.append(float(actor_loss.detach().item()))
                     step_bc_losses.append(float(actor_metrics.get("bc_loss", 0.0)))
                     step_q_pi.append(float(actor_metrics.get("q_pi", 0.0)))
+                    step_human_bc.append(float(actor_metrics.get("human_bc_loss", 0.0)))
+                    step_wa_stay.append(float(actor_metrics.get("wa_stay_loss", 0.0)))
+                    step_smooth.append(float(actor_metrics.get("smooth_loss", 0.0)))
+                    step_human_mask.append(float(actor_metrics.get("human_mask_frac", 0.0)))
+                    step_wa_mask.append(float(actor_metrics.get("wa_mask_frac", 0.0)))
+                    step_q_weight.append(float(actor_metrics.get("q_weight", 0.0)))
                 actor_grad_norm = self.model.clip_grad_norm_(max_norm=self.cfg.actor.optim.clip_grad)
                 self.optimizer.step()
                 self.lr_scheduler.step()
@@ -1744,6 +1856,12 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 actor_bc_losses.append(float(np.mean(step_bc_losses)))
                 actor_q_pi_means.append(float(np.mean(step_q_pi)))
                 actor_grad_norms.append(float(actor_grad_norm))
+                actor_human_bc_losses.append(float(np.mean(step_human_bc)) if step_human_bc else 0.0)
+                actor_wa_stay_losses.append(float(np.mean(step_wa_stay)) if step_wa_stay else 0.0)
+                actor_smooth_losses.append(float(np.mean(step_smooth)) if step_smooth else 0.0)
+                actor_human_mask_fracs.append(float(np.mean(step_human_mask)) if step_human_mask else 0.0)
+                actor_wa_mask_fracs.append(float(np.mean(step_wa_mask)) if step_wa_mask else 0.0)
+                actor_q_weights.append(float(np.mean(step_q_weight)) if step_q_weight else 0.0)
 
         metrics = {
             "offline_rl/train_critic_loss": float(np.mean(critic_train_losses)) if critic_train_losses else 0.0,
@@ -1751,9 +1869,18 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "offline_rl/train_q2_mean": float(np.mean(critic_q2_means)) if critic_q2_means else 0.0,
             "offline_rl/train_q_logged_mean": float(np.mean(critic_q_logged_means)) if critic_q_logged_means else 0.0,
             "offline_rl/train_target_q_mean": float(np.mean(critic_target_q_means)) if critic_target_q_means else 0.0,
+            "offline_rl/train_pairwise_loss": float(np.mean(critic_pairwise_losses)) if critic_pairwise_losses else 0.0,
+            "offline_rl/train_pairwise_count": float(np.mean(critic_pairwise_counts)) if critic_pairwise_counts else 0.0,
+            "offline_rl/train_q_human_minus_wa_pair": float(np.mean(critic_pairwise_gaps)) if critic_pairwise_gaps else 0.0,
             "offline_rl/train_actor_loss": float(np.mean(actor_train_losses)) if actor_train_losses else 0.0,
             "offline_rl/train_bc_loss": float(np.mean(actor_bc_losses)) if actor_bc_losses else 0.0,
             "offline_rl/train_q_pi_mean": float(np.mean(actor_q_pi_means)) if actor_q_pi_means else 0.0,
+            "offline_rl/train_human_bc_loss": float(np.mean(actor_human_bc_losses)) if actor_human_bc_losses else 0.0,
+            "offline_rl/train_wa_stay_loss": float(np.mean(actor_wa_stay_losses)) if actor_wa_stay_losses else 0.0,
+            "offline_rl/train_smooth_loss": float(np.mean(actor_smooth_losses)) if actor_smooth_losses else 0.0,
+            "offline_rl/train_human_mask_frac": float(np.mean(actor_human_mask_fracs)) if actor_human_mask_fracs else 0.0,
+            "offline_rl/train_wa_mask_frac": float(np.mean(actor_wa_mask_fracs)) if actor_wa_mask_fracs else 0.0,
+            "offline_rl/train_actor_q_weight": float(np.mean(actor_q_weights)) if actor_q_weights else 0.0,
             "offline_rl/critic_grad_norm": float(np.mean(critic_grad_norms)) if critic_grad_norms else 0.0,
             "offline_rl/actor_grad_norm": float(np.mean(actor_grad_norms)) if actor_grad_norms else 0.0,
             "offline_rl/did_validation": float(bool(do_validation)),
@@ -1761,6 +1888,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "actor/lr": float(self.lr_scheduler.get_last_lr()[0]),
             "critic/lr": float(self.qf_lr_scheduler.get_last_lr()[0]),
         }
+        metrics = all_reduce_dict(metrics, op=torch.distributed.ReduceOp.AVG)
 
         if do_validation:
             metrics.update(
@@ -3000,8 +3128,220 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
 
         return y.contiguous()
 
-    def _compute_critic_outputs(self, batch):
+    def _normalize_runtime_mask(
+        self,
+        x: torch.Tensor | None,
+        *,
+        batch_size: int,
+        default: bool = False,
+    ) -> torch.Tensor:
+        expected_chunk = int(self.cfg.actor.model.get("num_action_chunks", 1))
+        if x is None:
+            return torch.full(
+                (batch_size, expected_chunk),
+                bool(default),
+                dtype=torch.bool,
+                device=self.device,
+            )
+        y = x.to(self.device, dtype=torch.bool)
+        if y.ndim == 1:
+            y = y[:, None].expand(y.shape[0], expected_chunk)
+        elif y.ndim == 3 and y.shape[1] == 1:
+            y = y.squeeze(1)
+        elif y.ndim == 3 and y.shape[-1] == 1:
+            y = y.squeeze(-1)
+        elif y.ndim > 2:
+            y = y.reshape(y.shape[0], -1)
+        if y.ndim != 2:
+            raise RuntimeError(f"Mask normalized to unexpected shape {tuple(y.shape)}")
+        if y.shape[1] > expected_chunk:
+            y = y[:, :expected_chunk]
+        elif y.shape[1] < expected_chunk:
+            pad = torch.full(
+                (y.shape[0], expected_chunk - y.shape[1]),
+                bool(default),
+                dtype=torch.bool,
+                device=y.device,
+            )
+            y = torch.cat([y, pad], dim=1)
+        return y.contiguous()
+
+    def _batch_valid_mask(self, batch: dict[str, torch.Tensor], batch_size: int) -> torch.Tensor:
+        mask = batch.get("action_valid_mask", None)
+        if mask is None and isinstance(batch.get("forward_inputs"), dict):
+            mask = batch["forward_inputs"].get("action_valid_mask", None)
+        return self._normalize_runtime_mask(mask, batch_size=batch_size, default=True)
+
+    def _batch_action_source(self, batch: dict[str, torch.Tensor], batch_size: int) -> torch.Tensor:
+        source = None
+        if isinstance(batch.get("forward_inputs"), dict):
+            source = batch["forward_inputs"].get("action_source", None)
+        expected_chunk = int(self.cfg.actor.model.get("num_action_chunks", 1))
+        if source is None:
+            return torch.zeros(batch_size, expected_chunk, dtype=torch.long, device=self.device)
+        y = source.to(self.device, dtype=torch.long)
+        if y.ndim == 1:
+            y = y[:, None].expand(y.shape[0], expected_chunk)
+        elif y.ndim == 3 and y.shape[1] == 1:
+            y = y.squeeze(1)
+        elif y.ndim > 2:
+            y = y.reshape(y.shape[0], -1)
+        if y.shape[1] > expected_chunk:
+            y = y[:, :expected_chunk]
+        elif y.shape[1] < expected_chunk:
+            pad = torch.full((y.shape[0], expected_chunk - y.shape[1]), 3, dtype=torch.long, device=y.device)
+            y = torch.cat([y, pad], dim=1)
+        return y.contiguous()
+
+    def _get_forward_model_action(
+        self,
+        batch: dict[str, torch.Tensor],
+        key: str,
+        fallback: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        fi = batch.get("forward_inputs", None)
+        if isinstance(fi, dict) and key in fi and isinstance(fi[key], torch.Tensor):
+            return self._reshape_runtime_action_tensor(
+                fi[key].to(self.device, dtype=self.torch_dtype),
+                tensor_name=f"forward_inputs.{key}",
+            )
+        return fallback
+
+    def _masked_mse(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.to(device=pred.device, dtype=pred.dtype)
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(-1)
+        diff = (pred.float() - target.float()) ** 2
+        denom = (mask.sum() * diff.shape[-1]).clamp_min(1.0)
+        return (diff * mask).sum() / denom
+
+    def _chunk_smoothness_loss(self, action: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if action.shape[1] <= 1:
+            return action.new_zeros(())
+        pair_mask = (mask[:, 1:] & mask[:, :-1]).to(device=action.device, dtype=action.dtype)
+        diff = (action[:, 1:].float() - action[:, :-1].float()) ** 2
+        denom = (pair_mask.sum() * diff.shape[-1]).clamp_min(1.0)
+        return (diff * pair_mask.unsqueeze(-1)).sum() / denom
+
+    def _human_like_mask(self, source: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        human = source == 1
+        if self.intervention_use_replan_as_human:
+            human = human | (source == 2)
+        return human & valid
+
+    def _intervention_effective_q_coef(self) -> float:
+        base = float(self.intervention_q_coef)
+        if base <= 0.0:
+            return 0.0
+        warmup = max(0, int(self.intervention_q_warmup_actor_updates))
+        ramp = max(0, int(self.intervention_q_ramp_actor_updates))
+        updates = max(0, int(self.actor_update_step))
+        if updates < warmup:
+            return 0.0
+        if ramp <= 0:
+            return base
+        progress = min(1.0, max(0.0, float(updates - warmup) / float(ramp)))
+        return base * progress
+
+    def _compute_intervention_pairwise_critic_loss(self, batch) -> tuple[torch.Tensor, dict[str, float]]:
+        actions = self._reshape_runtime_action_tensor(
+            batch["actions"].to(self.device, dtype=self.torch_dtype),
+            tensor_name="batch.actions",
+        )
+        zero = actions.new_zeros(())
+        metrics = {
+            "pairwise_loss": 0.0,
+            "pairwise_count": 0.0,
+            "q_human_pair_mean": 0.0,
+            "q_wa_pair_mean": 0.0,
+            "q_human_minus_wa_pair": 0.0,
+        }
+        if not self.intervention_rl_enable or self.intervention_pairwise_coef <= 0.0:
+            return zero, metrics
+
+        human_action = self._get_forward_model_action(batch, "model_action", fallback=actions)
+        wa_action = self._get_forward_model_action(batch, "policy_action_model", fallback=None)
+        if human_action is None or wa_action is None:
+            return zero, metrics
+
+        batch_size = int(actions.shape[0])
+        valid = self._batch_valid_mask(batch, batch_size)
+        source = self._batch_action_source(batch, batch_size)
+        pair_mask = self._human_like_mask(source, valid)
+        if not bool(pair_mask.any().item()):
+            return zero, metrics
+
+        curr_obs = batch["curr_obs"]
+        with torch.no_grad():
+            curr_visual_feat = self._build_visual_feat_for_actor(curr_obs["visual_latent"])
+            _, curr_actor_aux = self.model(
+                forward_type=ForwardType.DEFAULT,
+                mode="actor",
+                visual_feat=curr_visual_feat.detach(),
+                robot_state=curr_obs["robot_state"].to(self.device, dtype=self.torch_dtype),
+                ref_action=self._reshape_runtime_action_tensor(
+                    curr_obs["ref_action"].to(self.device, dtype=self.torch_dtype),
+                    tensor_name="curr_obs.ref_action",
+                ),
+                ref_action_dropout_p=0.0,
+                use_target=False,
+            )
+            curr_rl_state = curr_actor_aux["rl_state"].detach()
+            curr_critic_visual_tokens = curr_actor_aux.get("critic_visual_tokens", None)
+            if curr_critic_visual_tokens is not None:
+                curr_critic_visual_tokens = curr_critic_visual_tokens.detach()
+            curr_critic_robot_state = curr_actor_aux.get("critic_robot_state", None)
+            if curr_critic_robot_state is not None:
+                curr_critic_robot_state = curr_critic_robot_state.detach()
+            curr_critic_ref_action = curr_actor_aux.get("critic_ref_action", None)
+            if curr_critic_ref_action is not None:
+                curr_critic_ref_action = curr_critic_ref_action.detach()
+
+        qh1, qh2 = self.model(
+            forward_type=ForwardType.DEFAULT,
+            mode="critic",
+            rl_state=curr_rl_state,
+            action=human_action,
+            use_target=False,
+            critic_visual_tokens=curr_critic_visual_tokens,
+            critic_robot_state=curr_critic_robot_state,
+            critic_ref_action=curr_critic_ref_action,
+        )
+        qw1, qw2 = self.model(
+            forward_type=ForwardType.DEFAULT,
+            mode="critic",
+            rl_state=curr_rl_state,
+            action=wa_action,
+            use_target=False,
+            critic_visual_tokens=curr_critic_visual_tokens,
+            critic_robot_state=curr_critic_robot_state,
+            critic_ref_action=curr_critic_ref_action,
+        )
+        q_human = torch.minimum(qh1, qh2)
+        q_wa = torch.minimum(qw1, qw2)
+        sample_weight = pair_mask.float().mean(dim=-1, keepdim=True)
+        active = sample_weight > 0
+        if not bool(active.any().item()):
+            return zero, metrics
+
+        margin = q_human.new_tensor(float(self.intervention_pairwise_margin))
+        rank = F.relu(margin - (q_human - q_wa))
+        pairwise_loss = (rank * sample_weight).sum() / sample_weight.sum().clamp_min(1.0)
+        q_human_mean = q_human[active].mean()
+        q_wa_mean = q_wa[active].mean()
+        metrics = {
+            "pairwise_loss": float(pairwise_loss.detach().item()),
+            "pairwise_count": float(active.sum().detach().item()),
+            "q_human_pair_mean": float(q_human_mean.detach().item()),
+            "q_wa_pair_mean": float(q_wa_mean.detach().item()),
+            "q_human_minus_wa_pair": float((q_human_mean - q_wa_mean).detach().item()),
+        }
+        return float(self.intervention_pairwise_coef) * pairwise_loss, metrics
+
+    def _compute_critic_outputs(self, batch, enable_pairwise: bool | None = None):
         policy = self._unwrap_policy(self.model)
+        if enable_pairwise is None:
+            enable_pairwise = self.intervention_rl_enable and not self.intervention_pairwise_success_only
 
         curr_obs = batch["curr_obs"]
         next_obs = batch["next_obs"]
@@ -3082,6 +3422,51 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
         target_q_values = target_q_values.to(dtype=q1.dtype)
         critic_loss = F.mse_loss(q1, target_q_values) + F.mse_loss(q2, target_q_values)
+        pairwise_loss = q1.new_zeros(())
+        pairwise_count = 0.0
+        q_human_mean = q1.new_zeros(())
+        q_wa_mean = q1.new_zeros(())
+        if enable_pairwise and self.intervention_rl_enable and self.intervention_pairwise_coef > 0.0:
+            human_action = self._get_forward_model_action(batch, "model_action", fallback=actions)
+            wa_action = self._get_forward_model_action(batch, "policy_action_model", fallback=None)
+            if human_action is not None and wa_action is not None:
+                batch_size = int(actions.shape[0])
+                valid = self._batch_valid_mask(batch, batch_size)
+                source = self._batch_action_source(batch, batch_size)
+                pair_mask = self._human_like_mask(source, valid)
+                if bool(pair_mask.any().item()):
+                    qh1, qh2 = self.model(
+                        forward_type=ForwardType.DEFAULT,
+                        mode="critic",
+                        rl_state=curr_rl_state,
+                        action=human_action,
+                        use_target=False,
+                        critic_visual_tokens=curr_critic_visual_tokens,
+                        critic_robot_state=curr_critic_robot_state,
+                        critic_ref_action=curr_critic_ref_action,
+                    )
+                    qw1, qw2 = self.model(
+                        forward_type=ForwardType.DEFAULT,
+                        mode="critic",
+                        rl_state=curr_rl_state,
+                        action=wa_action,
+                        use_target=False,
+                        critic_visual_tokens=curr_critic_visual_tokens,
+                        critic_robot_state=curr_critic_robot_state,
+                        critic_ref_action=curr_critic_ref_action,
+                    )
+                    q_human = torch.minimum(qh1, qh2)
+                    q_wa = torch.minimum(qw1, qw2)
+                    sample_weight = pair_mask.float().mean(dim=-1, keepdim=True)
+                    active = sample_weight > 0
+                    if bool(active.any().item()):
+                        margin = q_human.new_tensor(float(self.intervention_pairwise_margin))
+                        rank = F.relu(margin - (q_human - q_wa))
+                        pairwise_loss = (rank * sample_weight).sum() / sample_weight.sum().clamp_min(1.0)
+                        critic_loss = critic_loss + float(self.intervention_pairwise_coef) * pairwise_loss
+                        pairwise_count = float(active.sum().detach().item())
+                        q_human_mean = q_human[active].mean()
+                        q_wa_mean = q_wa[active].mean()
         q1_overshoot = torch.clamp(q1 - self.critic_q_upper_bound, min=0.0)
         q2_overshoot = torch.clamp(q2 - self.critic_q_upper_bound, min=0.0)
         critic_overshoot_penalty = q1.new_zeros(())
@@ -3095,6 +3480,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "q1_overshoot": float(q1_overshoot.mean().detach().item()),
             "q2_overshoot": float(q2_overshoot.mean().detach().item()),
             "q_upper_bound": float(self.critic_q_upper_bound),
+            "pairwise_loss": float(pairwise_loss.detach().item()),
+            "pairwise_count": float(pairwise_count),
+            "q_human_pair_mean": float(q_human_mean.detach().item()),
+            "q_wa_pair_mean": float(q_wa_mean.detach().item()),
+            "q_human_minus_wa_pair": float((q_human_mean - q_wa_mean).detach().item()),
         }
         return critic_loss, q1, q2, target_q_values, critic_aux
 
@@ -3109,6 +3499,11 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "q1_overshoot": critic_aux["q1_overshoot"],
             "q2_overshoot": critic_aux["q2_overshoot"],
             "q_upper_bound": critic_aux["q_upper_bound"],
+            "pairwise_loss": critic_aux["pairwise_loss"],
+            "pairwise_count": critic_aux["pairwise_count"],
+            "q_human_pair_mean": critic_aux["q_human_pair_mean"],
+            "q_wa_pair_mean": critic_aux["q_wa_pair_mean"],
+            "q_human_minus_wa_pair": critic_aux["q_human_minus_wa_pair"],
         }
 
     def _compose_actor_loss(self, q_pi: torch.Tensor | None, bc_loss: torch.Tensor):
@@ -3155,6 +3550,62 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             "bc_guard_penalty": float(hard_penalty.detach().item()),
             "bc_guard_active": guard_active,
             "q_weight": q_weight,
+        }
+        return actor_loss, metrics
+
+    def _compose_intervention_actor_loss(
+        self,
+        *,
+        pi: torch.Tensor,
+        ref_action: torch.Tensor,
+        batch_action: torch.Tensor,
+        q_pi: torch.Tensor | None,
+        valid_mask: torch.Tensor,
+        source: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        q_term = pi.new_zeros(())
+        q_pi_for_loss = None
+        if q_pi is not None:
+            q_pi_for_loss = q_pi
+            if self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound:
+                q_pi_for_loss = torch.clamp(q_pi_for_loss, max=self.critic_q_upper_bound)
+            q_term = (-q_pi_for_loss).mean()
+
+        human_mask = self._human_like_mask(source, valid_mask)
+        wa_mask = (source == 0) & valid_mask
+        human_bc = self._masked_mse(pi, batch_action, human_mask)
+        wa_stay = self._masked_mse(pi, ref_action, wa_mask)
+        smooth = self._chunk_smoothness_loss(pi, valid_mask)
+        effective_q_coef = self._intervention_effective_q_coef()
+
+        actor_loss = (
+            float(effective_q_coef) * q_term
+            + float(self.intervention_human_bc_coef) * human_bc
+            + float(self.intervention_wa_stay_coef) * wa_stay
+            + float(self.intervention_smooth_coef) * smooth
+        )
+        metrics = {
+            "bc_loss": float(human_bc.detach().item()),
+            "human_bc_loss": float(human_bc.detach().item()),
+            "wa_stay_loss": float(wa_stay.detach().item()),
+            "smooth_loss": float(smooth.detach().item()),
+            "human_mask_frac": float(human_mask.float().mean().detach().item()),
+            "wa_mask_frac": float(wa_mask.float().mean().detach().item()),
+            "valid_mask_frac": float(valid_mask.float().mean().detach().item()),
+            "q_weight": float(effective_q_coef),
+            "q_weight_base": float(self.intervention_q_coef),
+            "q_warmup_actor_updates": float(self.intervention_q_warmup_actor_updates),
+            "q_ramp_actor_updates": float(self.intervention_q_ramp_actor_updates),
+            "bc_coef_effective": float(self.intervention_human_bc_coef),
+            "wa_stay_coef": float(self.intervention_wa_stay_coef),
+            "smooth_coef": float(self.intervention_smooth_coef),
+            "intervention_rl_enabled": 1.0,
+            "q_upper_bound_enabled": float(self.enable_critic_q_upper_bound),
+            "q_upper_bound": float(self.critic_q_upper_bound),
+            "q_loss_clamped": float(
+                self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound and q_pi is not None
+            ),
+            "q_pi_used_for_loss": float(q_pi_for_loss.mean().detach().item()) if q_pi_for_loss is not None else 0.0,
         }
         return actor_loss, metrics
 
@@ -3219,17 +3670,23 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             use_target=False,
         )
 
-        bc_target = ref_action
-        if self.actor_bc_target == "batch_action" and "actions" in batch:
-            bc_target = self._reshape_runtime_action_tensor(
+        batch_action = (
+            self._reshape_runtime_action_tensor(
                 batch["actions"].to(self.device, dtype=self.torch_dtype),
                 tensor_name="batch.actions",
             )
+            if "actions" in batch
+            else ref_action
+        )
+        bc_target = ref_action
+        if self.actor_bc_target == "batch_action" and "actions" in batch:
+            bc_target = batch_action
         valid_mask = None
         if self.use_action_valid_mask and "action_valid_mask" in batch:
             valid_mask = batch["action_valid_mask"].to(self.device, dtype=torch.bool)
             if valid_mask.dim() == 3 and valid_mask.shape[1] == 1:
                 valid_mask = valid_mask.squeeze(1)
+        valid_mask_for_intervention = self._batch_valid_mask(batch, int(ref_action.shape[0]))
         bc_loss = policy.compute_bc_loss(pi, bc_target, valid_mask=valid_mask)
 
         metrics = {
@@ -3258,8 +3715,20 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
                 ).detach(),
             }
 
+        source = self._batch_action_source(batch, int(ref_action.shape[0]))
+
         if self.stage_actor_bc_only:
-            actor_loss, guard_metrics = self._compose_actor_loss(q_pi=None, bc_loss=bc_loss)
+            if self.intervention_rl_enable:
+                actor_loss, guard_metrics = self._compose_intervention_actor_loss(
+                    pi=pi,
+                    ref_action=ref_action,
+                    batch_action=batch_action,
+                    q_pi=None,
+                    valid_mask=valid_mask_for_intervention,
+                    source=source,
+                )
+            else:
+                actor_loss, guard_metrics = self._compose_actor_loss(q_pi=None, bc_loss=bc_loss)
             metrics.update(guard_metrics)
             metrics["q_pi"] = 0.0
             return actor_loss, metrics, debug_bundle
@@ -3277,7 +3746,17 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
         )
         q_pi = torch.minimum(q1_pi, q2_pi)
 
-        actor_loss, guard_metrics = self._compose_actor_loss(q_pi=q_pi, bc_loss=bc_loss)
+        if self.intervention_rl_enable:
+            actor_loss, guard_metrics = self._compose_intervention_actor_loss(
+                pi=pi,
+                ref_action=ref_action,
+                batch_action=batch_action,
+                q_pi=q_pi,
+                valid_mask=valid_mask_for_intervention,
+                source=source,
+            )
+        else:
+            actor_loss, guard_metrics = self._compose_actor_loss(q_pi=q_pi, bc_loss=bc_loss)
         metrics.update(guard_metrics)
         metrics["q_pi"] = q_pi.mean().item()
         if self.enable_critic_q_upper_bound and self.actor_q_loss_clamp_to_upper_bound:
@@ -3553,7 +4032,7 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
     def compute_advantages_and_returns(self):
         return {}
 
-    def save_checkpoint(self, save_base_path, step):
+    def save_checkpoint(self, save_base_path, step, save_replay_buffers: bool = True):
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
             self.is_weight_offloaded = False
@@ -3569,16 +4048,33 @@ class EmbodiedGigaWAFSDPPolicy(EmbodiedFSDPActor):
             checkpoint_format="local_shard" if self.cfg.actor.fsdp_config.use_orig_params else "dcp",
         )
 
-        buffer_save_path = os.path.join(
-            save_base_path, f"gigawa_components/replay_buffer/rank_{self._rank}"
-        )
-        self.replay_buffer.save_checkpoint(buffer_save_path)
-
-        if self.demo_buffer is not None:
-            demo_buffer_save_path = os.path.join(
-                save_base_path, f"gigawa_components/demo_buffer/rank_{self._rank}"
+        if save_replay_buffers:
+            buffer_save_path = os.path.join(
+                save_base_path, f"gigawa_components/replay_buffer/rank_{self._rank}"
             )
-            self.demo_buffer.save_checkpoint(demo_buffer_save_path)
+            self.replay_buffer.save_checkpoint(buffer_save_path)
+
+            if self.demo_buffer is not None:
+                demo_buffer_save_path = os.path.join(
+                    save_base_path, f"gigawa_components/demo_buffer/rank_{self._rank}"
+                )
+                self.demo_buffer.save_checkpoint(demo_buffer_save_path)
+
+    def load_full_weights(self, weight_path: str):
+        """Load model weights only from a full_weights.pt file.
+
+        This intentionally does not restore optimizer state or checkpointed
+        replay/demo buffers, so offline RL can initialize from a BC actor while
+        still training on the currently configured demo_buffer.load_path.
+        """
+        state_dict = torch.load(str(weight_path), map_location="cpu", weights_only=False)
+        policy = self._unwrap_policy(self.model)
+        missing, unexpected = policy.load_state_dict(state_dict, strict=False)
+        policy.soft_update_targets(tau=1.0)
+        self.log_on_first_rank(
+            f"Loaded full model weights only from {weight_path} | "
+            f"missing_keys={len(missing)} | unexpected_keys={len(unexpected)}"
+        )
 
     def load_checkpoint(self, load_base_path):
         load_optimizer_and_scheduler_state = bool(

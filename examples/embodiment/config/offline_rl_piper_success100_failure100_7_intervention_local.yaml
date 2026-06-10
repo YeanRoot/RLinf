@@ -1,0 +1,54 @@
+defaults:
+  - offline_rl_pretrain_success100_failure100_7
+  - _self_
+
+runner:
+  logger:
+    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_rl_piper_success100_failure100_7_intervention_local"
+    experiment_name: "piper_intervention_actor_local"
+  resume_dir: null
+  ckpt_path: null
+  save_interval: 50
+  save_initial_checkpoint: true
+  save_replay_buffers_with_checkpoint: false
+
+algorithm:
+  gamma: 0.9836
+  training_stage: full_rl
+  actor_bc_target: batch_action
+  use_action_valid_mask: true
+  bc_coef: 0
+  offline_rl_pretrain:
+    steps_per_epoch: 1
+    val_steps_per_epoch: 1
+    class_eval_steps_per_epoch: 1
+    val_interval: 50
+    class_eval_interval: 50
+    tb_flush_interval: 10
+    critic_updates_per_step: 2
+    actor_updates_per_step: 1
+  intervention_rl:
+    enable: true
+    actor_success_only: true
+    q_coef: 1.0
+    q_warmup_actor_updates: 100
+    q_ramp_actor_updates: 200
+    human_bc_coef: 10.0
+    wa_stay_coef: 10.0
+    smooth_coef: 0.02
+    pairwise_coef: 2.0
+    pairwise_margin: 0.05
+    pairwise_success_only: true
+    use_replan_as_human: false
+  action_diagnostics:
+    enable: true
+    every_actor_updates: 50
+    max_save_samples: 4
+    visual_feat_plot_dims: 256
+    output_dir: "${runner.logger.log_path}/${runner.logger.experiment_name}/action_diagnostics"
+
+actor:
+  model:
+    giga_world_policy:
+      norm_json: "/home/ubuntu/users/angen.ye/gwp/norm_stats_delta.json"
+      enable_absolute_action_bound: false

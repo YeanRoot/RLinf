@@ -1,0 +1,34 @@
+defaults:
+  - offline_rl_pretrain_success100_failure100_7
+  - _self_
+
+runner:
+  logger:
+    log_path: "/home/ubuntu/users/angen.ye/gwp/RLinf/examples/results/offline_rl_piper_success100_failure100_7_zero_actor_local"
+    experiment_name: "piper_zero_actor_local"
+  resume_dir: null
+  ckpt_path: null
+  save_interval: 50
+  save_initial_checkpoint: true
+  save_replay_buffers_with_checkpoint: false
+
+algorithm:
+  gamma: 0.9836
+  offline_rl_pretrain:
+    steps_per_epoch: 1
+    val_steps_per_epoch: 1
+    class_eval_steps_per_epoch: 1
+    val_interval: 50
+    class_eval_interval: 50
+    tb_flush_interval: 10
+  action_diagnostics:
+    enable: true
+    every_actor_updates: 50
+    max_save_samples: 4
+    visual_feat_plot_dims: 256
+    output_dir: "${runner.logger.log_path}/${runner.logger.experiment_name}/action_diagnostics"
+
+actor:
+  model:
+    giga_world_policy:
+      enable_absolute_action_bound: false
